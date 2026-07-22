@@ -134,8 +134,8 @@ def _dialog_portfolio_loeschen(portfolio_id: int, name: str):
 
 
 @st.dialog("Position löschen?")
-def _dialog_position_loeschen(position_id: int, ticker: str):
-    st.warning(f"Position „{ticker}“ inkl. ALLER Transaktionen wirklich löschen? Das kann nicht rückgängig gemacht werden.")
+def _dialog_position_loeschen(position_id: int, anzeigename: str):
+    st.warning(f"Position „{anzeigename}“ inkl. ALLER Transaktionen wirklich löschen? Das kann nicht rückgängig gemacht werden.")
     col_ja, col_nein = st.columns(2)
     if col_ja.button("Ja, endgültig löschen", key="confirm_delete_pos"):
         portfolio_module.delete_position(position_id)
@@ -272,14 +272,14 @@ with tab1:
             st.caption("🏆 Gewinner")
             if top_gewinner:
                 for p in top_gewinner:
-                    st.markdown(f"**{p['ticker']}** — +{fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
+                    st.markdown(f"**{p['name']}** — +{fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
             else:
                 st.info("Keine Gewinner heute")
 
             st.caption("📉 Verlierer")
             if top_verlierer:
                 for p in top_verlierer:
-                    st.markdown(f"**{p['ticker']}** — {fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
+                    st.markdown(f"**{p['name']}** — {fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
             else:
                 st.caption("Keine Verlierer heute")
         else:
@@ -377,8 +377,10 @@ with tab2:
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
         st.markdown("**Steuervorschau**")
-        ticker_wahl = st.selectbox("Position wählen", gefiltert["ticker"].tolist())
-        gewaehlte_pos = next(p for p in alle_pos if p["ticker"] == ticker_wahl)
+        steuer_pos_options = {f"{row['name']} ({row['portfolio_name']})": row.to_dict()
+                               for _, row in gefiltert.iterrows()}
+        steuer_pos_wahl = st.selectbox("Position wählen", list(steuer_pos_options.keys()))
+        gewaehlte_pos = steuer_pos_options[steuer_pos_wahl]
         if st.button("Steuervorschau anzeigen"):
             try:
                 verkaufspreis = gewaehlte_pos["current_price"] or gewaehlte_pos["avg_buy_price"]
@@ -870,19 +872,52 @@ with tab8:
 
     st.divider()
 
-    # ---- Positionen / Transaktionen löschen --------------------------
-    st.subheader("Positionen / Transaktionen löschen")
+    # ---- Positionen bearbeiten / löschen / Transaktionen löschen -----
+    st.subheader("Positionen bearbeiten / löschen")
     alle_pos_verwaltung = []
     for uid in aktive_user_ids:
         alle_pos_verwaltung.extend(portfolio_module.get_positions(uid))
 
     if alle_pos_verwaltung:
-        pos_options = {f"{p['ticker']} ({p['portfolio_name']})": p for p in alle_pos_verwaltung}
+        pos_options = {f"{p['name']} ({p['portfolio_name']})": p for p in alle_pos_verwaltung}
         pos_wahl = st.selectbox("Position", list(pos_options.keys()), key="pos_loeschen_wahl")
         gewaehlte_pos = pos_options[pos_wahl]
 
-        if st.button("🗑️ Position löschen (inkl. aller Transaktionen)", key="pos_loeschen_btn"):
-            _dialog_position_loeschen(gewaehlte_pos["id"], gewaehlte_pos["ticker"])
+        col_edit, col_del = st.columns(2)
+        with col_edit:
+            with st.expander("✏️ Bearbeiten"):
+                with st.form("position_bearbeiten"):
+                    edit_display_name = st.text_input(
+                        "Anzeigename", value=gewaehlte_pos["display_name"] or "", key="pos_edit_display_name")
+                    edit_ticker = st.text_input("Ticker", value=gewaehlte_pos["ticker"], key="pos_edit_ticker")
+                    ac_keys = list(ac_options.keys())
+                    default_idx = ac_keys.index(gewaehlte_pos["asset_class"]) if gewaehlte_pos["asset_class"] in ac_keys else 0
+                    edit_asset_class = st.selectbox(
+                        "Assetklasse", ac_keys if ac_keys else ["(keine vorhanden)"],
+                        index=default_idx, key="pos_edit_asset_class")
+                    edit_quantity = st.number_input(
+                        "Anzahl", min_value=0.0, step=1.0,
+                        value=float(gewaehlte_pos["quantity"] or 0.0), key="pos_edit_qty")
+                    edit_avg_price = st.number_input(
+                        "Ø-Kaufpreis", min_value=0.0, step=0.01,
+                        value=float(gewaehlte_pos["avg_buy_price"] or 0.0), key="pos_edit_price")
+                    if st.form_submit_button("Speichern"):
+                        try:
+                            portfolio_module.update_position(
+                                gewaehlte_pos["id"],
+                                display_name=edit_display_name,
+                                ticker=edit_ticker,
+                                asset_class_id=ac_options.get(edit_asset_class),
+                                quantity=edit_quantity,
+                                avg_buy_price=edit_avg_price,
+                            )
+                            st.success("Position aktualisiert")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Fehler: {e}")
+        with col_del:
+            if st.button("🗑️ Position löschen (inkl. aller Transaktionen)", key="pos_loeschen_btn"):
+                _dialog_position_loeschen(gewaehlte_pos["id"], gewaehlte_pos["name"])
 
         with get_session() as session:
             txs = [
@@ -893,7 +928,7 @@ with tab8:
                 .all()
             ]
         if txs:
-            st.markdown(f"**Transaktionen von {gewaehlte_pos['ticker']}**")
+            st.markdown(f"**Transaktionen von {gewaehlte_pos['name']}**")
             for t in txs:
                 col_info, col_del = st.columns([5, 1])
                 col_info.write(f"{t['datum']} · {t['typ']} · {fmt_menge(t['quantity'])} @ {fmt_eur(t['price'])} "

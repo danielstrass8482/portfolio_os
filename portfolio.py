@@ -76,7 +76,12 @@ def get_positions(user_id: int, asset_class: str = None) -> list:
                 "portfolio_name": pf.name,
                 "broker": pf.broker,
                 "ticker": pos.ticker,
-                "name": pos.name,
+                # "name": Anzeigename mit Fallback (display_name wenn gesetzt, sonst Ticker) –
+                # das ist der Wert, der überall im Dashboard angezeigt wird. "display_name"
+                # bleibt zusätzlich roh (auch None) verfügbar, damit Bearbeiten-Formulare den
+                # tatsächlich gespeicherten Wert vorbelegen können statt des aufgelösten Fallbacks.
+                "name": pos.display_name or pos.ticker,
+                "display_name": pos.display_name,
                 "asset_class": pos.asset_class.name if pos.asset_class else "Unklassifiziert",
                 "quantity": pos.quantity,
                 "avg_buy_price": pos.avg_buy_price,
@@ -321,6 +326,29 @@ def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broke
             portfolio.broker = broker
         if is_kinderdepot is not None:
             portfolio.is_kinderdepot = is_kinderdepot
+
+
+def update_position(position_id: int, display_name: str = None, ticker: str = None,
+                     asset_class_id: int = None, quantity: float = None, avg_buy_price: float = None):
+    """
+    Ändert Anzeigename/Ticker/Assetklasse/Bestand/Ø-Kaufpreis einer bestehenden Position
+    (nur übergebene Felder werden geändert). `display_name=""` löscht den Anzeigenamen
+    explizit wieder (get_positions() fällt dann auf den Ticker zurück, siehe dort).
+    """
+    with get_session() as session:
+        pos = session.get(PosPosition, position_id)
+        if pos is None:
+            raise ValueError(f"Position {position_id} nicht gefunden")
+        if display_name is not None:
+            pos.display_name = display_name
+        if ticker is not None:
+            pos.ticker = normalize_ticker(ticker)
+        if asset_class_id is not None:
+            pos.asset_class_id = asset_class_id
+        if quantity is not None:
+            pos.quantity = quantity
+        if avg_buy_price is not None:
+            pos.avg_buy_price = avg_buy_price
 
 
 def delete_portfolio(portfolio_id: int):

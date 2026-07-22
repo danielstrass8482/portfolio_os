@@ -88,6 +88,7 @@ class PosPosition(Base):
     asset_class_id = Column(Integer, ForeignKey("pos_asset_classes.id"), nullable=True)
     ticker         = Column(String(20), nullable=False)
     name           = Column(String(200), nullable=True)
+    display_name   = Column(Text, nullable=True)
     quantity       = Column(Float, default=0.0)
     avg_buy_price  = Column(Float, default=0.0)
     current_price  = Column(Float, nullable=True)

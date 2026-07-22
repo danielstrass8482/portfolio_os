@@ -188,7 +188,7 @@ def find_tax_loss_harvesting(user_id: int) -> list:
             verlust = (pos.avg_buy_price - pos.current_price) * pos.quantity
             result.append({
                 "position_id": pos.id,
-                "ticker": pos.ticker,
+                "ticker": pos.display_name or pos.ticker,
                 "quantity": pos.quantity,
                 "avg_buy_price": pos.avg_buy_price,
                 "current_price": pos.current_price,
