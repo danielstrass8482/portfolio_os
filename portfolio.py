@@ -3,11 +3,13 @@ portfolio.py – Kernlogik für Portfolio-Verwaltung: Positionen, Transaktionen,
 Kursaktualisierung, Ist/Soll-Allokation, CSV-Import und Performance-Kennzahlen.
 """
 
+import re
 from datetime import datetime, date, timedelta
 
 import pandas as pd
 import yfinance as yf
 
+from config import TICKER_MAPPING
 from database import (
     get_session, PosPortfolio, PosPosition, PosTransaction,
     PosAssetClass, PosTargetWeight, PosDailySnapshot,
@@ -219,7 +221,10 @@ def add_transaction(portfolio_id: int, typ: str, ticker: str, quantity: float,
 
 def update_prices() -> int:
     """
-    Aktualisiert current_price aller Positionen via yfinance.
+    Aktualisiert current_price aller Positionen via yfinance – funktioniert für
+    beliebige Börsenplätze/Suffixe (z.B. "BMW.DE", "MC.PA", "AAPL"), da der
+    Suffix bereits Teil des gespeicherten Tickers ist (siehe resolve_ticker()).
+
     Läuft fehlertolerant: einzelne nicht auflösbare Ticker überspringen den
     Rest nicht. Gibt die Anzahl erfolgreich aktualisierter Positionen zurück.
     """
@@ -236,9 +241,15 @@ def update_prices() -> int:
             print(f"⚠️  Preisaktualisierung fehlgeschlagen: {e} (degraded mode)")
             return 0
 
+        # yfinance liefert mit group_by="ticker" IMMER einen MultiIndex-Spaltenaufbau
+        # (Ticker, Preisfeld) – auch bei genau einem Ticker. Auf die Ticker-Anzahl
+        # zu schauen war der Bug: bei einem einzelnen Ticker schlug data["Close"]
+        # fehl und die Position wurde stillschweigend übersprungen.
+        ist_multiindex = isinstance(data.columns, pd.MultiIndex)
+
         for pos in positions:
             try:
-                closes = data["Close"] if len(tickers) == 1 else data[pos.ticker]["Close"]
+                closes = data[pos.ticker]["Close"] if ist_multiindex else data["Close"]
                 price = float(closes.dropna().iloc[-1])
                 pos.current_price = price
                 pos.last_updated = datetime.utcnow()
@@ -247,6 +258,102 @@ def update_prices() -> int:
                 continue
 
     return updated
+
+
+# ─────────────────────────────────────────────
+# TICKER-AUFLÖSUNG (Suche/Validierung vor dem Speichern)
+# ─────────────────────────────────────────────
+
+# ISIN: 2 Länderbuchstaben + 9 alphanumerische Stellen (NSIN) + 1 Prüfziffer.
+_ISIN_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
+
+
+def _yf_ticker_info(symbol: str) -> dict:
+    """
+    Prüft via yfinance.Ticker(symbol).info ob ein Symbol existiert und einen
+    Kurs liefert. Gibt {"symbol","name","exchange"} zurück oder None.
+    Netzwerk-/API-Fehler werden abgefangen (kein Absturz, degraded mode).
+    """
+    try:
+        info = yf.Ticker(symbol).info
+    except Exception:
+        return None
+    if not info:
+        return None
+    name = info.get("longName") or info.get("shortName")
+    hat_kurs = info.get("regularMarketPrice") is not None or info.get("previousClose") is not None
+    if not name or not hat_kurs:
+        return None
+    return {
+        "symbol": symbol,
+        "name": name,
+        "exchange": info.get("fullExchangeName") or info.get("exchange") or "?",
+    }
+
+
+def _yf_search(query: str, max_results: int = 6) -> list:
+    """
+    Sucht via yfinance-Volltextsuche (Name oder ISIN) nach passenden Tickern.
+    Degradiert bei Fehlern (Netzwerk, API-Änderung) auf eine leere Liste,
+    statt die Ticker-Auflösung abzubrechen.
+    """
+    try:
+        ergebnis = yf.Search(query, max_results=max_results)
+        quotes = ergebnis.quotes or []
+    except Exception as e:
+        print(f"⚠️  Ticker-Suche für '{query}' fehlgeschlagen: {e} (degraded mode)")
+        return []
+
+    kandidaten = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        kandidaten.append({
+            "symbol": symbol,
+            "name": q.get("longname") or q.get("shortname") or symbol,
+            "exchange": q.get("exchange") or "?",
+        })
+    return kandidaten
+
+
+def resolve_ticker(eingabe: str) -> list:
+    """
+    Löst eine Nutzereingabe (Ticker-Kürzel ODER ISIN) zu einem oder mehreren
+    konkreten yfinance-Symbolen auf – zur Bestätigung durch den Nutzer VOR
+    dem Speichern einer Position/Transaktion. Reihenfolge:
+
+    1. TICKER_MAPPING (bekannte deutsche/französische Ticker, z.B. "BMW" -> "BMW.DE")
+    2. ISIN erkannt -> yfinance-Suche (yf.Search)
+    3. Direkter Symbolcheck via yfinance.Ticker(...).info
+    4. Fallback: Symbol + ".DE" anhängen und erneut prüfen (deutsche Standardbörse)
+    5. Letzter Fallback: yfinance-Volltextsuche (liefert ggf. mehrere Kandidaten,
+       u.a. auch die passende .PA/.DE/... Notierung)
+
+    Gibt eine Liste von Kandidaten [{"symbol", "name", "exchange"}, ...] zurück
+    (leer, wenn nichts gefunden wurde – niemals ein Fehler/Exception).
+    """
+    if not eingabe or not eingabe.strip():
+        return []
+    roh = eingabe.strip().upper()
+
+    if roh in TICKER_MAPPING:
+        treffer = _yf_ticker_info(TICKER_MAPPING[roh])
+        if treffer:
+            return [treffer]
+
+    if _ISIN_PATTERN.match(roh):
+        return _yf_search(roh)
+
+    direkt = _yf_ticker_info(roh)
+    if direkt:
+        return [direkt]
+
+    mit_de = _yf_ticker_info(f"{roh}.DE")
+    if mit_de:
+        return [mit_de]
+
+    return _yf_search(roh)
 
 
 # ─────────────────────────────────────────────

@@ -35,6 +35,14 @@ st.set_page_config(
 
 init_db()
 
+# Preise einmal pro Browser-Session automatisch aktualisieren (nicht bei jedem
+# Rerun – yfinance-Abfragen sind zu langsam, um sie bei jeder Nutzerinteraktion
+# erneut auszuführen). Zusätzlich gibt es den manuellen Button in der Sidebar.
+if "preise_beim_start_aktualisiert" not in st.session_state:
+    with st.spinner("Aktualisiere Kurse (einmalig beim Start)..."):
+        portfolio_module.update_prices()
+    st.session_state.preise_beim_start_aktualisiert = True
+
 # ── STYLING (gleiches dunkles Theme wie der Trading Bot) ───────────
 st.markdown("""
 <style>
@@ -113,7 +121,7 @@ if warnungen:
         for w in warnungen:
             st.caption(w)
 
-if st.sidebar.button("🔄 Kurse aktualisieren"):
+if st.sidebar.button("🔄 Preise aktualisieren"):
     with st.spinner("Aktualisiere Kurse via yfinance..."):
         n = portfolio_module.update_prices()
     st.sidebar.success(f"{n} Position(en) aktualisiert")
@@ -143,22 +151,58 @@ with st.sidebar.expander("⚙️ Verwaltung"):
             st.rerun()
 
     st.markdown("**Transaktion erfassen**")
-    with st.form("neue_transaktion"):
-        tx_pf = st.selectbox("Portfolio", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"])
-        tx_typ = st.selectbox("Typ", ["kauf", "verkauf", "dividende", "sparrate"])
-        tx_ticker = st.text_input("Ticker/ISIN")
-        tx_qty = st.number_input("Menge", min_value=0.0, step=1.0)
-        tx_price = st.number_input("Preis", min_value=0.0, step=0.01)
-        tx_fees = st.number_input("Gebühren", min_value=0.0, step=0.01)
-        tx_datum = st.date_input("Datum", value=date.today())
-        if st.form_submit_button("Buchen") and pf_options and tx_ticker and tx_qty > 0:
-            try:
-                portfolio_module.add_transaction(
-                    pf_options[tx_pf], tx_typ, tx_ticker.upper(), tx_qty, tx_price, tx_datum, tx_fees
-                )
-                st.success("Transaktion gebucht")
-            except Exception as e:
-                st.error(f"Fehler: {e}")
+
+    if "tx_kandidaten" not in st.session_state:
+        st.session_state.tx_kandidaten = []
+    if "tx_ticker_bestaetigt" not in st.session_state:
+        st.session_state.tx_ticker_bestaetigt = None
+
+    # Schritt 1: Ticker/ISIN eingeben und via yfinance auflösen lassen
+    # (außerhalb des st.form, da Formulare in Streamlit erst beim Submit
+    # neu rendern – für die Zwischenbestätigung brauchen wir sofortige Reruns).
+    tx_ticker_eingabe = st.text_input("Ticker oder ISIN eingeben", key="tx_ticker_eingabe")
+    if st.button("🔎 Ticker suchen", key="tx_ticker_suchen_btn"):
+        with st.spinner("Suche Ticker via yfinance..."):
+            kandidaten = portfolio_module.resolve_ticker(tx_ticker_eingabe)
+        st.session_state.tx_kandidaten = kandidaten
+        st.session_state.tx_ticker_bestaetigt = None
+        if not kandidaten:
+            st.warning(f"Kein Ticker für „{tx_ticker_eingabe}“ gefunden (auch nicht mit .DE-Suffix oder Volltextsuche).")
+
+    # Schritt 2: Gefundenen Kandidaten dem Nutzer zur Bestätigung anzeigen
+    if st.session_state.tx_kandidaten:
+        optionen = {
+            f"{k['symbol']} — {k['name']} ({k['exchange']})": k
+            for k in st.session_state.tx_kandidaten
+        }
+        wahl = st.selectbox("Gefunden – bitte bestätigen", list(optionen.keys()), key="tx_kandidat_wahl")
+        if st.button("✅ Ticker bestätigen", key="tx_ticker_bestaetigen_btn"):
+            st.session_state.tx_ticker_bestaetigt = optionen[wahl]["symbol"]
+            st.session_state.tx_kandidaten = []
+            st.rerun()
+
+    # Schritt 3: Erst NACH Bestätigung die eigentliche Buchungsmaske zeigen
+    if st.session_state.tx_ticker_bestaetigt:
+        st.success(f"Aktiver Ticker für die Buchung: **{st.session_state.tx_ticker_bestaetigt}**")
+        with st.form("neue_transaktion"):
+            tx_pf = st.selectbox("Portfolio", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"])
+            tx_typ = st.selectbox("Typ", ["kauf", "verkauf", "dividende", "sparrate"])
+            tx_qty = st.number_input("Menge", min_value=0.0, step=1.0)
+            tx_price = st.number_input("Preis", min_value=0.0, step=0.01)
+            tx_fees = st.number_input("Gebühren", min_value=0.0, step=0.01)
+            tx_datum = st.date_input("Datum", value=date.today())
+            if st.form_submit_button("Buchen") and pf_options and tx_qty > 0:
+                try:
+                    portfolio_module.add_transaction(
+                        pf_options[tx_pf], tx_typ, st.session_state.tx_ticker_bestaetigt,
+                        tx_qty, tx_price, tx_datum, tx_fees,
+                    )
+                    st.success("Transaktion gebucht")
+                    st.session_state.tx_ticker_bestaetigt = None
+                except Exception as e:
+                    st.error(f"Fehler: {e}")
+    else:
+        st.caption("Bitte zuerst einen Ticker suchen und bestätigen.")
 
     st.markdown("**CSV-Import**")
     with st.form("csv_import"):

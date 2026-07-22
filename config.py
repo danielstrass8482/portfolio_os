@@ -87,6 +87,20 @@ DEFAULT_ASSET_CLASSES = [
     "Aktien", "ETF", "Anleihen", "Krypto", "Immobilie", "Konto/Cash", "Sonstiges",
 ]
 
+# ─────────────────────────────────────────────
+# TICKER-MAPPING
+# ─────────────────────────────────────────────
+# Bekannte deutsche/französische Ticker, die yfinance ohne Börsensuffix nicht
+# findet – wird in portfolio.resolve_ticker() als erster (schneller) Schritt
+# geprüft, bevor die Suffix-Heuristik (.DE) bzw. die yfinance-Suche greifen.
+TICKER_MAPPING = {
+    "SIX2": "SIX2.DE",   # Sixt Stammaktie
+    "SIX3": "SIX3.DE",   # Sixt Vorzugsaktie
+    "BMW":  "BMW.DE",
+    "SAP":  "SAP.DE",
+    "LVMH": "MC.PA",
+}
+
 
 def validate_config() -> list[str]:
     """Prüft ob kritische Konfiguration vorhanden ist. Gibt Liste mit Warnings zurück."""
