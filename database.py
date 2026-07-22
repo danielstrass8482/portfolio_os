@@ -18,7 +18,12 @@ from config import DATABASE_URL, DEFAULT_ASSET_CLASSES, FREISTELLUNGSAUFTRAG_DEF
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
+# expire_on_commit=False: geladene Attribute bleiben nach commit()/close() im
+# Objekt gecacht statt sich zu "expiren" – verhindert DetachedInstanceError,
+# wenn ORM-Objekte (z.B. im Dashboard) außerhalb ihres "with get_session()"-Blocks
+# gelesen werden. Ersetzt NICHT die Notwendigkeit, Relationships/Lazy-Loads
+# weiterhin innerhalb der Session aufzulösen.
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 # ─────────────────────────────────────────────

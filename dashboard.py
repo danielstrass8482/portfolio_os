@@ -313,12 +313,17 @@ with tab1:
 
     st.subheader("Zielfortschritt")
     with get_session() as session:
-        ziele = session.query(PosFamilyGoal).all()
+        ziele = [
+            {"name": z.name, "fortschritt_pct": z.fortschritt_pct,
+             "aktuell_betrag": z.aktuell_betrag, "ziel_betrag": z.ziel_betrag}
+            for z in session.query(PosFamilyGoal).all()
+        ]
     if ziele:
         for z in ziele:
-            st.progress(min(1.0, z.fortschritt_pct / 100), text=f"{z.name}: {z.fortschritt_pct:.0f}% ({z.aktuell_betrag:,.0f}/{z.ziel_betrag:,.0f} €)")
-            if z.fortschritt_pct >= 100:
-                st.success(f"🎉 Ziel „{z.name}“ erreicht!")
+            st.progress(min(1.0, z["fortschritt_pct"] / 100),
+                        text=f"{z['name']}: {z['fortschritt_pct']:.0f}% ({z['aktuell_betrag']:,.0f}/{z['ziel_betrag']:,.0f} €)")
+            if z["fortschritt_pct"] >= 100:
+                st.success(f"🎉 Ziel „{z['name']}“ erreicht!")
     else:
         st.caption("Keine Familienziele hinterlegt (siehe ⚙️ Verwaltung).")
 
@@ -540,10 +545,13 @@ with tab6:
     kinder_zeilen = []
     for n in nutzer:
         with get_session() as session:
-            portfolios_n = session.query(PosPortfolio).filter_by(user_id=n["id"]).all()
+            portfolios_n = [
+                {"name": p.name, "typ": p.typ, "broker": p.broker}
+                for p in session.query(PosPortfolio).filter_by(user_id=n["id"]).all()
+            ]
         for p in portfolios_n:
-            eintrag = {"Nutzer": n["name"], "Depot": p.name, "Typ": p.typ, "Broker": p.broker}
-            if "kind" in p.name.lower():
+            eintrag = {"Nutzer": n["name"], "Depot": p["name"], "Typ": p["typ"], "Broker": p["broker"]}
+            if "kind" in p["name"].lower():
                 kinder_zeilen.append(eintrag)
             else:
                 zeilen.append(eintrag)
@@ -567,10 +575,13 @@ with tab6:
 
     st.subheader("Gemeinsame Ziele")
     with get_session() as session:
-        ziele = session.query(PosFamilyGoal).all()
+        ziele = [
+            {"name": z.name, "fortschritt_pct": z.fortschritt_pct}
+            for z in session.query(PosFamilyGoal).all()
+        ]
     if ziele:
         for z in ziele:
-            st.progress(min(1.0, z.fortschritt_pct / 100), text=f"{z.name}: {z.fortschritt_pct:.0f}%")
+            st.progress(min(1.0, z["fortschritt_pct"] / 100), text=f"{z['name']}: {z['fortschritt_pct']:.0f}%")
     else:
         st.caption("Keine gemeinsamen Ziele hinterlegt.")
 
