@@ -321,6 +321,21 @@ def get_asset_class_by_slug(session: Session, slug: str) -> PosAssetClass:
     return session.query(PosAssetClass).filter_by(slug=slug).first()
 
 
+def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, asset_breakdown: dict = None):
+    """Speichert oder aktualisiert den täglichen Vermögens-Snapshot eines Nutzers (für Performance/Charts)."""
+    today = date.today()
+    existing = session.query(PosDailySnapshot).filter_by(user_id=user_id, datum=today).first()
+    if existing:
+        existing.gesamtvermoegen = gesamtvermoegen
+        if asset_breakdown is not None:
+            existing.set_breakdown(asset_breakdown)
+    else:
+        snap = PosDailySnapshot(user_id=user_id, datum=today, gesamtvermoegen=gesamtvermoegen)
+        if asset_breakdown is not None:
+            snap.set_breakdown(asset_breakdown)
+        session.add(snap)
+
+
 if __name__ == "__main__":
     init_db()
     print("✅ Datenbank initialisiert.")
