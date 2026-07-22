@@ -336,10 +336,10 @@ with tab2:
             gefiltert = gefiltert[gefiltert["asset_class"].isin(klasse_filter)]
 
         anzeige = gefiltert[[
-            "ticker", "name", "asset_class", "portfolio_name", "quantity",
+            "name", "asset_class", "portfolio_name", "quantity",
             "avg_buy_price", "current_price", "market_value", "unrealized_pnl", "unrealized_pnl_pct",
         ]].rename(columns={
-            "ticker": "Ticker", "name": "Name", "asset_class": "Assetklasse", "portfolio_name": "Depot",
+            "name": "Wertpapier", "asset_class": "Assetklasse", "portfolio_name": "Depot",
             "quantity": "Menge", "avg_buy_price": "Ø-Kaufpreis", "current_price": "Kurs",
             "market_value": "Wert", "unrealized_pnl": "G/V", "unrealized_pnl_pct": "G/V %",
         })
@@ -415,7 +415,7 @@ with tab2:
                     )
 
                 text = (
-                    f"📊 Steuervorschau: {gewaehlte_pos['name']} ({gewaehlte_pos['ticker']})\n\n"
+                    f"📊 Steuervorschau: {gewaehlte_pos['name']}\n\n"
                     f"Wenn du alle {fmt_menge(preview['quantity'])} Anteile heute zum aktuellen "
                     f"Kurs von {fmt_eur(verkaufspreis)} verkaufst:\n\n"
                     f"Bruttoerlös:              {fmt_eur(brutto_erloes)}\n"
@@ -883,24 +883,36 @@ with tab8:
         pos_wahl = st.selectbox("Position", list(pos_options.keys()), key="pos_loeschen_wahl")
         gewaehlte_pos = pos_options[pos_wahl]
 
+        # Bei Positionswechsel im Dropdown alte "edit_*"-Widget-States verwerfen –
+        # sonst zeigt Streamlit (Widget-State bleibt über den key hinweg bestehen
+        # und ignoriert `value=` bei Reruns) für die neu gewählte Position weiterhin
+        # die Formularwerte der zuvor bearbeiteten Position an.
+        if st.session_state.get("last_edit_position") != gewaehlte_pos["id"]:
+            st.session_state["last_edit_position"] = gewaehlte_pos["id"]
+            for key in list(st.session_state.keys()):
+                if key.startswith("edit_"):
+                    del st.session_state[key]
+
         col_edit, col_del = st.columns(2)
         with col_edit:
             with st.expander("✏️ Bearbeiten"):
                 with st.form("position_bearbeiten"):
                     edit_display_name = st.text_input(
-                        "Anzeigename", value=gewaehlte_pos["display_name"] or "", key="pos_edit_display_name")
-                    edit_ticker = st.text_input("Ticker", value=gewaehlte_pos["ticker"], key="pos_edit_ticker")
+                        "Anzeigename", value=gewaehlte_pos["display_name"] or "",
+                        key=f"edit_name_{gewaehlte_pos['id']}")
+                    edit_ticker = st.text_input(
+                        "Ticker", value=gewaehlte_pos["ticker"], key=f"edit_ticker_{gewaehlte_pos['id']}")
                     ac_keys = list(ac_options.keys())
                     default_idx = ac_keys.index(gewaehlte_pos["asset_class"]) if gewaehlte_pos["asset_class"] in ac_keys else 0
                     edit_asset_class = st.selectbox(
                         "Assetklasse", ac_keys if ac_keys else ["(keine vorhanden)"],
-                        index=default_idx, key="pos_edit_asset_class")
+                        index=default_idx, key=f"edit_assetclass_{gewaehlte_pos['id']}")
                     edit_quantity = st.number_input(
                         "Anzahl", min_value=0.0, step=1.0,
-                        value=float(gewaehlte_pos["quantity"] or 0.0), key="pos_edit_qty")
+                        value=float(gewaehlte_pos["quantity"] or 0.0), key=f"edit_quantity_{gewaehlte_pos['id']}")
                     edit_avg_price = st.number_input(
                         "Ø-Kaufpreis", min_value=0.0, step=0.01,
-                        value=float(gewaehlte_pos["avg_buy_price"] or 0.0), key="pos_edit_price")
+                        value=float(gewaehlte_pos["avg_buy_price"] or 0.0), key=f"edit_price_{gewaehlte_pos['id']}")
                     if st.form_submit_button("Speichern"):
                         try:
                             portfolio_module.update_position(
