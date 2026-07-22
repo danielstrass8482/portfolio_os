@@ -84,7 +84,7 @@ YEARLY_REPORT_HOUR    = 7   # 1. Januar
 # ASSETKLASSEN (Standard-Seeds für pos_asset_classes)
 # ─────────────────────────────────────────────
 DEFAULT_ASSET_CLASSES = [
-    "Aktien", "ETF", "Anleihen", "Krypto", "Immobilie", "Konto/Cash", "Sonstiges",
+    "ETF", "Einzelaktie", "Anleihe", "Gold/Rohstoff", "Tagesgeld", "Krypto", "Immobilie",
 ]
 
 # ─────────────────────────────────────────────

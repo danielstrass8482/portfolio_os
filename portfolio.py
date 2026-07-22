@@ -77,7 +77,7 @@ def get_positions(user_id: int, asset_class: str = None) -> list:
                 "broker": pf.broker,
                 "ticker": pos.ticker,
                 "name": pos.name,
-                "asset_class": pos.asset_class.name if pos.asset_class else None,
+                "asset_class": pos.asset_class.name if pos.asset_class else "Unklassifiziert",
                 "quantity": pos.quantity,
                 "avg_buy_price": pos.avg_buy_price,
                 "current_price": pos.current_price,
@@ -148,35 +148,72 @@ def calculate_allocation(user_id: int) -> list:
 # TRANSAKTIONEN
 # ─────────────────────────────────────────────
 
+def normalize_ticker(ticker: str) -> str:
+    """
+    Normalisiert einen Ticker für den Duplikat-Abgleich: immer uppercase;
+    bekannte deutsche/französische Ticker aus TICKER_MAPPING werden auf ihr
+    kanonisches Symbol inkl. Börsensuffix aufgelöst (z.B. "SIX3" -> "SIX3.DE"),
+    damit unterschiedliche Schreibweisen derselben Aktie (manuelle Eingabe,
+    Ticker-Suche, CSV-Import) dieselbe Position treffen statt ein Duplikat
+    anzulegen.
+    """
+    if not ticker:
+        return ticker
+    roh = ticker.strip().upper()
+    return TICKER_MAPPING.get(roh, roh)
+
+
+def _finde_bestehende_position(session, portfolio_id: int, ticker: str):
+    """
+    Sucht eine bereits vorhandene Position im Portfolio – neben dem exakten
+    (normalisierten) Ticker zusätzlich mit/ohne ".DE"-Suffix getauscht, damit
+    z.B. "SIX3" und "SIX3.DE" als dieselbe Position erkannt werden, statt ein
+    Duplikat anzulegen (siehe normalize_ticker()).
+    """
+    kandidaten = {ticker}
+    if ticker.endswith(".DE"):
+        kandidaten.add(ticker[:-3])
+    else:
+        kandidaten.add(f"{ticker}.DE")
+    return (
+        session.query(PosPosition)
+        .filter(PosPosition.portfolio_id == portfolio_id, PosPosition.ticker.in_(kandidaten))
+        .first()
+    )
+
+
 def add_transaction(portfolio_id: int, typ: str, ticker: str, quantity: float,
-                     price: float, datum, fees: float = 0.0) -> dict:
+                     price: float, datum, fees: float = 0.0, asset_class_id: int = None) -> dict:
     """
     Erfasst eine Transaktion (kauf/verkauf/dividende/sparrate) und aktualisiert
     Bestand sowie gleitenden Durchschnittspreis der zugehörigen Position.
     Bei 'verkauf' und 'dividende' wird automatisch die Steuer berechnet
     (siehe tax_engine.calculate_tax) und in der Transaktion vermerkt.
+
+    `asset_class_id` wird bei NEU angelegten Positionen gesetzt; existiert die
+    Position bereits, aber ohne Assetklasse, wird sie nachträglich ergänzt.
     """
     typ = typ.lower().strip()
     if typ not in ("kauf", "verkauf", "dividende", "sparrate"):
         raise ValueError(f"Unbekannter Transaktionstyp: {typ}")
+
+    ticker = normalize_ticker(ticker)
 
     with get_session() as session:
         portfolio = session.get(PosPortfolio, portfolio_id)
         if portfolio is None:
             raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
 
-        position = (
-            session.query(PosPosition)
-            .filter_by(portfolio_id=portfolio_id, ticker=ticker)
-            .first()
-        )
+        position = _finde_bestehende_position(session, portfolio_id, ticker)
         if position is None and typ in ("kauf", "sparrate"):
             position = PosPosition(
                 portfolio_id=portfolio_id, ticker=ticker, name=ticker,
-                quantity=0.0, avg_buy_price=0.0,
+                quantity=0.0, avg_buy_price=0.0, asset_class_id=asset_class_id,
             )
             session.add(position)
             session.flush()
+        elif position is not None and asset_class_id and not position.asset_class_id:
+            position.asset_class_id = asset_class_id
 
         if typ in ("kauf", "sparrate"):
             neuer_bestand = (position.quantity or 0.0) + quantity
@@ -215,47 +252,148 @@ def add_transaction(portfolio_id: int, typ: str, ticker: str, quantity: float,
         }
 
 
+def _recompute_position(session, position_id: int):
+    """
+    Berechnet Bestand und gleitenden Durchschnittspreis einer Position komplett
+    aus ihren (verbleibenden) Transaktionen neu – wird nach delete_transaction()
+    aufgerufen, damit gelöschte Buchungen korrekt rückgängig gemacht werden.
+    """
+    position = session.get(PosPosition, position_id)
+    if position is None:
+        return
+    txs = (
+        session.query(PosTransaction)
+        .filter_by(position_id=position_id)
+        .order_by(PosTransaction.datum, PosTransaction.id)
+        .all()
+    )
+    qty, avg = 0.0, 0.0
+    for tx in txs:
+        if tx.typ in ("kauf", "sparrate"):
+            neuer_bestand = qty + tx.quantity
+            kosten_neu = qty * avg + tx.quantity * tx.price + (tx.fees or 0.0)
+            qty = neuer_bestand
+            avg = (kosten_neu / neuer_bestand) if neuer_bestand else 0.0
+        elif tx.typ == "verkauf":
+            qty -= tx.quantity
+    position.quantity = qty
+    position.avg_buy_price = avg
+
+
+def delete_transaction(transaction_id: int):
+    """Löscht eine Transaktion und berechnet die zugehörige Position neu (siehe _recompute_position)."""
+    with get_session() as session:
+        tx = session.get(PosTransaction, transaction_id)
+        if tx is None:
+            raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
+        position_id = tx.position_id
+        session.delete(tx)
+        session.flush()
+        if position_id:
+            _recompute_position(session, position_id)
+
+
+def delete_position(position_id: int):
+    """Löscht eine Position samt aller zugehörigen Transaktionen (cascade, siehe database.py)."""
+    with get_session() as session:
+        position = session.get(PosPosition, position_id)
+        if position is None:
+            raise ValueError(f"Position {position_id} nicht gefunden")
+        session.delete(position)
+
+
+# ─────────────────────────────────────────────
+# PORTFOLIO-VERWALTUNG (CRUD)
+# ─────────────────────────────────────────────
+
+def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broker: str = None):
+    """Ändert Name/Typ/Broker eines bestehenden Portfolios (nur übergebene Felder werden geändert)."""
+    with get_session() as session:
+        portfolio = session.get(PosPortfolio, portfolio_id)
+        if portfolio is None:
+            raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
+        if name is not None:
+            portfolio.name = name
+        if typ is not None:
+            portfolio.typ = typ
+        if broker is not None:
+            portfolio.broker = broker
+
+
+def delete_portfolio(portfolio_id: int):
+    """
+    Löscht ein Portfolio – NUR wenn es keine Positionen mehr enthält, damit
+    nicht versehentlich Bestandsdaten/Transaktionshistorie verschwinden.
+    Positionen zuerst einzeln über delete_position() entfernen.
+    """
+    with get_session() as session:
+        portfolio = session.get(PosPortfolio, portfolio_id)
+        if portfolio is None:
+            raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
+        anzahl_positionen = (
+            session.query(PosPosition).filter_by(portfolio_id=portfolio_id).count()
+        )
+        if anzahl_positionen > 0:
+            raise ValueError(
+                f"Portfolio '{portfolio.name}' enthält noch {anzahl_positionen} Position(en) – "
+                f"diese zuerst löschen."
+            )
+        session.delete(portfolio)
+
+
 # ─────────────────────────────────────────────
 # KURSAKTUALISIERUNG
 # ─────────────────────────────────────────────
 
+def _aktueller_kurs(ticker: str) -> float:
+    """
+    Aktueller Kurs für EINEN Ticker (beliebiger Börsensuffix, z.B. ".DE"/".PA").
+    Erst yfinance.Ticker(...).fast_info["lastPrice"] (ein schneller Request),
+    bei Fehler/fehlendem Preis Fallback auf yfinance.download(period="1d").
+    Gibt None zurück, wenn der Ticker auf keinem der beiden Wege auflösbar ist.
+    """
+    try:
+        preis = yf.Ticker(ticker).fast_info.get("lastPrice")
+        if preis:
+            return float(preis)
+    except Exception:
+        pass
+
+    try:
+        data = yf.download(ticker, period="1d", progress=False)
+        if not data.empty:
+            closes = data["Close"]
+            if hasattr(closes, "columns"):  # MultiIndex-Fall: DataFrame statt Series
+                closes = closes.iloc[:, 0]
+            closes = closes.dropna()
+            if len(closes):
+                return float(closes.iloc[-1])
+    except Exception:
+        pass
+
+    return None
+
+
 def update_prices() -> int:
     """
-    Aktualisiert current_price aller Positionen via yfinance – funktioniert für
-    beliebige Börsenplätze/Suffixe (z.B. "BMW.DE", "MC.PA", "AAPL"), da der
-    Suffix bereits Teil des gespeicherten Tickers ist (siehe resolve_ticker()).
-
+    Aktualisiert current_price aller Positionen (siehe _aktueller_kurs()).
     Läuft fehlertolerant: einzelne nicht auflösbare Ticker überspringen den
-    Rest nicht. Gibt die Anzahl erfolgreich aktualisierter Positionen zurück.
+    Rest nicht, werden aber geloggt. Gibt die Anzahl erfolgreich
+    aktualisierter Positionen zurück.
     """
     updated = 0
     with get_session() as session:
         positions = session.query(PosPosition).all()
-        tickers = sorted({p.ticker for p in positions if p.ticker})
-        if not tickers:
-            return 0
-
-        try:
-            data = yf.download(tickers, period="5d", progress=False, group_by="ticker", threads=True)
-        except Exception as e:
-            print(f"⚠️  Preisaktualisierung fehlgeschlagen: {e} (degraded mode)")
-            return 0
-
-        # yfinance liefert mit group_by="ticker" IMMER einen MultiIndex-Spaltenaufbau
-        # (Ticker, Preisfeld) – auch bei genau einem Ticker. Auf die Ticker-Anzahl
-        # zu schauen war der Bug: bei einem einzelnen Ticker schlug data["Close"]
-        # fehl und die Position wurde stillschweigend übersprungen.
-        ist_multiindex = isinstance(data.columns, pd.MultiIndex)
-
         for pos in positions:
-            try:
-                closes = data[pos.ticker]["Close"] if ist_multiindex else data["Close"]
-                price = float(closes.dropna().iloc[-1])
-                pos.current_price = price
-                pos.last_updated = datetime.utcnow()
-                updated += 1
-            except Exception:
+            if not pos.ticker:
                 continue
+            preis = _aktueller_kurs(pos.ticker)
+            if preis is None:
+                print(f"⚠️  Kein aktueller Kurs für Ticker '{pos.ticker}' gefunden (übersprungen)")
+                continue
+            pos.current_price = preis
+            pos.last_updated = datetime.utcnow()
+            updated += 1
 
     return updated
 
@@ -415,6 +553,21 @@ def import_csv(portfolio_id: int, filepath: str, broker: str) -> dict:
             f"(gefunden: {list(df.columns)})"
         )
 
+    # Cache: dieselbe ISIN/derselbe Ticker kommt in einem Kontoauszug oft mehrfach
+    # vor (mehrere Sparplan-Ausführungen etc.) – pro eindeutigem Rohwert nur
+    # einmal via yfinance auflösen, statt bei jeder Zeile erneut zu suchen.
+    ticker_cache: dict = {}
+
+    def _aufgeloester_ticker(roh_ticker: str) -> str:
+        if roh_ticker not in ticker_cache:
+            kandidaten = resolve_ticker(roh_ticker)
+            # Broker-Exporte liefern meist ISIN/WKN statt Symbol – diese über
+            # dieselbe Ticker-Suche wie im Dashboard auflösen (behebt das
+            # Duplikat-Problem, wenn dieselbe Aktie später manuell mit einem
+            # bereits mit .DE-Suffix versehenen Symbol nachgebucht wird).
+            ticker_cache[roh_ticker] = kandidaten[0]["symbol"] if kandidaten else normalize_ticker(roh_ticker)
+        return ticker_cache[roh_ticker]
+
     imported, skipped = 0, 0
     for _, row in df.iterrows():
         try:
@@ -429,7 +582,8 @@ def import_csv(portfolio_id: int, filepath: str, broker: str) -> dict:
                 skipped += 1
                 continue
 
-            ticker = str(row[cols["ticker"]]).strip()
+            roh_ticker = str(row[cols["ticker"]]).strip()
+            ticker = _aufgeloester_ticker(roh_ticker)
             quantity = abs(float(str(row[cols["quantity"]]).replace(".", "").replace(",", ".")
                                   if "," in str(row[cols["quantity"]]) else row[cols["quantity"]]))
             price = abs(float(str(row[cols["price"]]).replace(".", "").replace(",", ".")

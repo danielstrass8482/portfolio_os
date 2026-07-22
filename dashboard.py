@@ -1,13 +1,17 @@
 """
 dashboard.py – Streamlit-Dashboard für Portfolio-OS.
-7 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Familie, KI-Analyse.
+8 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Familie,
+KI-Analyse, Verwaltung. Keine Sidebar – die Nutzer-/Familienauswahl steht
+oberhalb der Tabs (wird von allen Tabs benötigt), alle Anlege-/Bearbeiten-/
+Löschen-Formulare stecken im Tab „⚙️ Verwaltung“.
 
 Datenzugriff läuft ausschließlich über portfolio.py / tax_engine.py /
 rebalancing.py / llm_analyst.py – dashboard.py enthält keine eigene
-Geschäftslogik, nur Darstellung und einfache Verwaltungsformulare
-(Nutzer/Portfolio/Position anlegen), die für den Bootstrap nötig sind.
+Geschäftslogik, nur Darstellung und Formulare.
 """
 
+import os
+import tempfile
 from datetime import date, datetime
 
 import streamlit as st
@@ -18,26 +22,27 @@ from config import validate_config, BASE_URL
 from database import (
     init_db, get_session, get_or_create_user,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
-    PosRealEstate, PosFamilyGoal,
+    PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction,
 )
 import portfolio as portfolio_module
 import tax_engine
 import rebalancing
 import llm_analyst
 
+PORTFOLIO_TYPEN = ["depot", "krypto", "immobilie", "konto"]
+
 # ── PAGE CONFIG ────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Portfolio-OS",
     page_icon="💼",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 init_db()
 
 # Preise einmal pro Browser-Session automatisch aktualisieren (nicht bei jedem
 # Rerun – yfinance-Abfragen sind zu langsam, um sie bei jeder Nutzerinteraktion
-# erneut auszuführen). Zusätzlich gibt es den manuellen Button in der Sidebar.
+# erneut auszuführen). Zusätzlich gibt es den manuellen Button im Positionen-Tab.
 if "preise_beim_start_aktualisiert" not in st.session_state:
     with st.spinner("Aktualisiere Kurse (einmalig beim Start)..."):
         portfolio_module.update_prices()
@@ -81,21 +86,53 @@ AMPEL_LABEL = {"gruen": "🟢 im Ziel", "hellgelb": "🟡 leicht abweichend", "g
 
 
 # ─────────────────────────────────────────────
-# BOOTSTRAP: NUTZERAUSWAHL
+# BESTÄTIGUNGSDIALOGE (Portfolio/Position löschen)
+# ─────────────────────────────────────────────
+
+@st.dialog("Portfolio löschen?")
+def _dialog_portfolio_loeschen(portfolio_id: int, name: str):
+    st.warning(f"Portfolio „{name}“ wirklich löschen? Geht nur, wenn keine Positionen mehr enthalten sind.")
+    col_ja, col_nein = st.columns(2)
+    if col_ja.button("Ja, endgültig löschen", key="confirm_delete_pf"):
+        try:
+            portfolio_module.delete_portfolio(portfolio_id)
+            st.success("Portfolio gelöscht")
+        except Exception as e:
+            st.error(f"Fehler: {e}")
+        else:
+            st.rerun()
+    if col_nein.button("Abbrechen", key="cancel_delete_pf"):
+        st.rerun()
+
+
+@st.dialog("Position löschen?")
+def _dialog_position_loeschen(position_id: int, ticker: str):
+    st.warning(f"Position „{ticker}“ inkl. ALLER Transaktionen wirklich löschen? Das kann nicht rückgängig gemacht werden.")
+    col_ja, col_nein = st.columns(2)
+    if col_ja.button("Ja, endgültig löschen", key="confirm_delete_pos"):
+        portfolio_module.delete_position(position_id)
+        st.success("Position gelöscht")
+        st.rerun()
+    if col_nein.button("Abbrechen", key="cancel_delete_pos"):
+        st.rerun()
+
+
+# ─────────────────────────────────────────────
+# BOOTSTRAP: NUTZER / KONTEXT (ersetzt die frühere Sidebar)
 # ─────────────────────────────────────────────
 
 def _alle_nutzer():
     with get_session() as session:
-        return [{"id": u.id, "name": u.name, "rolle": u.rolle} for u in session.query(PosUser).all()]
+        return [{"id": u.id, "name": u.name, "email": u.email, "rolle": u.rolle} for u in session.query(PosUser).all()]
 
 
 nutzer = _alle_nutzer()
 
-st.sidebar.title("💼 Portfolio-OS")
+st.title("💼 Portfolio-OS")
 
 if not nutzer:
-    st.sidebar.warning("Noch kein Nutzer angelegt.")
-    with st.sidebar.form("neuer_erstnutzer"):
+    st.warning("Noch kein Nutzer angelegt.")
+    with st.form("neuer_erstnutzer"):
         name = st.text_input("Name")
         email = st.text_input("E-Mail (optional)")
         if st.form_submit_button("Nutzer anlegen") and name:
@@ -105,174 +142,31 @@ if not nutzer:
     st.stop()
 
 nutzer_namen = [n["name"] for n in nutzer]
-familien_modus = st.sidebar.toggle("👨‍👩‍👧 Familien-Portfolio (alle Nutzer)", value=False)
+
+kontext_col1, kontext_col2, kontext_col3 = st.columns([2, 2, 3])
+with kontext_col1:
+    familien_modus = st.toggle("👨‍👩‍👧 Familien-Portfolio (alle Nutzer)", value=False)
+with kontext_col2:
+    if not familien_modus:
+        gewaehlter_name = st.selectbox("Portfolio von", nutzer_namen, label_visibility="collapsed")
+    else:
+        st.caption("Alle Nutzer aktiv")
 
 if not familien_modus:
-    gewaehlter_name = st.sidebar.selectbox("Portfolio von", nutzer_namen)
     aktiver_user = next(n for n in nutzer if n["name"] == gewaehlter_name)
     aktive_user_ids = [aktiver_user["id"]]
 else:
     aktiver_user = None
     aktive_user_ids = [n["id"] for n in nutzer]
 
+with kontext_col3:
+    st.caption(f"{'Familien-Portfolio' if familien_modus else aktiver_user['name']} · {BASE_URL}")
+
 warnungen = validate_config()
 if warnungen:
-    with st.sidebar.expander("⚠️ Konfigurationshinweise"):
+    with st.expander("⚠️ Konfigurationshinweise"):
         for w in warnungen:
             st.caption(w)
-
-if st.sidebar.button("🔄 Preise aktualisieren"):
-    with st.spinner("Aktualisiere Kurse via yfinance..."):
-        n = portfolio_module.update_prices()
-    st.sidebar.success(f"{n} Position(en) aktualisiert")
-
-
-# ─────────────────────────────────────────────
-# VERWALTUNG (Bootstrap-Formulare für Grunddaten)
-# ─────────────────────────────────────────────
-
-with st.sidebar.expander("⚙️ Verwaltung"):
-    with get_session() as session:
-        asset_classes = session.query(PosAssetClass).all()
-        ac_options = {ac.name: ac.id for ac in asset_classes}
-        portfolios_all = session.query(PosPortfolio).filter(
-            PosPortfolio.user_id.in_(aktive_user_ids)
-        ).all()
-        pf_options = {f"{p.name} ({p.typ})": p.id for p in portfolios_all}
-
-    st.markdown("**Neues Portfolio**")
-    with st.form("neues_portfolio"):
-        pf_name = st.text_input("Name", key="pf_name")
-        pf_typ = st.selectbox("Typ", ["depot", "krypto", "immobilie", "konto"], key="pf_typ")
-        pf_broker = st.text_input("Broker (optional)", key="pf_broker")
-        if st.form_submit_button("Anlegen") and pf_name and not familien_modus:
-            with get_session() as session:
-                session.add(PosPortfolio(user_id=aktiver_user["id"], name=pf_name, broker=pf_broker, typ=pf_typ))
-            st.rerun()
-
-    st.markdown("**Transaktion erfassen**")
-
-    if "tx_kandidaten" not in st.session_state:
-        st.session_state.tx_kandidaten = []
-    if "tx_ticker_bestaetigt" not in st.session_state:
-        st.session_state.tx_ticker_bestaetigt = None
-
-    # Schritt 1: Ticker/ISIN eingeben und via yfinance auflösen lassen
-    # (außerhalb des st.form, da Formulare in Streamlit erst beim Submit
-    # neu rendern – für die Zwischenbestätigung brauchen wir sofortige Reruns).
-    tx_ticker_eingabe = st.text_input("Ticker oder ISIN eingeben", key="tx_ticker_eingabe")
-    if st.button("🔎 Ticker suchen", key="tx_ticker_suchen_btn"):
-        with st.spinner("Suche Ticker via yfinance..."):
-            kandidaten = portfolio_module.resolve_ticker(tx_ticker_eingabe)
-        st.session_state.tx_kandidaten = kandidaten
-        st.session_state.tx_ticker_bestaetigt = None
-        if not kandidaten:
-            st.warning(f"Kein Ticker für „{tx_ticker_eingabe}“ gefunden (auch nicht mit .DE-Suffix oder Volltextsuche).")
-
-    # Schritt 2: Gefundenen Kandidaten dem Nutzer zur Bestätigung anzeigen
-    if st.session_state.tx_kandidaten:
-        optionen = {
-            f"{k['symbol']} — {k['name']} ({k['exchange']})": k
-            for k in st.session_state.tx_kandidaten
-        }
-        wahl = st.selectbox("Gefunden – bitte bestätigen", list(optionen.keys()), key="tx_kandidat_wahl")
-        if st.button("✅ Ticker bestätigen", key="tx_ticker_bestaetigen_btn"):
-            st.session_state.tx_ticker_bestaetigt = optionen[wahl]["symbol"]
-            st.session_state.tx_kandidaten = []
-            st.rerun()
-
-    # Schritt 3: Erst NACH Bestätigung die eigentliche Buchungsmaske zeigen
-    if st.session_state.tx_ticker_bestaetigt:
-        st.success(f"Aktiver Ticker für die Buchung: **{st.session_state.tx_ticker_bestaetigt}**")
-        with st.form("neue_transaktion"):
-            tx_pf = st.selectbox("Portfolio", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"])
-            tx_typ = st.selectbox("Typ", ["kauf", "verkauf", "dividende", "sparrate"])
-            tx_qty = st.number_input("Menge", min_value=0.0, step=1.0)
-            tx_price = st.number_input("Preis", min_value=0.0, step=0.01)
-            tx_fees = st.number_input("Gebühren", min_value=0.0, step=0.01)
-            tx_datum = st.date_input("Datum", value=date.today())
-            if st.form_submit_button("Buchen") and pf_options and tx_qty > 0:
-                try:
-                    portfolio_module.add_transaction(
-                        pf_options[tx_pf], tx_typ, st.session_state.tx_ticker_bestaetigt,
-                        tx_qty, tx_price, tx_datum, tx_fees,
-                    )
-                    st.success("Transaktion gebucht")
-                    st.session_state.tx_ticker_bestaetigt = None
-                except Exception as e:
-                    st.error(f"Fehler: {e}")
-    else:
-        st.caption("Bitte zuerst einen Ticker suchen und bestätigen.")
-
-    st.markdown("**CSV-Import**")
-    with st.form("csv_import"):
-        csv_pf = st.selectbox("Portfolio ", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"], key="csv_pf")
-        csv_broker = st.selectbox("Broker", ["comdirect", "tr"])
-        csv_file = st.file_uploader("CSV-Datei", type=["csv"])
-        if st.form_submit_button("Importieren") and pf_options and csv_file:
-            import tempfile, os
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                tmp.write(csv_file.getvalue())
-                tmp_path = tmp.name
-            try:
-                ergebnis = portfolio_module.import_csv(pf_options[csv_pf], tmp_path, csv_broker)
-                st.success(f"{ergebnis['imported']} importiert, {ergebnis['skipped']} übersprungen")
-            except Exception as e:
-                st.error(f"Fehler: {e}")
-            finally:
-                os.unlink(tmp_path)
-
-    if not familien_modus:
-        st.markdown("**Ziel-Gewichtung**")
-        with st.form("ziel_gewichtung"):
-            tw_class = st.selectbox("Assetklasse", list(ac_options.keys()))
-            tw_target = st.slider("Ziel-%", 0, 100, 20)
-            tw_min = st.slider("Min-%", 0, 100, max(0, tw_target - 5))
-            tw_max = st.slider("Max-%", 0, 100, min(100, tw_target + 5))
-            if st.form_submit_button("Speichern"):
-                with get_session() as session:
-                    existing = session.query(PosTargetWeight).filter_by(
-                        user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class]
-                    ).first()
-                    if existing:
-                        existing.target_pct, existing.min_pct, existing.max_pct = tw_target / 100, tw_min / 100, tw_max / 100
-                    else:
-                        session.add(PosTargetWeight(
-                            user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class],
-                            target_pct=tw_target / 100, min_pct=tw_min / 100, max_pct=tw_max / 100,
-                        ))
-                st.success("Ziel-Gewichtung gespeichert")
-
-        st.markdown("**Immobilie anlegen**")
-        with st.form("neue_immobilie"):
-            im_adresse = st.text_input("Adresse")
-            im_kaufpreis = st.number_input("Kaufpreis", min_value=0.0, step=1000.0)
-            im_kaufjahr = st.number_input("Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year)
-            im_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0)
-            im_ek = st.number_input("Eigenkapital", min_value=0.0, step=1000.0)
-            im_restschuld = st.number_input("Restschuld", min_value=0.0, step=1000.0)
-            im_rate = st.number_input("Monatliche Rate", min_value=0.0, step=10.0)
-            im_miete = st.number_input("Monatliche Mieteinnahmen", min_value=0.0, step=10.0)
-            if st.form_submit_button("Anlegen") and im_adresse:
-                with get_session() as session:
-                    session.add(PosRealEstate(
-                        user_id=aktiver_user["id"], adresse=im_adresse, kaufpreis=im_kaufpreis,
-                        kaufjahr=int(im_kaufjahr), wohnflaeche_qm=im_qm, eigenkapital=im_ek,
-                        restschuld=im_restschuld, monatliche_rate=im_rate, mieteinnahmen=im_miete,
-                        letzter_schaetzwert=im_kaufpreis, letztes_update=datetime.utcnow(),
-                    ))
-                st.rerun()
-
-    st.markdown("**Familienziel anlegen**")
-    with st.form("neues_ziel"):
-        z_name = st.text_input("Name (z.B. Notgroschen, Kinderstudium)")
-        z_betrag = st.number_input("Zielbetrag", min_value=0.0, step=100.0)
-        z_aktuell = st.number_input("Aktueller Stand", min_value=0.0, step=100.0)
-        z_datum = st.date_input("Zieldatum", value=None)
-        if st.form_submit_button("Anlegen") and z_name:
-            with get_session() as session:
-                session.add(PosFamilyGoal(name=z_name, ziel_betrag=z_betrag, aktuell_betrag=z_aktuell, zieldatum=z_datum))
-            st.rerun()
 
 
 def _kombinierte_summary(user_ids: list) -> dict:
@@ -290,12 +184,9 @@ def _kombinierte_summary(user_ids: list) -> dict:
     return gesamt
 
 
-st.title("💼 Portfolio-OS")
-st.caption(f"{'Familien-Portfolio' if familien_modus else aktiver_user['name']} · {BASE_URL}")
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Übersicht", "📋 Positionen", "⚖️ Rebalancing", "🧾 Steuer",
-    "🏠 Immobilie", "👨‍👩‍👧‍👦 Familie", "🤖 KI-Analyse",
+    "🏠 Immobilie", "👨‍👩‍👧‍👦 Familie", "🤖 KI-Analyse", "⚙️ Verwaltung",
 ])
 
 # ─────────────────────────────────────────────
@@ -335,7 +226,7 @@ with tab1:
                                font_color="#f9fafb", legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Noch keine Positionen erfasst – siehe ⚙️ Verwaltung in der Sidebar.")
+            st.info("Noch keine Positionen erfasst – siehe Tab ⚙️ Verwaltung.")
 
     with col_top:
         st.subheader("Top-Gewinner / Top-Verlierer")
@@ -369,13 +260,23 @@ with tab1:
             if z["fortschritt_pct"] >= 100:
                 st.success(f"🎉 Ziel „{z['name']}“ erreicht!")
     else:
-        st.caption("Keine Familienziele hinterlegt (siehe ⚙️ Verwaltung).")
+        st.caption("Keine Familienziele hinterlegt (siehe Tab ⚙️ Verwaltung).")
 
 
 # ─────────────────────────────────────────────
 # TAB 2 – POSITIONEN
 # ─────────────────────────────────────────────
 with tab2:
+    col_head, col_btn = st.columns([4, 1])
+    with col_head:
+        st.subheader("Alle Positionen")
+    with col_btn:
+        if st.button("🔄 Preise aktualisieren", key="preise_tab2_btn"):
+            with st.spinner("Aktualisiere Kurse via yfinance..."):
+                n = portfolio_module.update_prices()
+            st.success(f"{n} Position(en) aktualisiert")
+            st.rerun()
+
     alle_pos = []
     for uid in aktive_user_ids:
         alle_pos.extend(portfolio_module.get_positions(uid))
@@ -402,7 +303,24 @@ with tab2:
             "quantity": "Menge", "avg_buy_price": "Ø-Kaufpreis", "current_price": "Kurs",
             "market_value": "Wert", "unrealized_pnl": "G/V", "unrealized_pnl_pct": "G/V %",
         })
-        st.dataframe(anzeige, use_container_width=True, hide_index=True)
+
+        # G/V = (aktueller_kurs - avg_kaufpreis) * menge, G/V% analog –
+        # grün bei Gewinn, rot bei Verlust (gleiche Farben wie die KPI-Karten).
+        def _pnl_farbe(wert):
+            if pd.isna(wert):
+                return ""
+            farbe = "#34d399" if wert >= 0 else "#f87171"
+            return f"color: {farbe}; font-weight: 600"
+
+        styled = (
+            anzeige.style
+            .map(_pnl_farbe, subset=["G/V", "G/V %"])
+            .format({
+                "Ø-Kaufpreis": "{:.2f}", "Kurs": "{:.2f}", "Wert": "{:,.2f}",
+                "G/V": "{:+,.2f}", "G/V %": "{:+.1f}%",
+            })
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
         st.markdown("**Steuervorschau** _(Streamlit unterstützt kein echtes Hover – daher als Auswahl)_")
         ticker_wahl = st.selectbox("Position wählen", gefiltert["ticker"].tolist())
@@ -435,7 +353,7 @@ with tab3:
                     unsafe_allow_html=True,
                 )
         else:
-            st.info("Keine Ziel-Gewichtung hinterlegt (siehe ⚙️ Verwaltung).")
+            st.info("Keine Ziel-Gewichtung hinterlegt (siehe Tab ⚙️ Verwaltung).")
 
         st.subheader("Offene Vorschläge")
         offene = [p for p in rebalancing.get_rebalancing_history(uid) if p["status"] == "pending"]
@@ -479,7 +397,6 @@ with tab4:
         uid = aktiver_user["id"]
         rest = tax_engine.get_remaining_freistellung(uid)
         with get_session() as session:
-            from database import PosTaxConfig
             cfg = session.query(PosTaxConfig).filter_by(user_id=uid).first()
             freibetrag = cfg.freistellungsauftrag if cfg else 0.0
             genutzt = cfg.freistellungsgenutzt if cfg else 0.0
@@ -545,7 +462,7 @@ with tab5:
         } for i in immobilien]
 
     if not immobilien_data:
-        st.info("Keine Immobilie hinterlegt (siehe ⚙️ Verwaltung).")
+        st.info("Keine Immobilie hinterlegt (siehe Tab ⚙️ Verwaltung).")
     else:
         for im in immobilien_data:
             st.subheader(im["adresse"])
@@ -671,3 +588,242 @@ with tab7:
         st.caption(
             "Hinweis: Die KI empfiehlt, keine Anlageberatung. Alle Entscheidungen trifft der Nutzer selbst."
         )
+
+
+# ─────────────────────────────────────────────
+# TAB 8 – VERWALTUNG
+# ─────────────────────────────────────────────
+with tab8:
+    with get_session() as session:
+        asset_classes = session.query(PosAssetClass).all()
+        ac_options = {ac.name: ac.id for ac in asset_classes}
+        portfolios_all = [
+            {"id": p.id, "name": p.name, "typ": p.typ, "broker": p.broker}
+            for p in session.query(PosPortfolio).filter(PosPortfolio.user_id.in_(aktive_user_ids)).all()
+        ]
+    pf_options = {f"{p['name']} ({p['typ']})": p for p in portfolios_all}
+
+    # ---- Nutzer verwalten -----------------------------------------
+    st.subheader("Nutzer verwalten")
+    st.dataframe(pd.DataFrame(nutzer)[["name", "email", "rolle"]], use_container_width=True, hide_index=True)
+    with st.form("verwaltung_neuer_nutzer"):
+        n_name = st.text_input("Name", key="verw_nutzer_name")
+        n_email = st.text_input("E-Mail (optional)", key="verw_nutzer_email")
+        n_rolle = st.selectbox("Rolle", ["member", "admin"], key="verw_nutzer_rolle")
+        if st.form_submit_button("Nutzer anlegen") and n_name:
+            with get_session() as session:
+                get_or_create_user(session, n_name, n_email, rolle=n_rolle)
+            st.rerun()
+
+    st.divider()
+
+    # ---- Portfolios: anlegen / bearbeiten / löschen ----------------
+    st.subheader("Portfolios verwalten")
+    col_pf_neu, col_pf_edit = st.columns(2)
+
+    with col_pf_neu:
+        st.markdown("**Neues Portfolio**")
+        with st.form("neues_portfolio"):
+            pf_name = st.text_input("Name", key="pf_name")
+            pf_typ = st.selectbox("Typ", PORTFOLIO_TYPEN, key="pf_typ")
+            pf_broker = st.text_input("Broker (optional)", key="pf_broker")
+            if st.form_submit_button("Anlegen") and pf_name and not familien_modus:
+                with get_session() as session:
+                    session.add(PosPortfolio(user_id=aktiver_user["id"], name=pf_name, broker=pf_broker, typ=pf_typ))
+                st.rerun()
+
+    with col_pf_edit:
+        st.markdown("**Portfolio bearbeiten / löschen**")
+        if pf_options:
+            pf_wahl = st.selectbox("Portfolio", list(pf_options.keys()), key="pf_bearbeiten_wahl")
+            gewaehltes_pf = pf_options[pf_wahl]
+            with st.form("portfolio_bearbeiten"):
+                neuer_name = st.text_input("Name", value=gewaehltes_pf["name"], key="pf_edit_name")
+                neuer_typ = st.selectbox("Typ", PORTFOLIO_TYPEN,
+                                          index=PORTFOLIO_TYPEN.index(gewaehltes_pf["typ"]), key="pf_edit_typ")
+                neuer_broker = st.text_input("Broker", value=gewaehltes_pf["broker"] or "", key="pf_edit_broker")
+                if st.form_submit_button("Speichern"):
+                    portfolio_module.update_portfolio(gewaehltes_pf["id"], name=neuer_name, typ=neuer_typ, broker=neuer_broker)
+                    st.success("Portfolio aktualisiert")
+                    st.rerun()
+            if st.button("🗑️ Portfolio löschen", key="pf_loeschen_btn"):
+                _dialog_portfolio_loeschen(gewaehltes_pf["id"], gewaehltes_pf["name"])
+        else:
+            st.caption("Noch kein Portfolio angelegt.")
+
+    st.divider()
+
+    # ---- Transaktion erfassen (mit Ticker-Suche + Assetklasse) -----
+    st.subheader("Transaktion erfassen")
+
+    if "tx_kandidaten" not in st.session_state:
+        st.session_state.tx_kandidaten = []
+    if "tx_ticker_bestaetigt" not in st.session_state:
+        st.session_state.tx_ticker_bestaetigt = None
+
+    # Schritt 1: Ticker/ISIN eingeben und via yfinance auflösen lassen
+    # (außerhalb des st.form, da Formulare in Streamlit erst beim Submit
+    # neu rendern – für die Zwischenbestätigung brauchen wir sofortige Reruns).
+    tx_ticker_eingabe = st.text_input("Ticker oder ISIN eingeben", key="tx_ticker_eingabe")
+    if st.button("🔎 Ticker suchen", key="tx_ticker_suchen_btn"):
+        with st.spinner("Suche Ticker via yfinance..."):
+            kandidaten = portfolio_module.resolve_ticker(tx_ticker_eingabe)
+        st.session_state.tx_kandidaten = kandidaten
+        st.session_state.tx_ticker_bestaetigt = None
+        if not kandidaten:
+            st.warning(f"Kein Ticker für „{tx_ticker_eingabe}“ gefunden (auch nicht mit .DE-Suffix oder Volltextsuche).")
+
+    # Schritt 2: Gefundenen Kandidaten dem Nutzer zur Bestätigung anzeigen
+    if st.session_state.tx_kandidaten:
+        optionen = {
+            f"{k['symbol']} — {k['name']} ({k['exchange']})": k
+            for k in st.session_state.tx_kandidaten
+        }
+        wahl = st.selectbox("Gefunden – bitte bestätigen", list(optionen.keys()), key="tx_kandidat_wahl")
+        if st.button("✅ Ticker bestätigen", key="tx_ticker_bestaetigen_btn"):
+            st.session_state.tx_ticker_bestaetigt = optionen[wahl]["symbol"]
+            st.session_state.tx_kandidaten = []
+            st.rerun()
+
+    # Schritt 3: Erst NACH Bestätigung die eigentliche Buchungsmaske zeigen
+    if st.session_state.tx_ticker_bestaetigt:
+        st.success(f"Aktiver Ticker für die Buchung: **{st.session_state.tx_ticker_bestaetigt}**")
+        with st.form("neue_transaktion"):
+            tx_pf = st.selectbox("Portfolio", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"])
+            tx_typ = st.selectbox("Typ", ["kauf", "verkauf", "dividende", "sparrate"])
+            tx_asset_class = st.selectbox("Assetklasse", list(ac_options.keys()) if ac_options else ["(keine vorhanden)"])
+            tx_qty = st.number_input("Menge", min_value=0.0, step=1.0)
+            tx_price = st.number_input("Preis", min_value=0.0, step=0.01)
+            tx_fees = st.number_input("Gebühren", min_value=0.0, step=0.01)
+            tx_datum = st.date_input("Datum", value=date.today())
+            if st.form_submit_button("Buchen") and pf_options and tx_qty > 0:
+                try:
+                    portfolio_module.add_transaction(
+                        pf_options[tx_pf]["id"], tx_typ, st.session_state.tx_ticker_bestaetigt,
+                        tx_qty, tx_price, tx_datum, tx_fees,
+                        asset_class_id=ac_options.get(tx_asset_class),
+                    )
+                    st.success("Transaktion gebucht")
+                    st.session_state.tx_ticker_bestaetigt = None
+                except Exception as e:
+                    st.error(f"Fehler: {e}")
+    else:
+        st.caption("Bitte zuerst einen Ticker suchen und bestätigen.")
+
+    st.divider()
+
+    # ---- CSV-Import --------------------------------------------------
+    st.subheader("CSV-Import")
+    with st.form("csv_import"):
+        csv_pf = st.selectbox("Portfolio ", list(pf_options.keys()) if pf_options else ["(erst Portfolio anlegen)"], key="csv_pf")
+        csv_broker = st.selectbox("Broker", ["comdirect", "tr"])
+        csv_file = st.file_uploader("CSV-Datei", type=["csv"])
+        if st.form_submit_button("Importieren") and pf_options and csv_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                tmp.write(csv_file.getvalue())
+                tmp_path = tmp.name
+            try:
+                ergebnis = portfolio_module.import_csv(pf_options[csv_pf]["id"], tmp_path, csv_broker)
+                st.success(f"{ergebnis['imported']} importiert, {ergebnis['skipped']} übersprungen")
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+            finally:
+                os.unlink(tmp_path)
+
+    st.divider()
+
+    # ---- Positionen / Transaktionen löschen --------------------------
+    st.subheader("Positionen / Transaktionen löschen")
+    alle_pos_verwaltung = []
+    for uid in aktive_user_ids:
+        alle_pos_verwaltung.extend(portfolio_module.get_positions(uid))
+
+    if alle_pos_verwaltung:
+        pos_options = {f"{p['ticker']} ({p['portfolio_name']})": p for p in alle_pos_verwaltung}
+        pos_wahl = st.selectbox("Position", list(pos_options.keys()), key="pos_loeschen_wahl")
+        gewaehlte_pos = pos_options[pos_wahl]
+
+        if st.button("🗑️ Position löschen (inkl. aller Transaktionen)", key="pos_loeschen_btn"):
+            _dialog_position_loeschen(gewaehlte_pos["id"], gewaehlte_pos["ticker"])
+
+        with get_session() as session:
+            txs = [
+                {"id": t.id, "typ": t.typ, "datum": t.datum, "quantity": t.quantity, "price": t.price, "fees": t.fees}
+                for t in session.query(PosTransaction)
+                .filter_by(position_id=gewaehlte_pos["id"])
+                .order_by(PosTransaction.datum.desc())
+                .all()
+            ]
+        if txs:
+            st.markdown(f"**Transaktionen von {gewaehlte_pos['ticker']}**")
+            for t in txs:
+                col_info, col_del = st.columns([5, 1])
+                col_info.write(f"{t['datum']} · {t['typ']} · {t['quantity']} @ {t['price']:.2f} € (Gebühren {t['fees']:.2f} €)")
+                if col_del.button("🗑️", key=f"tx_del_{t['id']}"):
+                    portfolio_module.delete_transaction(t["id"])
+                    st.rerun()
+        else:
+            st.caption("Keine Transaktionen für diese Position.")
+    else:
+        st.caption("Keine Positionen vorhanden.")
+
+    st.divider()
+
+    # ---- Zielgewichtungen ---------------------------------------------
+    if not familien_modus:
+        st.subheader("Ziel-Gewichtung")
+        with st.form("ziel_gewichtung"):
+            tw_class = st.selectbox("Assetklasse", list(ac_options.keys()))
+            tw_target = st.slider("Ziel-%", 0, 100, 20)
+            tw_min = st.slider("Min-%", 0, 100, max(0, tw_target - 5))
+            tw_max = st.slider("Max-%", 0, 100, min(100, tw_target + 5))
+            if st.form_submit_button("Speichern"):
+                with get_session() as session:
+                    existing = session.query(PosTargetWeight).filter_by(
+                        user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class]
+                    ).first()
+                    if existing:
+                        existing.target_pct, existing.min_pct, existing.max_pct = tw_target / 100, tw_min / 100, tw_max / 100
+                    else:
+                        session.add(PosTargetWeight(
+                            user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class],
+                            target_pct=tw_target / 100, min_pct=tw_min / 100, max_pct=tw_max / 100,
+                        ))
+                st.success("Ziel-Gewichtung gespeichert")
+
+        st.divider()
+
+        # ---- Immobilie anlegen -----------------------------------------
+        st.subheader("Immobilie anlegen")
+        with st.form("neue_immobilie"):
+            im_adresse = st.text_input("Adresse")
+            im_kaufpreis = st.number_input("Kaufpreis", min_value=0.0, step=1000.0)
+            im_kaufjahr = st.number_input("Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year)
+            im_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0)
+            im_ek = st.number_input("Eigenkapital", min_value=0.0, step=1000.0)
+            im_restschuld = st.number_input("Restschuld", min_value=0.0, step=1000.0)
+            im_rate = st.number_input("Monatliche Rate", min_value=0.0, step=10.0)
+            im_miete = st.number_input("Monatliche Mieteinnahmen", min_value=0.0, step=10.0)
+            if st.form_submit_button("Anlegen") and im_adresse:
+                with get_session() as session:
+                    session.add(PosRealEstate(
+                        user_id=aktiver_user["id"], adresse=im_adresse, kaufpreis=im_kaufpreis,
+                        kaufjahr=int(im_kaufjahr), wohnflaeche_qm=im_qm, eigenkapital=im_ek,
+                        restschuld=im_restschuld, monatliche_rate=im_rate, mieteinnahmen=im_miete,
+                        letzter_schaetzwert=im_kaufpreis, letztes_update=datetime.utcnow(),
+                    ))
+                st.rerun()
+
+        st.divider()
+
+    # ---- Familienziel anlegen -----------------------------------------
+    st.subheader("Familienziel anlegen")
+    with st.form("neues_ziel"):
+        z_name = st.text_input("Name (z.B. Notgroschen, Kinderstudium)")
+        z_betrag = st.number_input("Zielbetrag", min_value=0.0, step=100.0)
+        z_aktuell = st.number_input("Aktueller Stand", min_value=0.0, step=100.0)
+        z_datum = st.date_input("Zieldatum", value=None)
+        if st.form_submit_button("Anlegen") and z_name:
+            with get_session() as session:
+                session.add(PosFamilyGoal(name=z_name, ziel_betrag=z_betrag, aktuell_betrag=z_aktuell, zieldatum=z_datum))
+            st.rerun()
