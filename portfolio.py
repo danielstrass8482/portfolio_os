@@ -306,8 +306,9 @@ def delete_position(position_id: int):
 # PORTFOLIO-VERWALTUNG (CRUD)
 # ─────────────────────────────────────────────
 
-def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broker: str = None):
-    """Ändert Name/Typ/Broker eines bestehenden Portfolios (nur übergebene Felder werden geändert)."""
+def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broker: str = None,
+                      is_kinderdepot: bool = None):
+    """Ändert Name/Typ/Broker/Kinderdepot-Flag eines bestehenden Portfolios (nur übergebene Felder werden geändert)."""
     with get_session() as session:
         portfolio = session.get(PosPortfolio, portfolio_id)
         if portfolio is None:
@@ -318,6 +319,8 @@ def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broke
             portfolio.typ = typ
         if broker is not None:
             portfolio.broker = broker
+        if is_kinderdepot is not None:
+            portfolio.is_kinderdepot = is_kinderdepot
 
 
 def delete_portfolio(portfolio_id: int):
@@ -374,12 +377,48 @@ def _aktueller_kurs(ticker: str) -> float:
     return None
 
 
+def get_price_in_eur(ticker: str) -> float:
+    """
+    Aktueller Kurs eines Tickers, umgerechnet in EUR. Liest die von yfinance
+    gemeldete Handelswährung (info["currency"]) aus statt den Rohpreis
+    unkonvertiert zu übernehmen – London-Stock-Exchange-Ticker (".L") notieren
+    in Pence (GBp), nicht Pfund, und müssen vor der FX-Umrechnung durch 100
+    geteilt werden. yfinance meldet das nicht bei jedem ".L"-Ticker korrekt
+    als "GBp", daher zusätzlich am Suffix erkannt.
+    """
+    t = yf.Ticker(ticker)
+    info = t.info
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    currency = info.get("currency", "EUR")
+
+    if price is None:
+        return None
+
+    if currency == "GBp" or ticker.upper().endswith(".L"):
+        price = price / 100
+        currency = "GBP"
+
+    if currency == "GBP":
+        fx = yf.Ticker("GBPEUR=X").info.get("regularMarketPrice", 1.18)
+        price = price * fx
+    elif currency == "USD":
+        fx = yf.Ticker("EURUSD=X").info.get("regularMarketPrice", 1.08)
+        price = price / fx
+    elif currency == "CHF":
+        fx = yf.Ticker("CHFEUR=X").info.get("regularMarketPrice", 1.04)
+        price = price * fx
+    # EUR bleibt EUR
+
+    return round(price, 2)
+
+
 def update_prices() -> int:
     """
-    Aktualisiert current_price aller Positionen (siehe _aktueller_kurs()).
-    Läuft fehlertolerant: einzelne nicht auflösbare Ticker überspringen den
-    Rest nicht, werden aber geloggt. Gibt die Anzahl erfolgreich
-    aktualisierter Positionen zurück.
+    Aktualisiert current_price aller Positionen – Preise werden über
+    get_price_in_eur() geholt, laufen also immer bereits in EUR umgerechnet
+    ein (siehe get_price_in_eur()). Läuft fehlertolerant: einzelne nicht
+    auflösbare oder fehlerhafte Ticker überspringen den Rest nicht, werden
+    aber geloggt. Gibt die Anzahl erfolgreich aktualisierter Positionen zurück.
     """
     updated = 0
     with get_session() as session:
@@ -387,11 +426,16 @@ def update_prices() -> int:
         for pos in positions:
             if not pos.ticker:
                 continue
-            preis = _aktueller_kurs(pos.ticker)
+            try:
+                preis = get_price_in_eur(pos.ticker)
+            except Exception as e:
+                print(f"⚠️  Fehler beim Kursabruf für Ticker '{pos.ticker}': {e} (übersprungen)")
+                continue
             if preis is None:
                 print(f"⚠️  Kein aktueller Kurs für Ticker '{pos.ticker}' gefunden (übersprungen)")
                 continue
             pos.current_price = preis
+            pos.currency = "EUR"
             pos.last_updated = datetime.utcnow()
             updated += 1
 

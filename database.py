@@ -50,11 +50,12 @@ class PosPortfolio(Base):
     """Ein Depot/Konto (z.B. Comdirect-Depot, Binance-Wallet, Girokonto)."""
     __tablename__ = "pos_portfolios"
 
-    id       = Column(Integer, primary_key=True, autoincrement=True)
-    user_id  = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
-    name     = Column(String(150), nullable=False)
-    broker   = Column(String(100), nullable=True)
-    typ      = Column(String(20), nullable=False)   # depot / krypto / immobilie / konto
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    user_id        = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    name           = Column(String(150), nullable=False)
+    broker         = Column(String(100), nullable=True)
+    typ            = Column(String(20), nullable=False)   # depot / krypto / immobilie / konto
+    is_kinderdepot = Column(Boolean, default=False)
 
     user      = relationship("PosUser", back_populates="portfolios")
     positions = relationship("PosPosition", back_populates="portfolio", cascade="all, delete-orphan")

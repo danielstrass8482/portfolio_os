@@ -29,6 +29,34 @@ import tax_engine
 import rebalancing
 import llm_analyst
 
+def fmt_eur(wert, nachkommastellen=2):
+    if wert is None:
+        return "–"
+    return f"{wert:,.{nachkommastellen}f}".replace(",", "X").replace(".", ",").replace("X", ".") + " €"
+
+
+def fmt_zahl(wert, nachkommastellen=2):
+    if wert is None:
+        return "–"
+    return f"{wert:,.{nachkommastellen}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_menge(menge):
+    if menge is None:
+        return "–"
+    if menge == int(menge):
+        return str(int(menge))
+    return f"{menge:.4f}".replace(".", ",")
+
+
+def _tabellen_safe(fn):
+    """Wrappt fmt_eur/fmt_zahl/fmt_menge für pandas Styler.format() – NaN
+    (z.B. aus noch nie aktualisierten current_price-Werten) wird von pandas
+    aus None erzeugt und würde sonst nicht durch die 'wert is None'-Prüfung
+    der Formatierer abgefangen."""
+    return lambda w: fn(None if pd.isna(w) else w)
+
+
 PORTFOLIO_TYPEN = ["depot", "krypto", "immobilie", "konto"]
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
@@ -198,11 +226,12 @@ with tab1:
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f'<div class="kpi-card"><div class="kpi-label">Gesamtvermögen</div>'
-                    f'<div class="kpi-value neutral">{summary["gesamtvermoegen"]:,.2f} €</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-value neutral">{fmt_eur(summary["gesamtvermoegen"])}</div></div>', unsafe_allow_html=True)
     with c2:
         klasse = "positive" if summary["unrealized_pnl"] >= 0 else "negative"
+        vz = "+" if summary["unrealized_pnl"] >= 0 else ""
         st.markdown(f'<div class="kpi-card"><div class="kpi-label">Unrealisierter G/V</div>'
-                    f'<div class="kpi-value {klasse}">{summary["unrealized_pnl"]:+,.2f} €</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-value {klasse}">{vz}{fmt_eur(summary["unrealized_pnl"])}</div></div>', unsafe_allow_html=True)
     with c3:
         st.markdown(f'<div class="kpi-card"><div class="kpi-label">Positionen</div>'
                     f'<div class="kpi-value neutral">{summary["positions_count"]}</div></div>', unsafe_allow_html=True)
@@ -235,14 +264,24 @@ with tab1:
             alle_pos.extend(portfolio_module.get_positions(uid))
         bewertbar = [p for p in alle_pos if p["unrealized_pnl_pct"] is not None]
         if bewertbar:
-            top_gewinner = sorted(bewertbar, key=lambda p: -p["unrealized_pnl_pct"])[:3]
-            top_verlierer = sorted(bewertbar, key=lambda p: p["unrealized_pnl_pct"])[:3]
+            gewinner_pool = [p for p in bewertbar if p["unrealized_pnl_pct"] > 0]
+            verlierer_pool = [p for p in bewertbar if p["unrealized_pnl_pct"] < 0]
+            top_gewinner = sorted(gewinner_pool, key=lambda p: -p["unrealized_pnl_pct"])[:3]
+            top_verlierer = sorted(verlierer_pool, key=lambda p: p["unrealized_pnl_pct"])[:3]
+
             st.caption("🏆 Gewinner")
-            for p in top_gewinner:
-                st.markdown(f"**{p['ticker']}** — {p['unrealized_pnl_pct']:+.1f}%")
+            if top_gewinner:
+                for p in top_gewinner:
+                    st.markdown(f"**{p['ticker']}** — +{fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
+            else:
+                st.info("Keine Gewinner heute")
+
             st.caption("📉 Verlierer")
-            for p in top_verlierer:
-                st.markdown(f"**{p['ticker']}** — {p['unrealized_pnl_pct']:+.1f}%")
+            if top_verlierer:
+                for p in top_verlierer:
+                    st.markdown(f"**{p['ticker']}** — {fmt_zahl(p['unrealized_pnl_pct'], 1)}%")
+            else:
+                st.caption("Keine Verlierer heute")
         else:
             st.info("Noch keine bewerteten Positionen (Kurse aktualisieren).")
 
@@ -256,7 +295,8 @@ with tab1:
     if ziele:
         for z in ziele:
             st.progress(min(1.0, z["fortschritt_pct"] / 100),
-                        text=f"{z['name']}: {z['fortschritt_pct']:.0f}% ({z['aktuell_betrag']:,.0f}/{z['ziel_betrag']:,.0f} €)")
+                        text=f"{z['name']}: {fmt_zahl(z['fortschritt_pct'], 0)}% "
+                             f"({fmt_zahl(z['aktuell_betrag'], 0)}/{fmt_zahl(z['ziel_betrag'], 0)} €)")
             if z["fortschritt_pct"] >= 100:
                 st.success(f"🎉 Ziel „{z['name']}“ erreicht!")
     else:
@@ -312,23 +352,77 @@ with tab2:
             farbe = "#34d399" if wert >= 0 else "#f87171"
             return f"color: {farbe}; font-weight: 600"
 
+        def _vz_eur(w):
+            if pd.isna(w):
+                return "–"
+            return ("+" if w >= 0 else "") + fmt_eur(w)
+
+        def _vz_pct(w):
+            if pd.isna(w):
+                return "–"
+            return ("+" if w >= 0 else "") + fmt_zahl(w, 1) + "%"
+
         styled = (
             anzeige.style
             .map(_pnl_farbe, subset=["G/V", "G/V %"])
             .format({
-                "Ø-Kaufpreis": "{:.2f}", "Kurs": "{:.2f}", "Wert": "{:,.2f}",
-                "G/V": "{:+,.2f}", "G/V %": "{:+.1f}%",
+                "Menge": _tabellen_safe(fmt_menge),
+                "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
+                "Kurs": _tabellen_safe(fmt_eur),
+                "Wert": _tabellen_safe(fmt_eur),
+                "G/V": _vz_eur,
+                "G/V %": _vz_pct,
             })
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
-        st.markdown("**Steuervorschau** _(Streamlit unterstützt kein echtes Hover – daher als Auswahl)_")
+        st.markdown("**Steuervorschau**")
         ticker_wahl = st.selectbox("Position wählen", gefiltert["ticker"].tolist())
         gewaehlte_pos = next(p for p in alle_pos if p["ticker"] == ticker_wahl)
         if st.button("Steuervorschau anzeigen"):
             try:
-                preview = tax_engine.get_tax_preview(gewaehlte_pos["id"], gewaehlte_pos["current_price"] or gewaehlte_pos["avg_buy_price"])
-                st.json(preview)
+                verkaufspreis = gewaehlte_pos["current_price"] or gewaehlte_pos["avg_buy_price"]
+                preview = tax_engine.get_tax_preview(gewaehlte_pos["id"], verkaufspreis)
+
+                with get_session() as _s:
+                    _pf = _s.get(PosPortfolio, gewaehlte_pos["portfolio_id"])
+                    steuer_user_id = _pf.user_id if _pf else None
+                rest_vor = tax_engine.get_remaining_freistellung(steuer_user_id) if steuer_user_id else 0.0
+                rest_nach = max(0.0, rest_vor - preview.get("freistellung_verrechnet", 0.0))
+
+                brutto_erloes = preview["quantity"] * verkaufspreis
+                einkaufswert = preview["quantity"] * (gewaehlte_pos["avg_buy_price"] or 0.0)
+                gewinn = preview["brutto_gewinn"]
+                gv_label = "Unrealisierter Gewinn" if gewinn >= 0 else "Unrealisierter Verlust"
+
+                if gewinn <= 0:
+                    hinweis = (
+                        "✅ Keine Steuer fällig – du realisierst einen Verlust.\n"
+                        "Dieser Verlust wird in deinen Verlusttopf eingebucht und kann\n"
+                        "zukünftige Gewinne steuerlich ausgleichen."
+                    )
+                elif preview["steuer"] == 0:
+                    hinweis = (
+                        "✅ Keine Steuer fällig – der Gewinn wird vollständig über Verlusttopf "
+                        "und/oder Freistellungsauftrag abgedeckt."
+                    )
+                else:
+                    hinweis = (
+                        f"💰 Geschätzte Steuer: {fmt_eur(preview['steuer'])}\n"
+                        f"Netto-Erlös nach Steuer: {fmt_eur(preview['netto_erloes'])}"
+                    )
+
+                text = (
+                    f"📊 Steuervorschau: {gewaehlte_pos['name']} ({gewaehlte_pos['ticker']})\n\n"
+                    f"Wenn du alle {fmt_menge(preview['quantity'])} Anteile heute zum aktuellen "
+                    f"Kurs von {fmt_eur(verkaufspreis)} verkaufst:\n\n"
+                    f"Bruttoerlös:              {fmt_eur(brutto_erloes)}\n"
+                    f"Einkaufswert:             {fmt_eur(einkaufswert)}\n"
+                    f"{gv_label}:{' ' * max(1, 15 - len(gv_label))}{fmt_eur(gewinn)}\n\n"
+                    f"{hinweis}\n\n"
+                    f"Verbleibender Freistellungsauftrag: {fmt_eur(rest_nach)}"
+                )
+                st.text(text)
             except Exception as e:
                 st.error(f"Fehler: {e}")
 
@@ -403,19 +497,34 @@ with tab4:
 
         st.subheader("Freistellungsauftrag")
         st.progress(min(1.0, genutzt / freibetrag) if freibetrag else 0.0,
-                    text=f"{genutzt:,.2f} / {freibetrag:,.2f} € genutzt (Rest: {rest:,.2f} €)")
+                    text=f"{fmt_zahl(genutzt)} / {fmt_zahl(freibetrag)} € genutzt (Rest: {fmt_zahl(rest)} €)")
 
         st.subheader(f"Realisierte Gewinne/Verluste {date.today().year} (YTD)")
         uebersicht = tax_engine.generate_jahresuebersicht(uid, date.today().year)
         c1, c2, c3 = st.columns(3)
-        c1.metric("Gewinne", f"{uebersicht['realisierte_gewinne']:,.2f} €")
-        c2.metric("Verluste", f"{uebersicht['realisierte_verluste']:,.2f} €")
-        c3.metric("Gezahlte Steuer", f"{uebersicht['steuer_gezahlt']:,.2f} €")
+        c1.metric("Gewinne", fmt_eur(uebersicht['realisierte_gewinne']))
+        c2.metric("Verluste", fmt_eur(uebersicht['realisierte_verluste']))
+        c3.metric("Gezahlte Steuer", fmt_eur(uebersicht['steuer_gezahlt']))
 
         st.subheader("Tax-Loss-Harvesting-Kandidaten")
         kandidaten = tax_engine.find_tax_loss_harvesting(uid)
         if kandidaten:
-            st.dataframe(pd.DataFrame(kandidaten), use_container_width=True, hide_index=True)
+            df_tlh = pd.DataFrame(kandidaten).drop(columns=["position_id"]).rename(columns={
+                "ticker": "Name der Position",
+                "quantity": "Anzahl",
+                "avg_buy_price": "Ø-Kaufpreis",
+                "current_price": "Aktueller Kurs",
+                "unrealisierter_verlust": "Unrealisierter Verlust",
+                "geschaetzte_steuerersparnis": "Geschätzte Steuerersparnis",
+            })
+            styled_tlh = df_tlh.style.format({
+                "Anzahl": _tabellen_safe(fmt_menge),
+                "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
+                "Aktueller Kurs": _tabellen_safe(fmt_eur),
+                "Unrealisierter Verlust": _tabellen_safe(fmt_eur),
+                "Geschätzte Steuerersparnis": _tabellen_safe(fmt_eur),
+            })
+            st.dataframe(styled_tlh, use_container_width=True, hide_index=True)
         else:
             st.caption("Keine Positionen im Minus.")
 
@@ -430,15 +539,17 @@ with tab4:
                 pdf.set_font("Helvetica", "B", 16)
                 pdf.cell(0, 10, f"Jahresuebersicht {int(jahr_wahl)}", ln=True)
                 pdf.set_font("Helvetica", "", 11)
+                # "EUR" statt "€" hier bewusst beibehalten: FPDFs Kernschrift
+                # Helvetica unterstützt kein €-Glyph ohne Unicode-Font-Einbettung.
                 for label, wert in [
                     ("Nutzer", aktiver_user["name"]),
-                    ("Realisierte Gewinne", f"{uebersicht_jahr['realisierte_gewinne']:.2f} EUR"),
-                    ("Realisierte Verluste", f"{uebersicht_jahr['realisierte_verluste']:.2f} EUR"),
-                    ("Netto-Ergebnis", f"{uebersicht_jahr['netto_ergebnis']:.2f} EUR"),
-                    ("Gezahlte Steuer", f"{uebersicht_jahr['steuer_gezahlt']:.2f} EUR"),
-                    ("Freistellungsauftrag", f"{uebersicht_jahr['freistellungsauftrag']:.2f} EUR"),
-                    ("Freistellung genutzt (aktuell)", f"{uebersicht_jahr['freistellung_genutzt_aktuell']:.2f} EUR"),
-                    ("Verlusttopf (aktuell)", f"{uebersicht_jahr['verlusttopf_aktuell']:.2f} EUR"),
+                    ("Realisierte Gewinne", f"{fmt_zahl(uebersicht_jahr['realisierte_gewinne'])} EUR"),
+                    ("Realisierte Verluste", f"{fmt_zahl(uebersicht_jahr['realisierte_verluste'])} EUR"),
+                    ("Netto-Ergebnis", f"{fmt_zahl(uebersicht_jahr['netto_ergebnis'])} EUR"),
+                    ("Gezahlte Steuer", f"{fmt_zahl(uebersicht_jahr['steuer_gezahlt'])} EUR"),
+                    ("Freistellungsauftrag", f"{fmt_zahl(uebersicht_jahr['freistellungsauftrag'])} EUR"),
+                    ("Freistellung genutzt (aktuell)", f"{fmt_zahl(uebersicht_jahr['freistellung_genutzt_aktuell'])} EUR"),
+                    ("Verlusttopf (aktuell)", f"{fmt_zahl(uebersicht_jahr['verlusttopf_aktuell'])} EUR"),
                 ]:
                     pdf.cell(0, 8, f"{label}: {wert}", ln=True)
                 pdf_bytes = bytes(pdf.output())
@@ -462,7 +573,28 @@ with tab5:
         } for i in immobilien]
 
     if not immobilien_data:
-        st.info("Keine Immobilie hinterlegt (siehe Tab ⚙️ Verwaltung).")
+        if familien_modus:
+            st.info("Keine Immobilie hinterlegt. Bitte oben einen Nutzer auswählen, um eine anzulegen.")
+        else:
+            st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen:")
+            with st.form("neue_immobilie_tab5"):
+                im5_adresse = st.text_input("Adresse")
+                im5_kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0)
+                im5_kaufjahr = st.number_input("Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year)
+                im5_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0)
+                im5_ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0)
+                im5_restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0)
+                im5_rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0)
+                im5_miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0)
+                if st.form_submit_button("Speichern") and im5_adresse:
+                    with get_session() as session:
+                        session.add(PosRealEstate(
+                            user_id=aktiver_user["id"], adresse=im5_adresse, kaufpreis=im5_kaufpreis,
+                            kaufjahr=int(im5_kaufjahr), wohnflaeche_qm=im5_qm, eigenkapital=im5_ek,
+                            restschuld=im5_restschuld, monatliche_rate=im5_rate, mieteinnahmen=im5_miete,
+                            letzter_schaetzwert=im5_kaufpreis, letztes_update=datetime.utcnow(),
+                        ))
+                    st.rerun()
     else:
         for im in immobilien_data:
             st.subheader(im["adresse"])
@@ -473,9 +605,9 @@ with tab5:
             ek_rendite = (jahres_cashflow / im["eigenkapital"]) if im["eigenkapital"] else 0.0
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Letzter Schätzwert", f"{schaetzwert:,.0f} €")
-            c2.metric("LTV-Ratio", f"{ltv*100:.1f}%")
-            c3.metric("Eigenkapitalrendite (Cash-on-Cash)", f"{ek_rendite*100:.1f}%")
+            c1.metric("Letzter Schätzwert", fmt_eur(schaetzwert, 0))
+            c2.metric("LTV-Ratio", f"{fmt_zahl(ltv*100, 1)}%")
+            c3.metric("Eigenkapitalrendite (Cash-on-Cash)", f"{fmt_zahl(ek_rendite*100, 1)}%")
 
             if st.button("🤖 KI-Schätzung anfordern", key=f"ki_schaetzung_{im['id']}"):
                 with st.spinner("Fordere KI-Schätzung an (Web-Suche)..."):
@@ -507,12 +639,12 @@ with tab6:
     for n in nutzer:
         with get_session() as session:
             portfolios_n = [
-                {"name": p.name, "typ": p.typ, "broker": p.broker}
+                {"name": p.name, "typ": p.typ, "broker": p.broker, "is_kinderdepot": p.is_kinderdepot}
                 for p in session.query(PosPortfolio).filter_by(user_id=n["id"]).all()
             ]
         for p in portfolios_n:
             eintrag = {"Nutzer": n["name"], "Depot": p["name"], "Typ": p["typ"], "Broker": p["broker"]}
-            if "kind" in p["name"].lower():
+            if p["is_kinderdepot"]:
                 kinder_zeilen.append(eintrag)
             else:
                 zeilen.append(eintrag)
@@ -523,7 +655,7 @@ with tab6:
         st.dataframe(pd.DataFrame(zeilen) if zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
                      use_container_width=True, hide_index=True)
     with c2:
-        st.markdown("**Kinderdepots** _(Depotname enthält „Kind“)_")
+        st.markdown("**Kinderdepots**")
         st.dataframe(pd.DataFrame(kinder_zeilen) if kinder_zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
                      use_container_width=True, hide_index=True)
 
@@ -531,8 +663,9 @@ with tab6:
     uebersicht_nutzer = []
     for n in nutzer:
         s = portfolio_module.get_portfolio_summary(n["id"])
-        uebersicht_nutzer.append({"Nutzer": n["name"], "Rolle": n["rolle"], "Vermögen": s["gesamtvermoegen"]})
-    st.dataframe(pd.DataFrame(uebersicht_nutzer), use_container_width=True, hide_index=True)
+        uebersicht_nutzer.append({"Nutzer": n["name"], "Vermögen": s["gesamtvermoegen"]})
+    df_verm = pd.DataFrame(uebersicht_nutzer)
+    st.dataframe(df_verm.style.format({"Vermögen": _tabellen_safe(fmt_eur)}), use_container_width=True, hide_index=True)
 
     st.subheader("Gemeinsame Ziele")
     with get_session() as session:
@@ -542,7 +675,7 @@ with tab6:
         ]
     if ziele:
         for z in ziele:
-            st.progress(min(1.0, z["fortschritt_pct"] / 100), text=f"{z['name']}: {z['fortschritt_pct']:.0f}%")
+            st.progress(min(1.0, z["fortschritt_pct"] / 100), text=f"{z['name']}: {fmt_zahl(z['fortschritt_pct'], 0)}%")
     else:
         st.caption("Keine gemeinsamen Ziele hinterlegt.")
 
@@ -598,7 +731,7 @@ with tab8:
         asset_classes = session.query(PosAssetClass).all()
         ac_options = {ac.name: ac.id for ac in asset_classes}
         portfolios_all = [
-            {"id": p.id, "name": p.name, "typ": p.typ, "broker": p.broker}
+            {"id": p.id, "name": p.name, "typ": p.typ, "broker": p.broker, "is_kinderdepot": p.is_kinderdepot}
             for p in session.query(PosPortfolio).filter(PosPortfolio.user_id.in_(aktive_user_ids)).all()
         ]
     pf_options = {f"{p['name']} ({p['typ']})": p for p in portfolios_all}
@@ -627,9 +760,11 @@ with tab8:
             pf_name = st.text_input("Name", key="pf_name")
             pf_typ = st.selectbox("Typ", PORTFOLIO_TYPEN, key="pf_typ")
             pf_broker = st.text_input("Broker (optional)", key="pf_broker")
+            pf_kinderdepot = st.checkbox("Kinderdepot", key="pf_kinderdepot")
             if st.form_submit_button("Anlegen") and pf_name and not familien_modus:
                 with get_session() as session:
-                    session.add(PosPortfolio(user_id=aktiver_user["id"], name=pf_name, broker=pf_broker, typ=pf_typ))
+                    session.add(PosPortfolio(user_id=aktiver_user["id"], name=pf_name, broker=pf_broker,
+                                              typ=pf_typ, is_kinderdepot=pf_kinderdepot))
                 st.rerun()
 
     with col_pf_edit:
@@ -642,8 +777,11 @@ with tab8:
                 neuer_typ = st.selectbox("Typ", PORTFOLIO_TYPEN,
                                           index=PORTFOLIO_TYPEN.index(gewaehltes_pf["typ"]), key="pf_edit_typ")
                 neuer_broker = st.text_input("Broker", value=gewaehltes_pf["broker"] or "", key="pf_edit_broker")
+                neuer_kinderdepot = st.checkbox("Kinderdepot", value=gewaehltes_pf["is_kinderdepot"] or False,
+                                                 key="pf_edit_kinderdepot")
                 if st.form_submit_button("Speichern"):
-                    portfolio_module.update_portfolio(gewaehltes_pf["id"], name=neuer_name, typ=neuer_typ, broker=neuer_broker)
+                    portfolio_module.update_portfolio(gewaehltes_pf["id"], name=neuer_name, typ=neuer_typ,
+                                                        broker=neuer_broker, is_kinderdepot=neuer_kinderdepot)
                     st.success("Portfolio aktualisiert")
                     st.rerun()
             if st.button("🗑️ Portfolio löschen", key="pf_loeschen_btn"):
@@ -758,7 +896,8 @@ with tab8:
             st.markdown(f"**Transaktionen von {gewaehlte_pos['ticker']}**")
             for t in txs:
                 col_info, col_del = st.columns([5, 1])
-                col_info.write(f"{t['datum']} · {t['typ']} · {t['quantity']} @ {t['price']:.2f} € (Gebühren {t['fees']:.2f} €)")
+                col_info.write(f"{t['datum']} · {t['typ']} · {fmt_menge(t['quantity'])} @ {fmt_eur(t['price'])} "
+                                f"(Gebühren {fmt_eur(t['fees'])})")
                 if col_del.button("🗑️", key=f"tx_del_{t['id']}"):
                     portfolio_module.delete_transaction(t["id"])
                     st.rerun()
