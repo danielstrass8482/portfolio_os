@@ -5,6 +5,7 @@ bei blockiertem 465). Fällt SMTP aus, wird nur geloggt – nie ein Absturz.
 """
 
 import smtplib
+import base64
 from email.mime.text import MIMEText
 from datetime import date
 
@@ -13,6 +14,23 @@ from config import (
     SMTP_USER, SMTP_PASSWORD, SMTP_TIMEOUT, BASE_URL,
 )
 
+
+def _smtp_login_utf8(server, user, password):
+    """
+    AUTH LOGIN von Hand, da smtplib.auth()/login() den Base64-Payload intern
+    mit .encode("ascii") kodiert und damit bei Nicht-ASCII-Zeichen (Umlaute)
+    im Passwort mit UnicodeEncodeError abstuerzt.
+    """
+    server.ehlo()
+    code, resp = server.docmd("AUTH", "LOGIN")
+    if code != 334:
+        raise smtplib.SMTPAuthenticationError(code, resp)
+    code, resp = server.docmd(base64.b64encode(user.encode("utf-8")).decode("ascii"))
+    if code != 334:
+        raise smtplib.SMTPAuthenticationError(code, resp)
+    code, resp = server.docmd(base64.b64encode(password.encode("utf-8")).decode("ascii"))
+    if code not in (235, 503):
+        raise smtplib.SMTPAuthenticationError(code, resp)
 
 def send_email(subject: str, body: str, to_email: str = None):
     """
@@ -31,14 +49,14 @@ def send_email(subject: str, body: str, to_email: str = None):
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
+            _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, [empfaenger], msg.as_string())
         print(f"📧 E-Mail versendet: {subject} (Port {SMTP_PORT})")
     except (TimeoutError, OSError) as e:
         print(f"⚠️  SMTP Port {SMTP_PORT} nicht erreichbar ({e}) – Fallback auf Port {SMTP_FALLBACK_PORT}")
         try:
             with smtplib.SMTP(SMTP_HOST, SMTP_FALLBACK_PORT, timeout=SMTP_TIMEOUT) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
+                _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_USER, [empfaenger], msg.as_string())
             print(f"📧 E-Mail versendet: {subject} (Port {SMTP_FALLBACK_PORT})")
         except Exception as fallback_e:
