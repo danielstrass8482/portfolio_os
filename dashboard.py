@@ -21,6 +21,7 @@ import plotly.express as px
 from config import validate_config, BASE_URL
 from database import (
     init_db, get_session, get_or_create_user, save_real_estate,
+    update_real_estate, delete_real_estate,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
     PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction, PosGoal,
 )
@@ -28,6 +29,7 @@ import portfolio as portfolio_module
 import tax_engine
 import rebalancing
 import llm_analyst
+import trading_bot_connector
 from onboarding import show_onboarding, projiziertes_kapital, RISIKO_PROFILE, ZIEL_ICONS
 
 def fmt_eur(wert, nachkommastellen=2):
@@ -146,6 +148,35 @@ def _dialog_position_loeschen(position_id: int, anzeigename: str):
         st.rerun()
 
 
+@st.dialog("Immobilie löschen?")
+def _dialog_immobilie_loeschen(real_estate_id: int, adresse: str):
+    st.warning(f"Immobilie „{adresse}“ wirklich unwiderruflich löschen?")
+    col_ja, col_nein = st.columns(2)
+    if col_ja.button("Ja, endgültig löschen", key="confirm_delete_immobilie"):
+        try:
+            delete_real_estate(real_estate_id)
+            st.success("Immobilie gelöscht")
+        except Exception as e:
+            st.error(f"Fehler: {e}")
+        else:
+            st.rerun()
+    if col_nein.button("Abbrechen", key="cancel_delete_immobilie"):
+        st.rerun()
+
+
+@st.dialog("Familienziel löschen?")
+def _dialog_familienziel_loeschen(goal_id: int, name: str):
+    st.warning(f"Familienziel „{name}“ wirklich löschen?")
+    col_ja, col_nein = st.columns(2)
+    if col_ja.button("Ja, endgültig löschen", key="confirm_delete_familienziel"):
+        with get_session() as session:
+            session.query(PosFamilyGoal).filter_by(id=goal_id).delete()
+        st.success("Familienziel gelöscht")
+        st.rerun()
+    if col_nein.button("Abbrechen", key="cancel_delete_familienziel"):
+        st.rerun()
+
+
 # ─────────────────────────────────────────────
 # BOOTSTRAP: NUTZER / KONTEXT (ersetzt die frühere Sidebar)
 # ─────────────────────────────────────────────
@@ -209,17 +240,35 @@ if warnungen:
 
 
 def _kombinierte_summary(user_ids: list) -> dict:
-    """Aggregiert get_portfolio_summary über mehrere Nutzer (für den Familien-Modus)."""
-    gesamt = {"gesamtvermoegen": 0.0, "unrealized_pnl": 0.0, "positions_count": 0,
-              "portfolios_count": 0, "asset_breakdown": {}}
+    """
+    Aggregiert get_total_wealth über mehrere Nutzer (für den Familien-Modus). Der
+    Trading-Bot-Depotwert ist ein einzelnes gemeinsames Konto (kein personen-
+    bezogenes Vermögen) und wird deshalb nicht pro Nutzer, sondern genau einmal
+    am Ende addiert – sonst würde er bei mehreren aktiven Nutzern vervielfacht.
+    """
+    gesamt = {
+        "gesamtvermoegen": 0.0, "unrealized_pnl": 0.0, "positions_count": 0,
+        "portfolios_count": 0, "asset_breakdown": {},
+        "immobilien_eigenkapital": 0.0, "immobilien_schaetzwert_summe": 0.0,
+        "immobilien_restschuld_summe": 0.0, "trading_bot_wert": 0.0,
+    }
     for uid in user_ids:
-        s = portfolio_module.get_portfolio_summary(uid)
+        s = portfolio_module.get_total_wealth(uid, include_trading_bot=False)
         gesamt["gesamtvermoegen"] += s["gesamtvermoegen"]
         gesamt["unrealized_pnl"] += s["unrealized_pnl"]
         gesamt["positions_count"] += s["positions_count"]
         gesamt["portfolios_count"] += s["portfolios_count"]
+        gesamt["immobilien_eigenkapital"] += s["immobilien_eigenkapital"]
+        gesamt["immobilien_schaetzwert_summe"] += s["immobilien_schaetzwert_summe"]
+        gesamt["immobilien_restschuld_summe"] += s["immobilien_restschuld_summe"]
         for klass, wert in s["asset_breakdown"].items():
             gesamt["asset_breakdown"][klass] = gesamt["asset_breakdown"].get(klass, 0.0) + wert
+
+    trading_bot_wert = trading_bot_connector.get_trading_bot_value_eur()
+    if trading_bot_wert:
+        gesamt["gesamtvermoegen"] += trading_bot_wert
+        gesamt["trading_bot_wert"] = trading_bot_wert
+        gesamt["asset_breakdown"]["Trading Bot"] = gesamt["asset_breakdown"].get("Trading Bot", 0.0) + trading_bot_wert
     return gesamt
 
 
@@ -232,7 +281,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
 # TAB 1 – ÜBERSICHT
 # ─────────────────────────────────────────────
 with tab1:
-    summary = _kombinierte_summary(aktive_user_ids) if familien_modus else portfolio_module.get_portfolio_summary(aktive_user_ids[0])
+    summary = _kombinierte_summary(aktive_user_ids) if familien_modus else portfolio_module.get_total_wealth(aktive_user_ids[0])
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -260,8 +309,23 @@ with tab1:
                 {"Assetklasse": list(summary["asset_breakdown"].keys()),
                  "Wert": list(summary["asset_breakdown"].values())}
             )
+
+            # Immobilie bekommt einen eigenen Hover-Text mit Schätzwert/Restschuld-
+            # Aufschlüsselung, alle anderen Slices zeigen nur Assetklasse + Wert.
+            def _hover_text(row):
+                basis = f"{row['Assetklasse']}: {fmt_eur(row['Wert'], 0)}"
+                if row["Assetklasse"] == "Immobilie" and summary.get("immobilien_eigenkapital"):
+                    basis += (
+                        f"<br>Schätzwert {fmt_eur(summary['immobilien_schaetzwert_summe'], 0)} "
+                        f"- Restschuld {fmt_eur(summary['immobilien_restschuld_summe'], 0)} "
+                        f"= Eigenkapital {fmt_eur(summary['immobilien_eigenkapital'], 0)}"
+                    )
+                return basis
+
+            df_alloc["Hover"] = df_alloc.apply(_hover_text, axis=1)
             fig = px.pie(df_alloc, names="Assetklasse", values="Wert", hole=0.6,
-                         color_discrete_sequence=px.colors.qualitative.Set2)
+                         color_discrete_sequence=px.colors.qualitative.Set2, custom_data=["Hover"])
+            fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                                font_color="#f9fafb", legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig, use_container_width=True)
@@ -638,15 +702,49 @@ def _parse_iso_date(wert):
         return None
 
 
-def _immobilie_erweiterte_felder(key_prefix: str) -> dict:
+def _immobilie_basis_felder(key_prefix: str, defaults: dict = None) -> dict:
+    """Rendert die Stammdaten-Felder (Adresse, Kaufpreis, ...) einer Immobilie und
+    gibt die eingegebenen Werte als dict zurück. `defaults` befüllt sie vor (Edit)."""
+    d = defaults or {}
+    adresse = st.text_input("Adresse", value=d.get("adresse", ""), key=f"{key_prefix}_adresse")
+    kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0,
+                                 value=float(d.get("kaufpreis") or 0.0), key=f"{key_prefix}_kaufpreis")
+    kaufjahr = st.number_input(
+        "Kaufjahr", min_value=1950, max_value=date.today().year,
+        value=int(d.get("kaufjahr") or date.today().year), key=f"{key_prefix}_kaufjahr")
+    qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0,
+                          value=float(d.get("wohnflaeche_qm") or 0.0), key=f"{key_prefix}_qm")
+    ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0,
+                          value=float(d.get("eigenkapital") or 0.0), key=f"{key_prefix}_ek")
+    restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0,
+                                  value=float(d.get("restschuld") or 0.0), key=f"{key_prefix}_restschuld")
+    rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0,
+                            value=float(d.get("monatliche_rate") or 0.0), key=f"{key_prefix}_rate")
+    miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0,
+                             value=float(d.get("mieteinnahmen") or 0.0), key=f"{key_prefix}_miete")
+    schaetzwert = st.number_input(
+        "Letzter Schätzwert (€, optional – Default: Kaufpreis)", min_value=0.0, step=1000.0,
+        value=float(d.get("letzter_schaetzwert") or kaufpreis or 0.0), key=f"{key_prefix}_schaetzwert")
+    return {
+        "adresse": adresse, "kaufpreis": kaufpreis, "kaufjahr": int(kaufjahr),
+        "wohnflaeche_qm": qm, "eigenkapital": ek, "restschuld": restschuld,
+        "monatliche_rate": rate, "mieteinnahmen": miete,
+        "letzter_schaetzwert": schaetzwert or kaufpreis,
+    }
+
+
+def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None) -> dict:
     """
     Rendert die Sektionen 'Abschreibung' und 'Finanzierung & Vermietung' für die
     Immobilien-Erfassung und gibt die eingegebenen Werte als dict zurück. Wird
     bewusst AUSSERHALB eines st.form aufgerufen, damit der Abschreibungssatz-
     Vorschlag beim Wechsel der Abschreibungsart sofort (per Rerun) aktualisiert wird.
+    `defaults` befüllt die Felder vor (Edit).
     """
+    d = defaults or {}
     st.markdown("**Abschreibung**")
-    afa_art = st.selectbox("Abschreibungsart", ABSCHREIBUNGSARTEN, key=f"{key_prefix}_afa_art")
+    afa_index = ABSCHREIBUNGSARTEN.index(d["abschreibungsart"]) if d.get("abschreibungsart") in ABSCHREIBUNGSARTEN else 0
+    afa_art = st.selectbox("Abschreibungsart", ABSCHREIBUNGSARTEN, index=afa_index, key=f"{key_prefix}_afa_art")
     felder = {"abschreibungsart": afa_art}
     if afa_art in ("Keine Abschreibung", "Selbst genutzt (keine AfA)"):
         felder["abschreibungsbasis"] = 0.0
@@ -654,32 +752,40 @@ def _immobilie_erweiterte_felder(key_prefix: str) -> dict:
     else:
         c1, c2 = st.columns(2)
         felder["abschreibungsbasis"] = c1.number_input(
-            "Abschreibungsbasis (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_afa_basis")
+            "Abschreibungsbasis (€)", min_value=0.0, step=1000.0,
+            value=float(d.get("abschreibungsbasis") or 0.0), key=f"{key_prefix}_afa_basis")
         felder["abschreibungssatz"] = c2.number_input(
             "Abschreibungssatz (%)", min_value=0.0, step=0.1,
-            value=AFA_STANDARDSAETZE.get(afa_art, 2.0), key=f"{key_prefix}_afa_satz")
-    felder["kaufdatum"] = st.date_input("Kaufdatum", value=None, key=f"{key_prefix}_kaufdatum")
+            value=float(d.get("abschreibungssatz") or AFA_STANDARDSAETZE.get(afa_art, 2.0)),
+            key=f"{key_prefix}_afa_satz")
+    felder["kaufdatum"] = st.date_input("Kaufdatum", value=d.get("kaufdatum"), key=f"{key_prefix}_kaufdatum")
 
     st.markdown("**Finanzierung & Vermietung**")
     felder["vermietung_start"] = st.date_input(
-        "Vermietung gestartet am (optional)", value=None, key=f"{key_prefix}_vermietung_start")
+        "Vermietung gestartet am (optional)", value=d.get("vermietung_start"), key=f"{key_prefix}_vermietung_start")
     c1, c2 = st.columns(2)
     felder["kredit_gesamtbetrag"] = c1.number_input(
-        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_kredit_gesamt")
+        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0,
+        value=float(d.get("kredit_gesamtbetrag") or 0.0), key=f"{key_prefix}_kredit_gesamt")
     felder["kredit_abgerufen"] = c2.number_input(
-        "Davon bereits abgerufen (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_kredit_abgerufen")
+        "Davon bereits abgerufen (€)", min_value=0.0, step=1000.0,
+        value=float(d.get("kredit_abgerufen") or 0.0), key=f"{key_prefix}_kredit_abgerufen")
     c3, c4 = st.columns(2)
     felder["kredit_zinssatz"] = c3.number_input(
-        "Zinssatz (% p.a.)", min_value=0.0, step=0.1, key=f"{key_prefix}_zinssatz")
+        "Zinssatz (% p.a.)", min_value=0.0, step=0.1,
+        value=float(d.get("kredit_zinssatz") or 0.0), key=f"{key_prefix}_zinssatz")
     felder["kredit_laufzeit_jahre"] = int(c4.number_input(
-        "Laufzeit (Jahre)", min_value=0, step=1, key=f"{key_prefix}_laufzeit"))
+        "Laufzeit (Jahre)", min_value=0, step=1,
+        value=int(d.get("kredit_laufzeit_jahre") or 0), key=f"{key_prefix}_laufzeit"))
     felder["zinsbindung_bis"] = st.date_input(
-        "Zinsbindung bis (optional)", value=None, key=f"{key_prefix}_zinsbindung")
+        "Zinsbindung bis (optional)", value=d.get("zinsbindung_bis"), key=f"{key_prefix}_zinsbindung")
     felder["vorfaelligkeitsgebuehr_pct"] = st.number_input(
         "Vorfälligkeitsentschädigung im Vertrag (% des Restdarlehens)",
-        min_value=0.0, step=0.1, key=f"{key_prefix}_vorfaelligkeit")
+        min_value=0.0, step=0.1, value=float(d.get("vorfaelligkeitsgebuehr_pct") or 0.0),
+        key=f"{key_prefix}_vorfaelligkeit")
     felder["finanzierungskosten"] = st.number_input(
-        "Finanzierungskosten p.a. (€)", min_value=0.0, step=100.0, key=f"{key_prefix}_finanzierungskosten")
+        "Finanzierungskosten p.a. (€)", min_value=0.0, step=100.0,
+        value=float(d.get("finanzierungskosten") or 0.0), key=f"{key_prefix}_finanzierungskosten")
     return felder
 
 
@@ -706,39 +812,9 @@ with tab5:
         if familien_modus:
             st.info("Keine Immobilie hinterlegt. Bitte oben einen Nutzer auswählen, um eine anzulegen.")
         else:
-            st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen:")
-            im5_adresse = st.text_input("Adresse", key="im5_adresse")
-            im5_kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0, key="im5_kaufpreis")
-            im5_kaufjahr = st.number_input(
-                "Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year, key="im5_kaufjahr")
-            im5_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0, key="im5_qm")
-            im5_ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0, key="im5_ek")
-            im5_restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0, key="im5_restschuld")
-            im5_rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0, key="im5_rate")
-            im5_miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0, key="im5_miete")
+            st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen.")
 
-            st.divider()
-            im5_erweitert = _immobilie_erweiterte_felder("im5")
-            st.divider()
-
-            if st.button("Speichern", key="im5_speichern_btn"):
-                if not im5_adresse:
-                    st.error("Bitte eine Adresse angeben.")
-                else:
-                    try:
-                        save_real_estate(
-                            user_id=aktiver_user["id"],
-                            adresse=im5_adresse, kaufpreis=im5_kaufpreis,
-                            kaufjahr=int(im5_kaufjahr), wohnflaeche_qm=im5_qm, eigenkapital=im5_ek,
-                            restschuld=im5_restschuld, monatliche_rate=im5_rate, mieteinnahmen=im5_miete,
-                            letzter_schaetzwert=im5_kaufpreis, letztes_update=datetime.utcnow(),
-                            **im5_erweitert,
-                        )
-                        st.success("Immobilie gespeichert!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Fehler beim Speichern: {e}")
-    else:
+    if immobilien_data:
         for im in immobilien_data:
             st.subheader(im["adresse"])
             schaetzwert = im["letzter_schaetzwert"] or im["kaufpreis"]
@@ -895,7 +971,69 @@ with tab5:
                         except Exception as e:
                             st.error(f"Fehler beim Speichern: {e}")
 
+            # ---- Bearbeiten / Löschen (Fix 2) -------------------------------
+            col_edit, col_del = st.columns(2)
+            edit_offen_key = f"im_edit_offen_{im['id']}"
+            with col_edit:
+                if st.button("✏️ Bearbeiten", key=f"im_edit_btn_{im['id']}"):
+                    st.session_state[edit_offen_key] = not st.session_state.get(edit_offen_key, False)
+                    st.rerun()
+            with col_del:
+                if st.button("🗑️ Löschen", key=f"im_del_btn_{im['id']}"):
+                    _dialog_immobilie_loeschen(im["id"], im["adresse"])
+
+            if st.session_state.get(edit_offen_key, False):
+                with st.expander("Immobilie bearbeiten", expanded=True):
+                    edit_prefix = f"im_edit_{im['id']}"
+                    edit_basis = _immobilie_basis_felder(edit_prefix, defaults=im)
+                    st.divider()
+                    edit_erweitert = _immobilie_erweiterte_felder(edit_prefix, defaults=im)
+                    st.divider()
+                    if st.button("💾 Speichern", key=f"im_edit_speichern_{im['id']}"):
+                        if not edit_basis["adresse"]:
+                            st.error("Bitte eine Adresse angeben.")
+                        else:
+                            try:
+                                update_real_estate(
+                                    im["id"], letztes_update=datetime.utcnow(),
+                                    **edit_basis, **edit_erweitert,
+                                )
+                                st.session_state[edit_offen_key] = False
+                                st.success("Immobilie aktualisiert!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Fehler beim Speichern: {e}")
+
             st.divider()
+
+    # ---- Neue / weitere Immobilie anlegen (Fix 2 & 4) ----------------------
+    if not familien_modus:
+        neu_offen_key = "im_neu_offen"
+        btn_label = "➕ Weitere Immobilie anlegen" if immobilien_data else "➕ Immobilie anlegen"
+        if st.button(btn_label, key="im_neu_toggle_btn"):
+            st.session_state[neu_offen_key] = not st.session_state.get(neu_offen_key, False)
+            st.rerun()
+
+        if st.session_state.get(neu_offen_key, False):
+            with st.expander("Neue Immobilie", expanded=True):
+                neu_basis = _immobilie_basis_felder("im_neu")
+                st.divider()
+                neu_erweitert = _immobilie_erweiterte_felder("im_neu")
+                st.divider()
+                if st.button("Speichern", key="im_neu_speichern_btn"):
+                    if not neu_basis["adresse"]:
+                        st.error("Bitte eine Adresse angeben.")
+                    else:
+                        try:
+                            save_real_estate(
+                                user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
+                                **neu_basis, **neu_erweitert,
+                            )
+                            st.session_state[neu_offen_key] = False
+                            st.success("Immobilie gespeichert!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Fehler beim Speichern: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1005,17 +1143,53 @@ with tab8:
         ]
     pf_options = {f"{p['name']} ({p['typ']})": p for p in portfolios_all}
 
-    # ---- Nutzer verwalten -----------------------------------------
+    # ---- Nutzer verwalten (Fix 5: Name + E-Mail bearbeitbar) -----------
     st.subheader("Nutzer verwalten")
     st.dataframe(pd.DataFrame(nutzer)[["name", "email", "rolle"]], use_container_width=True, hide_index=True)
-    with st.form("verwaltung_neuer_nutzer"):
-        n_name = st.text_input("Name", key="verw_nutzer_name")
-        n_email = st.text_input("E-Mail (optional)", key="verw_nutzer_email")
-        n_rolle = st.selectbox("Rolle", ["member", "admin"], key="verw_nutzer_rolle")
-        if st.form_submit_button("Nutzer anlegen") and n_name:
-            with get_session() as session:
-                get_or_create_user(session, n_name, n_email, rolle=n_rolle)
-            st.rerun()
+
+    col_nutzer_neu, col_nutzer_edit = st.columns(2)
+    with col_nutzer_neu:
+        st.markdown("**Neuer Nutzer**")
+        with st.form("verwaltung_neuer_nutzer"):
+            n_name = st.text_input("Name", key="verw_nutzer_name")
+            n_email = st.text_input("E-Mail (optional)", key="verw_nutzer_email")
+            n_rolle = st.selectbox("Rolle", ["member", "admin"], key="verw_nutzer_rolle")
+            if st.form_submit_button("Nutzer anlegen") and n_name:
+                with get_session() as session:
+                    get_or_create_user(session, n_name, n_email, rolle=n_rolle)
+                st.rerun()
+
+    with col_nutzer_edit:
+        st.markdown("**Nutzer bearbeiten**")
+        nutzer_options = {n["name"]: n for n in nutzer}
+        if nutzer_options:
+            nutzer_wahl = st.selectbox("Nutzer", list(nutzer_options.keys()), key="nutzer_bearbeiten_wahl")
+            gewaehlter_nutzer = nutzer_options[nutzer_wahl]
+
+            # Bei Wechsel des ausgewählten Nutzers alte Widget-States verwerfen
+            # (gleiches Muster wie beim Positionswechsel im Positionen-Tab).
+            if st.session_state.get("nutzer_last_edit_id") != gewaehlter_nutzer["id"]:
+                st.session_state["nutzer_last_edit_id"] = gewaehlter_nutzer["id"]
+                for key in list(st.session_state.keys()):
+                    if key.startswith("nutzer_edit_"):
+                        del st.session_state[key]
+
+            with st.form("nutzer_bearbeiten"):
+                neuer_nutzer_name = st.text_input("Name", value=gewaehlter_nutzer["name"], key="nutzer_edit_name")
+                neuer_nutzer_email = st.text_input(
+                    "E-Mail", value=gewaehlter_nutzer["email"] or "", key="nutzer_edit_email")
+                if st.form_submit_button("Speichern"):
+                    if not neuer_nutzer_name:
+                        st.error("Bitte einen Namen angeben.")
+                    else:
+                        with get_session() as session:
+                            u = session.get(PosUser, gewaehlter_nutzer["id"])
+                            u.name = neuer_nutzer_name
+                            u.email = neuer_nutzer_email or None
+                        st.success("Nutzer aktualisiert")
+                        st.rerun()
+        else:
+            st.caption("Noch kein Nutzer angelegt.")
 
     st.divider()
 
@@ -1209,12 +1383,44 @@ with tab8:
         if txs:
             st.markdown(f"**Transaktionen von {gewaehlte_pos['name']}**")
             for t in txs:
-                col_info, col_del = st.columns([5, 1])
+                col_info, col_edit, col_del = st.columns([5, 1, 1])
                 col_info.write(f"{t['datum']} · {t['typ']} · {fmt_menge(t['quantity'])} @ {fmt_eur(t['price'])} "
                                 f"(Gebühren {fmt_eur(t['fees'])})")
+                tx_edit_key = f"tx_edit_offen_{t['id']}"
+                if col_edit.button("✏️", key=f"tx_edit_btn_{t['id']}"):
+                    st.session_state[tx_edit_key] = not st.session_state.get(tx_edit_key, False)
+                    st.rerun()
                 if col_del.button("🗑️", key=f"tx_del_{t['id']}"):
                     portfolio_module.delete_transaction(t["id"])
                     st.rerun()
+
+                if st.session_state.get(tx_edit_key, False):
+                    with st.form(f"tx_edit_form_{t['id']}"):
+                        tx_edit_typ = st.selectbox(
+                            "Typ", ["kauf", "verkauf", "dividende", "sparrate"],
+                            index=["kauf", "verkauf", "dividende", "sparrate"].index(t["typ"]),
+                            key=f"tx_edit_typ_{t['id']}")
+                        tx_edit_qty = st.number_input(
+                            "Menge", min_value=0.0, step=1.0, value=float(t["quantity"] or 0.0),
+                            key=f"tx_edit_qty_{t['id']}")
+                        tx_edit_price = st.number_input(
+                            "Preis", min_value=0.0, step=0.01, value=float(t["price"] or 0.0),
+                            key=f"tx_edit_price_{t['id']}")
+                        tx_edit_fees = st.number_input(
+                            "Gebühren", min_value=0.0, step=0.01, value=float(t["fees"] or 0.0),
+                            key=f"tx_edit_fees_{t['id']}")
+                        tx_edit_datum = st.date_input("Datum", value=t["datum"], key=f"tx_edit_datum_{t['id']}")
+                        if st.form_submit_button("Speichern"):
+                            try:
+                                portfolio_module.update_transaction(
+                                    t["id"], typ=tx_edit_typ, quantity=tx_edit_qty,
+                                    price=tx_edit_price, datum=tx_edit_datum, fees=tx_edit_fees,
+                                )
+                                st.session_state[tx_edit_key] = False
+                                st.success("Transaktion aktualisiert")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Fehler: {e}")
         else:
             st.caption("Keine Transaktionen für diese Position.")
     else:
@@ -1246,44 +1452,140 @@ with tab8:
 
         st.divider()
 
-        # ---- Immobilie anlegen -----------------------------------------
-        st.subheader("Immobilie anlegen")
-        st.caption("Für Abschreibung, Finanzierung & Kreditvertrag-KI siehe Tab 🏠 Immobilie.")
-        with st.form("neue_immobilie"):
-            im_adresse = st.text_input("Adresse")
-            im_kaufpreis = st.number_input("Kaufpreis", min_value=0.0, step=1000.0)
-            im_kaufjahr = st.number_input("Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year)
-            im_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0)
-            im_ek = st.number_input("Eigenkapital", min_value=0.0, step=1000.0)
-            im_restschuld = st.number_input("Restschuld", min_value=0.0, step=1000.0)
-            im_rate = st.number_input("Monatliche Rate", min_value=0.0, step=10.0)
-            im_miete = st.number_input("Monatliche Mieteinnahmen", min_value=0.0, step=10.0)
-            if st.form_submit_button("Anlegen"):
-                if not im_adresse:
+        # ---- Immobilien (Fix 3) ------------------------------------------
+        st.subheader("Immobilien")
+        with get_session() as session:
+            verw_immobilien = session.query(PosRealEstate).filter_by(user_id=aktiver_user["id"]).all()
+            verw_immobilien_options = {
+                f"{i.adresse}": {
+                    "id": i.id, "adresse": i.adresse, "kaufpreis": i.kaufpreis, "kaufjahr": i.kaufjahr,
+                    "wohnflaeche_qm": i.wohnflaeche_qm, "eigenkapital": i.eigenkapital, "restschuld": i.restschuld,
+                    "monatliche_rate": i.monatliche_rate, "mieteinnahmen": i.mieteinnahmen,
+                    "letzter_schaetzwert": i.letzter_schaetzwert,
+                    "vermietung_start": i.vermietung_start, "kredit_gesamtbetrag": i.kredit_gesamtbetrag,
+                    "kredit_abgerufen": i.kredit_abgerufen, "kredit_zinssatz": i.kredit_zinssatz,
+                    "kredit_laufzeit_jahre": i.kredit_laufzeit_jahre,
+                    "vorfaelligkeitsgebuehr_pct": i.vorfaelligkeitsgebuehr_pct,
+                    "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
+                    "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
+                    "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
+                } for i in verw_immobilien
+            }
+
+        col_im_neu, col_im_edit = st.columns(2)
+
+        with col_im_neu:
+            st.markdown("**Neue Immobilie anlegen**")
+            verw_neu_basis = _immobilie_basis_felder("verw_im_neu")
+            st.divider()
+            verw_neu_erweitert = _immobilie_erweiterte_felder("verw_im_neu")
+            if st.button("Anlegen", key="verw_im_neu_anlegen_btn"):
+                if not verw_neu_basis["adresse"]:
                     st.error("Bitte eine Adresse angeben.")
                 else:
                     try:
                         save_real_estate(
-                            user_id=aktiver_user["id"], adresse=im_adresse, kaufpreis=im_kaufpreis,
-                            kaufjahr=int(im_kaufjahr), wohnflaeche_qm=im_qm, eigenkapital=im_ek,
-                            restschuld=im_restschuld, monatliche_rate=im_rate, mieteinnahmen=im_miete,
-                            letzter_schaetzwert=im_kaufpreis, letztes_update=datetime.utcnow(),
+                            user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
+                            **verw_neu_basis, **verw_neu_erweitert,
                         )
                         st.success("Immobilie gespeichert!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Fehler beim Speichern: {e}")
 
+        with col_im_edit:
+            st.markdown("**Immobilie bearbeiten / löschen**")
+            if verw_immobilien_options:
+                verw_im_wahl = st.selectbox("Immobilie", list(verw_immobilien_options.keys()), key="verw_im_wahl")
+                verw_gewaehlte_im = verw_immobilien_options[verw_im_wahl]
+
+                # Bei Wechsel der ausgewählten Immobilie alte Widget-States verwerfen –
+                # sonst zeigt das Formular nach dem Wechsel weiter die vorherigen Werte
+                # (gleicher Bug/Fix wie beim Positionswechsel im Positionen-Tab).
+                if st.session_state.get("verw_im_last_edit_id") != verw_gewaehlte_im["id"]:
+                    st.session_state["verw_im_last_edit_id"] = verw_gewaehlte_im["id"]
+                    for key in list(st.session_state.keys()):
+                        if key.startswith("verw_im_edit_"):
+                            del st.session_state[key]
+
+                verw_edit_basis = _immobilie_basis_felder("verw_im_edit", defaults=verw_gewaehlte_im)
+                st.divider()
+                verw_edit_erweitert = _immobilie_erweiterte_felder("verw_im_edit", defaults=verw_gewaehlte_im)
+                if st.button("💾 Speichern", key="verw_im_edit_speichern_btn"):
+                    if not verw_edit_basis["adresse"]:
+                        st.error("Bitte eine Adresse angeben.")
+                    else:
+                        try:
+                            update_real_estate(
+                                verw_gewaehlte_im["id"], letztes_update=datetime.utcnow(),
+                                **verw_edit_basis, **verw_edit_erweitert,
+                            )
+                            st.success("Immobilie aktualisiert!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Fehler beim Speichern: {e}")
+                if st.button("🗑️ Immobilie löschen", key="verw_im_loeschen_btn"):
+                    _dialog_immobilie_loeschen(verw_gewaehlte_im["id"], verw_gewaehlte_im["adresse"])
+            else:
+                st.caption("Noch keine Immobilie angelegt.")
+
         st.divider()
 
-    # ---- Familienziel anlegen -----------------------------------------
-    st.subheader("Familienziel anlegen")
-    with st.form("neues_ziel"):
-        z_name = st.text_input("Name (z.B. Notgroschen, Kinderstudium)")
-        z_betrag = st.number_input("Zielbetrag", min_value=0.0, step=100.0)
-        z_aktuell = st.number_input("Aktueller Stand", min_value=0.0, step=100.0)
-        z_datum = st.date_input("Zieldatum", value=None)
-        if st.form_submit_button("Anlegen") and z_name:
-            with get_session() as session:
-                session.add(PosFamilyGoal(name=z_name, ziel_betrag=z_betrag, aktuell_betrag=z_aktuell, zieldatum=z_datum))
-            st.rerun()
+    # ---- Familienziele (Fix 5) ------------------------------------------
+    st.subheader("Familienziele")
+    with get_session() as session:
+        fz_options = {
+            z.name: {"id": z.id, "name": z.name, "ziel_betrag": z.ziel_betrag,
+                     "aktuell_betrag": z.aktuell_betrag, "zieldatum": z.zieldatum}
+            for z in session.query(PosFamilyGoal).all()
+        }
+
+    col_fz_neu, col_fz_edit = st.columns(2)
+    with col_fz_neu:
+        st.markdown("**Neues Familienziel**")
+        with st.form("neues_ziel"):
+            z_name = st.text_input("Name (z.B. Notgroschen, Kinderstudium)")
+            z_betrag = st.number_input("Zielbetrag", min_value=0.0, step=100.0)
+            z_aktuell = st.number_input("Aktueller Stand", min_value=0.0, step=100.0)
+            z_datum = st.date_input("Zieldatum", value=None)
+            if st.form_submit_button("Anlegen") and z_name:
+                with get_session() as session:
+                    session.add(PosFamilyGoal(name=z_name, ziel_betrag=z_betrag, aktuell_betrag=z_aktuell, zieldatum=z_datum))
+                st.rerun()
+
+    with col_fz_edit:
+        st.markdown("**Familienziel bearbeiten / löschen**")
+        if fz_options:
+            fz_wahl = st.selectbox("Familienziel", list(fz_options.keys()), key="fz_bearbeiten_wahl")
+            gewaehltes_fz = fz_options[fz_wahl]
+
+            # Bei Wechsel des ausgewählten Ziels alte Widget-States verwerfen (siehe
+            # gleiches Muster bei Positionswechsel im Positionen-Tab).
+            if st.session_state.get("fz_last_edit_id") != gewaehltes_fz["id"]:
+                st.session_state["fz_last_edit_id"] = gewaehltes_fz["id"]
+                for key in list(st.session_state.keys()):
+                    if key.startswith("fz_edit_"):
+                        del st.session_state[key]
+
+            with st.form("familienziel_bearbeiten"):
+                neuer_fz_name = st.text_input("Name", value=gewaehltes_fz["name"], key="fz_edit_name")
+                neuer_fz_betrag = st.number_input(
+                    "Zielbetrag", min_value=0.0, step=100.0,
+                    value=float(gewaehltes_fz["ziel_betrag"] or 0.0), key="fz_edit_betrag")
+                neuer_fz_aktuell = st.number_input(
+                    "Aktueller Stand", min_value=0.0, step=100.0,
+                    value=float(gewaehltes_fz["aktuell_betrag"] or 0.0), key="fz_edit_aktuell")
+                neues_fz_datum = st.date_input("Zieldatum", value=gewaehltes_fz["zieldatum"], key="fz_edit_datum")
+                if st.form_submit_button("Speichern"):
+                    with get_session() as session:
+                        fz = session.get(PosFamilyGoal, gewaehltes_fz["id"])
+                        fz.name = neuer_fz_name
+                        fz.ziel_betrag = neuer_fz_betrag
+                        fz.aktuell_betrag = neuer_fz_aktuell
+                        fz.zieldatum = neues_fz_datum
+                    st.success("Familienziel aktualisiert")
+                    st.rerun()
+            if st.button("🗑️ Familienziel löschen", key="fz_loeschen_btn"):
+                _dialog_familienziel_loeschen(gewaehltes_fz["id"], gewaehltes_fz["name"])
+        else:
+            st.caption("Noch kein Familienziel angelegt.")

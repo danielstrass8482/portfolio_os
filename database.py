@@ -410,6 +410,33 @@ def save_real_estate(user_id: int, real_estate_id: int = None, **felder) -> int:
         return obj.id
 
 
+def update_real_estate(real_estate_id: int, **kwargs):
+    """
+    Aktualisiert eine bestehende Immobilie – nur übergebene, nicht-None Felder
+    werden geändert (im Unterschied zu save_real_estate() also sicher für
+    Bearbeiten-Formulare, bei denen einzelne optionale Felder leer bleiben
+    können, ohne dass dadurch bereits gespeicherte Werte überschrieben werden).
+    """
+    with get_session() as session:
+        obj = session.query(PosRealEstate).filter_by(id=real_estate_id).first()
+        if obj is None:
+            raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
+        for key, value in kwargs.items():
+            if hasattr(obj, key) and value is not None:
+                setattr(obj, key, value)
+        session.commit()
+        return obj
+
+
+def delete_real_estate(real_estate_id: int):
+    """Löscht eine Immobilie unwiderruflich."""
+    with get_session() as session:
+        obj = session.query(PosRealEstate).filter_by(id=real_estate_id).first()
+        if obj is None:
+            raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
+        session.delete(obj)
+
+
 def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, asset_breakdown: dict = None):
     """Speichert oder aktualisiert den täglichen Vermögens-Snapshot eines Nutzers (für Performance/Charts)."""
     today = date.today()

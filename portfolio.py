@@ -12,9 +12,10 @@ import yfinance as yf
 from config import TICKER_MAPPING
 from database import (
     get_session, PosPortfolio, PosPosition, PosTransaction,
-    PosAssetClass, PosTargetWeight, PosDailySnapshot,
+    PosAssetClass, PosTargetWeight, PosDailySnapshot, PosRealEstate,
 )
 import tax_engine
+import trading_bot_connector
 
 
 # ─────────────────────────────────────────────
@@ -46,6 +47,49 @@ def get_portfolio_summary(user_id: int) -> dict:
             "portfolios_count": len(portfolios),
             "asset_breakdown": breakdown,
         }
+
+
+def get_total_wealth(user_id: int, include_trading_bot: bool = True) -> dict:
+    """
+    Gesamtvermögen eines Nutzers über ALLE Vermögensklassen (nicht nur Depot-
+    Positionen wie get_portfolio_summary): Depot/ETF/Aktien/Krypto/Tagesgeld-
+    Positionen (bereits in get_portfolio_summary erfasst, da strukturell
+    identisch gepflegt) + Immobilien-Eigenkapital (Schätzwert - Restschuld,
+    über ALLE Immobilien des Nutzers summiert) + Trading-Bot-Depotwert
+    (separate Postgres-Tabellen, siehe trading_bot_connector.py).
+
+    `include_trading_bot=False` für den Familien-Modus: der Trading Bot ist ein
+    einzelnes gemeinsames Konto, kein personenbezogenes Vermögen – der Aufrufer
+    addiert ihn dort selbst genau einmal statt pro Nutzer (siehe dashboard.py).
+    """
+    summary = get_portfolio_summary(user_id)
+    breakdown = dict(summary["asset_breakdown"])
+
+    with get_session() as session:
+        immobilien = session.query(PosRealEstate).filter_by(user_id=user_id).all()
+        schaetzwert_summe = sum((im.letzter_schaetzwert or im.kaufpreis or 0.0) for im in immobilien)
+        restschuld_summe = sum((im.restschuld or 0.0) for im in immobilien)
+    immobilien_eigenkapital = schaetzwert_summe - restschuld_summe
+    if immobilien:
+        breakdown["Immobilie"] = breakdown.get("Immobilie", 0.0) + immobilien_eigenkapital
+
+    trading_bot_wert = 0.0
+    if include_trading_bot:
+        trading_bot_wert = trading_bot_connector.get_trading_bot_value_eur()
+        if trading_bot_wert:
+            breakdown["Trading Bot"] = breakdown.get("Trading Bot", 0.0) + trading_bot_wert
+
+    return {
+        "gesamtvermoegen": summary["gesamtvermoegen"] + immobilien_eigenkapital + trading_bot_wert,
+        "unrealized_pnl": summary["unrealized_pnl"],
+        "positions_count": summary["positions_count"],
+        "portfolios_count": summary["portfolios_count"],
+        "asset_breakdown": breakdown,
+        "immobilien_eigenkapital": immobilien_eigenkapital,
+        "immobilien_schaetzwert_summe": schaetzwert_summe,
+        "immobilien_restschuld_summe": restschuld_summe,
+        "trading_bot_wert": trading_bot_wert,
+    }
 
 
 def get_positions(user_id: int, asset_class: str = None) -> list:
@@ -296,6 +340,37 @@ def delete_transaction(transaction_id: int):
         session.flush()
         if position_id:
             _recompute_position(session, position_id)
+
+
+def update_transaction(transaction_id: int, typ: str = None, quantity: float = None,
+                        price: float = None, datum=None, fees: float = None):
+    """
+    Ändert eine bestehende Transaktion (nur übergebene Felder) und berechnet die
+    zugehörige Position anschließend komplett aus allen Transaktionen neu (siehe
+    _recompute_position), damit Bestand/Ø-Kaufpreis nach der Änderung wieder
+    korrekt sind. Bereits gebuchte Steuer (tx.steuern) wird dabei NICHT neu
+    berechnet – wie auch delete_transaction() die Steuer-Historie unangetastet lässt.
+    """
+    with get_session() as session:
+        tx = session.get(PosTransaction, transaction_id)
+        if tx is None:
+            raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
+        if typ is not None:
+            typ = typ.lower().strip()
+            if typ not in ("kauf", "verkauf", "dividende", "sparrate"):
+                raise ValueError(f"Unbekannter Transaktionstyp: {typ}")
+            tx.typ = typ
+        if quantity is not None:
+            tx.quantity = quantity
+        if price is not None:
+            tx.price = price
+        if datum is not None:
+            tx.datum = datum
+        if fees is not None:
+            tx.fees = fees
+        session.flush()
+        if tx.position_id:
+            _recompute_position(session, tx.position_id)
 
 
 def delete_position(position_id: int):
