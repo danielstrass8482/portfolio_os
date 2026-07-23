@@ -5,11 +5,32 @@ Das LLM entscheidet nichts und exekutiert nichts – es analysiert und erklärt.
 Bei API-Ausfall läuft das System im degraded mode weiter (siehe _ask()).
 """
 
+import base64
+import io
 import json
 
 import anthropic
 
 from config import ANTHROPIC_API_KEY, LLM_MODEL, LLM_MAX_TOKENS
+
+KREDIT_VERTRAG_SYSTEM_PROMPT = """Du bist ein Experte für deutsche Immobilienkreditverträge.
+Analysiere das Dokument und extrahiere folgende Daten als JSON:
+{
+    "kredit_gesamtbetrag": 0.0,
+    "kredit_abgerufen": 0.0,
+    "zinssatz": 0.0,
+    "laufzeit_jahre": 0,
+    "zinsbindung_bis": "YYYY-MM-DD oder null",
+    "monatliche_rate": 0.0,
+    "vorfaelligkeitsgebuehr_pct": 0.0,
+    "bank": "Name der Bank",
+    "darlehensnehmer": "Name(n)",
+    "objekt_adresse": "Adresse wenn vorhanden",
+    "abschluss_datum": "YYYY-MM-DD oder null",
+    "besonderheiten": "z.B. KfW-Förderung, Tilgungsaussetzung etc."
+}
+Wenn ein Wert nicht im Dokument steht: null setzen.
+Antworte NUR mit dem JSON, kein anderer Text."""
 
 SYSTEM_PROMPT = """Du bist ein kritischer, unabhängiger Finanzanalyst.
 Du gibst keine Anlageberatung sondern zeigst Fakten und Risiken auf.
@@ -133,6 +154,49 @@ Letzter bekannter Schätzwert: {immobilie.get('letzter_schaetzwert')} EUR"""
         "verfuegbar": text is not None,
         "text": text or "KI-Schätzung aktuell nicht verfügbar. Bitte letzten Schätzwert manuell aktualisieren.",
     }
+
+
+def analyze_kredit_vertrag(file_bytes: bytes, file_type: str) -> dict:
+    """
+    Liest einen hochgeladenen Immobilienkredit-Vertrag (PDF oder Bild) per KI aus
+    und gibt die erkannten Eckdaten als dict zurück (siehe KREDIT_VERTRAG_SYSTEM_PROMPT
+    für die Struktur). Bei fehlendem API-Key, nicht lesbarem Dokument oder ungültiger
+    KI-Antwort: degraded mode, gibt ein leeres dict zurück statt abzustürzen.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("⚠️  ANTHROPIC_API_KEY fehlt – Kreditvertrags-Analyse übersprungen (degraded mode)")
+        return {}
+
+    try:
+        if file_type == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            if not text.strip():
+                print("⚠️  Kein Text im PDF gefunden (degraded mode)")
+                return {}
+            user_content = f"Vertragstext:\n\n{text[:15000]}"
+        else:
+            media_type = file_type if file_type in ("image/jpeg", "image/png") else "image/jpeg"
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            user_content = [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                {"type": "text", "text": "Extrahiere die Kreditvertrags-Daten aus diesem Bild als JSON."},
+            ]
+
+        antwort = _ask(user_content, system=KREDIT_VERTRAG_SYSTEM_PROMPT, max_tokens=1024)
+        if antwort is None:
+            return {}
+
+        bereinigt = antwort.strip()
+        if bereinigt.startswith("```"):
+            bereinigt = bereinigt.strip("`")
+            if bereinigt.lower().startswith("json"):
+                bereinigt = bereinigt[4:]
+        return json.loads(bereinigt.strip())
+    except Exception as e:
+        print(f"⚠️  Kreditvertrags-Analyse fehlgeschlagen: {e} (degraded mode)")
+        return {}
 
 
 def generate_quarterly_report(user_id: int) -> dict:

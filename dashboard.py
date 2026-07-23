@@ -20,7 +20,7 @@ import plotly.express as px
 
 from config import validate_config, BASE_URL
 from database import (
-    init_db, get_session, get_or_create_user,
+    init_db, get_session, get_or_create_user, save_real_estate,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
     PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction,
 )
@@ -562,16 +562,95 @@ with tab4:
 
 
 # ─────────────────────────────────────────────
+# IMMOBILIEN-HELFER (Abschreibung & Finanzierung)
+# ─────────────────────────────────────────────
+ABSCHREIBUNGSARTEN = [
+    "Keine Abschreibung",
+    "Standard AfA (2% p.a.)",
+    "Denkmalschutz Sonderabschreibung (§7i EStG)",
+    "Energetische Sanierung (§35c EStG)",
+    "Selbst genutzt (keine AfA)",
+]
+AFA_STANDARDSAETZE = {
+    "Standard AfA (2% p.a.)": 2.0,
+    "Denkmalschutz Sonderabschreibung (§7i EStG)": 9.0,
+    "Energetische Sanierung (§35c EStG)": 14.0,
+}
+STEUERSATZ_SCHAETZUNG = 0.42  # geschätzter Grenzsteuersatz für die AfA-Ersparnis-Anzeige
+
+
+def _parse_iso_date(wert):
+    """Wandelt einen 'YYYY-MM-DD'-String (oder None/ungültig) der KI-Antwort in ein date um."""
+    if not wert:
+        return None
+    try:
+        return datetime.strptime(wert, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _immobilie_erweiterte_felder(key_prefix: str) -> dict:
+    """
+    Rendert die Sektionen 'Abschreibung' und 'Finanzierung & Vermietung' für die
+    Immobilien-Erfassung und gibt die eingegebenen Werte als dict zurück. Wird
+    bewusst AUSSERHALB eines st.form aufgerufen, damit der Abschreibungssatz-
+    Vorschlag beim Wechsel der Abschreibungsart sofort (per Rerun) aktualisiert wird.
+    """
+    st.markdown("**Abschreibung**")
+    afa_art = st.selectbox("Abschreibungsart", ABSCHREIBUNGSARTEN, key=f"{key_prefix}_afa_art")
+    felder = {"abschreibungsart": afa_art}
+    if afa_art in ("Keine Abschreibung", "Selbst genutzt (keine AfA)"):
+        felder["abschreibungsbasis"] = 0.0
+        felder["abschreibungssatz"] = 0.0
+    else:
+        c1, c2 = st.columns(2)
+        felder["abschreibungsbasis"] = c1.number_input(
+            "Abschreibungsbasis (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_afa_basis")
+        felder["abschreibungssatz"] = c2.number_input(
+            "Abschreibungssatz (%)", min_value=0.0, step=0.1,
+            value=AFA_STANDARDSAETZE.get(afa_art, 2.0), key=f"{key_prefix}_afa_satz")
+    felder["kaufdatum"] = st.date_input("Kaufdatum", value=None, key=f"{key_prefix}_kaufdatum")
+
+    st.markdown("**Finanzierung & Vermietung**")
+    felder["vermietung_start"] = st.date_input(
+        "Vermietung gestartet am (optional)", value=None, key=f"{key_prefix}_vermietung_start")
+    c1, c2 = st.columns(2)
+    felder["kredit_gesamtbetrag"] = c1.number_input(
+        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_kredit_gesamt")
+    felder["kredit_abgerufen"] = c2.number_input(
+        "Davon bereits abgerufen (€)", min_value=0.0, step=1000.0, key=f"{key_prefix}_kredit_abgerufen")
+    c3, c4 = st.columns(2)
+    felder["kredit_zinssatz"] = c3.number_input(
+        "Zinssatz (% p.a.)", min_value=0.0, step=0.1, key=f"{key_prefix}_zinssatz")
+    felder["kredit_laufzeit_jahre"] = int(c4.number_input(
+        "Laufzeit (Jahre)", min_value=0, step=1, key=f"{key_prefix}_laufzeit"))
+    felder["zinsbindung_bis"] = st.date_input(
+        "Zinsbindung bis (optional)", value=None, key=f"{key_prefix}_zinsbindung")
+    felder["vorfaelligkeitsgebuehr_pct"] = st.number_input(
+        "Vorfälligkeitsentschädigung im Vertrag (% des Restdarlehens)",
+        min_value=0.0, step=0.1, key=f"{key_prefix}_vorfaelligkeit")
+    felder["finanzierungskosten"] = st.number_input(
+        "Finanzierungskosten p.a. (€)", min_value=0.0, step=100.0, key=f"{key_prefix}_finanzierungskosten")
+    return felder
+
+
+# ─────────────────────────────────────────────
 # TAB 5 – IMMOBILIE
 # ─────────────────────────────────────────────
 with tab5:
     with get_session() as session:
         immobilien = session.query(PosRealEstate).filter(PosRealEstate.user_id.in_(aktive_user_ids)).all()
         immobilien_data = [{
-            "id": i.id, "adresse": i.adresse, "kaufpreis": i.kaufpreis, "kaufjahr": i.kaufjahr,
+            "id": i.id, "user_id": i.user_id, "adresse": i.adresse, "kaufpreis": i.kaufpreis, "kaufjahr": i.kaufjahr,
             "eigenkapital": i.eigenkapital, "restschuld": i.restschuld, "monatliche_rate": i.monatliche_rate,
             "mieteinnahmen": i.mieteinnahmen, "letzter_schaetzwert": i.letzter_schaetzwert,
             "letztes_update": i.letztes_update,
+            "vermietung_start": i.vermietung_start, "kredit_gesamtbetrag": i.kredit_gesamtbetrag,
+            "kredit_abgerufen": i.kredit_abgerufen, "kredit_zinssatz": i.kredit_zinssatz,
+            "kredit_laufzeit_jahre": i.kredit_laufzeit_jahre, "vorfaelligkeitsgebuehr_pct": i.vorfaelligkeitsgebuehr_pct,
+            "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
+            "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
+            "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
         } for i in immobilien]
 
     if not immobilien_data:
@@ -579,24 +658,37 @@ with tab5:
             st.info("Keine Immobilie hinterlegt. Bitte oben einen Nutzer auswählen, um eine anzulegen.")
         else:
             st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen:")
-            with st.form("neue_immobilie_tab5"):
-                im5_adresse = st.text_input("Adresse")
-                im5_kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0)
-                im5_kaufjahr = st.number_input("Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year)
-                im5_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0)
-                im5_ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0)
-                im5_restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0)
-                im5_rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0)
-                im5_miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0)
-                if st.form_submit_button("Speichern") and im5_adresse:
-                    with get_session() as session:
-                        session.add(PosRealEstate(
-                            user_id=aktiver_user["id"], adresse=im5_adresse, kaufpreis=im5_kaufpreis,
+            im5_adresse = st.text_input("Adresse", key="im5_adresse")
+            im5_kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0, key="im5_kaufpreis")
+            im5_kaufjahr = st.number_input(
+                "Kaufjahr", min_value=1950, max_value=date.today().year, value=date.today().year, key="im5_kaufjahr")
+            im5_qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0, key="im5_qm")
+            im5_ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0, key="im5_ek")
+            im5_restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0, key="im5_restschuld")
+            im5_rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0, key="im5_rate")
+            im5_miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0, key="im5_miete")
+
+            st.divider()
+            im5_erweitert = _immobilie_erweiterte_felder("im5")
+            st.divider()
+
+            if st.button("Speichern", key="im5_speichern_btn"):
+                if not im5_adresse:
+                    st.error("Bitte eine Adresse angeben.")
+                else:
+                    try:
+                        save_real_estate(
+                            user_id=aktiver_user["id"],
+                            adresse=im5_adresse, kaufpreis=im5_kaufpreis,
                             kaufjahr=int(im5_kaufjahr), wohnflaeche_qm=im5_qm, eigenkapital=im5_ek,
                             restschuld=im5_restschuld, monatliche_rate=im5_rate, mieteinnahmen=im5_miete,
                             letzter_schaetzwert=im5_kaufpreis, letztes_update=datetime.utcnow(),
-                        ))
-                    st.rerun()
+                            **im5_erweitert,
+                        )
+                        st.success("Immobilie gespeichert!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Fehler beim Speichern: {e}")
     else:
         for im in immobilien_data:
             st.subheader(im["adresse"])
@@ -610,6 +702,62 @@ with tab5:
             c1.metric("Letzter Schätzwert", fmt_eur(schaetzwert, 0))
             c2.metric("LTV-Ratio", f"{fmt_zahl(ltv*100, 1)}%")
             c3.metric("Eigenkapitalrendite (Cash-on-Cash)", f"{fmt_zahl(ek_rendite*100, 1)}%")
+
+            # ---- Selbstnutzung / Vermietungsbeginn ------------------------
+            if im["kaufjahr"]:
+                if im["vermietung_start"]:
+                    vermiet_jahr = im["vermietung_start"].year
+                    eigennutzung_jahre = max(0, vermiet_jahr - im["kaufjahr"])
+                    st.caption(
+                        f"📅 Selbstnutzungsphase: Gekauft {im['kaufjahr']} – Vermietung ab {vermiet_jahr} "
+                        f"({eigennutzung_jahre} Jahre Eigennutzung)"
+                    )
+                else:
+                    st.caption(f"📅 Gekauft {im['kaufjahr']} – noch keine Vermietung erfasst")
+
+            # ---- Finanzierung (Feature 2) ----------------------------------
+            if im["kredit_gesamtbetrag"]:
+                fc1, fc2, fc3 = st.columns(3)
+                offener_kredit = (im["kredit_gesamtbetrag"] or 0.0) - (im["kredit_abgerufen"] or 0.0)
+                fc1.metric("Noch nicht abgerufener Kredit", fmt_eur(offener_kredit, 0))
+                vorfaelligkeit = (im["restschuld"] or 0.0) * (im["vorfaelligkeitsgebuehr_pct"] or 0.0) / 100
+                fc2.metric("Geschätzte Vorfälligkeitsentschädigung", fmt_eur(vorfaelligkeit, 0))
+                if im["zinsbindung_bis"]:
+                    tage_bis_ablauf = (im["zinsbindung_bis"] - date.today()).days
+                    jahre_bis_ablauf = round(tage_bis_ablauf / 365.0, 1)
+                    fc3.metric("Zinsbindung läuft ab in", f"{fmt_zahl(jahre_bis_ablauf, 1)} Jahren")
+                else:
+                    fc3.metric("Zinsbindung läuft ab in", "–")
+
+            # ---- Abschreibung (Feature 2) -----------------------------------
+            if im["abschreibungsart"] not in (None, "Keine", "Keine Abschreibung", "Selbst genutzt (keine AfA)"):
+                jaehrliche_afa = (im["abschreibungsbasis"] or 0.0) * (im["abschreibungssatz"] or 0.0) / 100
+                steuerersparnis_jahr = jaehrliche_afa * STEUERSATZ_SCHAETZUNG
+                gesamte_steuerersparnis = (im["abschreibungsbasis"] or 0.0) * STEUERSATZ_SCHAETZUNG
+                effektiver_kaufpreis = im["kaufpreis"] - gesamte_steuerersparnis
+
+                st.markdown("**Abschreibung (AfA)**")
+                ac1, ac2, ac3 = st.columns(3)
+                ac1.metric("Jährliche Abschreibung", fmt_eur(jaehrliche_afa, 0))
+                ac2.metric("Steuerersparnis p.a.", fmt_eur(steuerersparnis_jahr, 0))
+                ac3.metric("Gesamte Steuerersparnis", fmt_eur(gesamte_steuerersparnis, 0))
+                st.caption(
+                    f"Effektiver Kaufpreis nach Steuerersparnis: {fmt_eur(effektiver_kaufpreis, 0)} · "
+                    "Geschätzt bei 42% Grenzsteuersatz – bitte mit Steuerberater abstimmen."
+                )
+
+                if im["abschreibungsart"] == "Denkmalschutz Sonderabschreibung (§7i EStG)":
+                    start_jahr = im["kaufdatum"].year if im["kaufdatum"] else im["kaufjahr"]
+                    if start_jahr:
+                        jahre_seit_kauf = date.today().year - start_jahr
+                        if jahre_seit_kauf < 8:
+                            st.caption(f"Phase 1: 9% p.a. (Jahr 1-8) → noch {8 - jahre_seit_kauf} Jahre")
+                            st.caption(f"Phase 2: 7% p.a. (Jahr 9-12) → ab Jahr {start_jahr + 8}")
+                        elif jahre_seit_kauf < 12:
+                            st.caption("Phase 1: 9% p.a. (Jahr 1-8) → abgeschlossen")
+                            st.caption(f"Phase 2: 7% p.a. (Jahr 9-12) → noch {12 - jahre_seit_kauf} Jahre")
+                        else:
+                            st.caption("Sonderabschreibungsphase abgeschlossen (Jahr 1-12)")
 
             if st.button("🤖 KI-Schätzung anfordern", key=f"ki_schaetzung_{im['id']}"):
                 with st.spinner("Fordere KI-Schätzung an (Web-Suche)..."):
@@ -628,6 +776,76 @@ with tab5:
             fig = px.line(verlauf, x="Datum", y="Wert", markers=True)
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
             st.plotly_chart(fig, use_container_width=True)
+
+            # ---- Kreditvertrag hochladen & KI auslesen (Feature 3) ---------
+            with st.expander("📄 Kreditvertrag hochladen"):
+                st.caption("KI liest den Vertrag aus und trägt die Daten automatisch ein")
+                kv_file = st.file_uploader(
+                    "Kreditvertrag (PDF, JPG, PNG)", type=["pdf", "jpg", "jpeg", "png"],
+                    key=f"kv_upload_{im['id']}")
+                if kv_file is not None and st.button("KI-Analyse starten", key=f"kv_analyse_btn_{im['id']}"):
+                    with st.spinner("KI analysiert Kreditvertrag..."):
+                        erkannt = llm_analyst.analyze_kredit_vertrag(kv_file.getvalue(), kv_file.type)
+                    if not erkannt:
+                        st.error("Kreditvertrag konnte nicht ausgelesen werden. Bitte Werte manuell eintragen.")
+                    else:
+                        st.session_state[f"kv_erkannt_{im['id']}"] = erkannt
+
+                erkannt = st.session_state.get(f"kv_erkannt_{im['id']}")
+                if erkannt:
+                    st.success("KI hat folgende Werte erkannt – bitte prüfen und ggf. korrigieren:")
+                    kc1, kc2 = st.columns(2)
+                    kv_gesamt = kc1.number_input(
+                        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0,
+                        value=float(erkannt.get("kredit_gesamtbetrag") or 0.0), key=f"kv_gesamt_{im['id']}")
+                    kv_abgerufen = kc2.number_input(
+                        "Davon abgerufen (€)", min_value=0.0, step=1000.0,
+                        value=float(erkannt.get("kredit_abgerufen") or 0.0), key=f"kv_abgerufen_{im['id']}")
+                    kc3, kc4 = st.columns(2)
+                    kv_zins = kc3.number_input(
+                        "Zinssatz (% p.a.)", min_value=0.0, step=0.1,
+                        value=float(erkannt.get("zinssatz") or 0.0), key=f"kv_zins_{im['id']}")
+                    kv_laufzeit = kc4.number_input(
+                        "Laufzeit (Jahre)", min_value=0, step=1,
+                        value=int(erkannt.get("laufzeit_jahre") or 0), key=f"kv_laufzeit_{im['id']}")
+                    kv_zinsbindung = st.date_input(
+                        "Zinsbindung bis", value=_parse_iso_date(erkannt.get("zinsbindung_bis")),
+                        key=f"kv_zinsbindung_{im['id']}")
+                    kv_vorfaelligkeit = st.number_input(
+                        "Vorfälligkeitsentschädigung (% des Restdarlehens)", min_value=0.0, step=0.1,
+                        value=float(erkannt.get("vorfaelligkeitsgebuehr_pct") or 0.0),
+                        key=f"kv_vorfaelligkeit_{im['id']}")
+
+                    info_bits = [
+                        f"{label}: {erkannt[feld]}"
+                        for label, feld in [
+                            ("Bank", "bank"), ("Darlehensnehmer", "darlehensnehmer"),
+                            ("Objekt", "objekt_adresse"), ("Abschluss", "abschluss_datum"),
+                            ("Besonderheiten", "besonderheiten"),
+                        ]
+                        if erkannt.get(feld)
+                    ]
+                    if info_bits:
+                        st.caption(" · ".join(info_bits))
+
+                    if st.button("✅ Alle Werte übernehmen", key=f"kv_uebernehmen_{im['id']}"):
+                        try:
+                            save_real_estate(
+                                user_id=im["user_id"],
+                                real_estate_id=im["id"],
+                                kredit_gesamtbetrag=kv_gesamt,
+                                kredit_abgerufen=kv_abgerufen,
+                                kredit_zinssatz=kv_zins,
+                                kredit_laufzeit_jahre=int(kv_laufzeit),
+                                zinsbindung_bis=kv_zinsbindung,
+                                vorfaelligkeitsgebuehr_pct=kv_vorfaelligkeit,
+                            )
+                            st.session_state.pop(f"kv_erkannt_{im['id']}", None)
+                            st.success("Kreditdaten übernommen!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Fehler beim Speichern: {e}")
+
             st.divider()
 
 
@@ -981,6 +1199,7 @@ with tab8:
 
         # ---- Immobilie anlegen -----------------------------------------
         st.subheader("Immobilie anlegen")
+        st.caption("Für Abschreibung, Finanzierung & Kreditvertrag-KI siehe Tab 🏠 Immobilie.")
         with st.form("neue_immobilie"):
             im_adresse = st.text_input("Adresse")
             im_kaufpreis = st.number_input("Kaufpreis", min_value=0.0, step=1000.0)
@@ -990,15 +1209,21 @@ with tab8:
             im_restschuld = st.number_input("Restschuld", min_value=0.0, step=1000.0)
             im_rate = st.number_input("Monatliche Rate", min_value=0.0, step=10.0)
             im_miete = st.number_input("Monatliche Mieteinnahmen", min_value=0.0, step=10.0)
-            if st.form_submit_button("Anlegen") and im_adresse:
-                with get_session() as session:
-                    session.add(PosRealEstate(
-                        user_id=aktiver_user["id"], adresse=im_adresse, kaufpreis=im_kaufpreis,
-                        kaufjahr=int(im_kaufjahr), wohnflaeche_qm=im_qm, eigenkapital=im_ek,
-                        restschuld=im_restschuld, monatliche_rate=im_rate, mieteinnahmen=im_miete,
-                        letzter_schaetzwert=im_kaufpreis, letztes_update=datetime.utcnow(),
-                    ))
-                st.rerun()
+            if st.form_submit_button("Anlegen"):
+                if not im_adresse:
+                    st.error("Bitte eine Adresse angeben.")
+                else:
+                    try:
+                        save_real_estate(
+                            user_id=aktiver_user["id"], adresse=im_adresse, kaufpreis=im_kaufpreis,
+                            kaufjahr=int(im_kaufjahr), wohnflaeche_qm=im_qm, eigenkapital=im_ek,
+                            restschuld=im_restschuld, monatliche_rate=im_rate, mieteinnahmen=im_miete,
+                            letzter_schaetzwert=im_kaufpreis, letztes_update=datetime.utcnow(),
+                        )
+                        st.success("Immobilie gespeichert!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Fehler beim Speichern: {e}")
 
         st.divider()
 

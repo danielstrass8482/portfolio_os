@@ -201,6 +201,22 @@ class PosRealEstate(Base):
     letzter_schaetzwert = Column(Float, nullable=True)
     letztes_update     = Column(DateTime, nullable=True)
 
+    # Finanzierung & Vermietung
+    vermietung_start           = Column(Date, nullable=True)
+    kredit_gesamtbetrag        = Column(Float, default=0.0)
+    kredit_abgerufen           = Column(Float, default=0.0)
+    kredit_zinssatz            = Column(Float, default=0.0)
+    kredit_laufzeit_jahre      = Column(Integer, default=0)
+    vorfaelligkeitsgebuehr_pct = Column(Float, default=0.0)
+    zinsbindung_bis            = Column(Date, nullable=True)
+    finanzierungskosten        = Column(Float, default=0.0)
+
+    # Abschreibung
+    abschreibungsart   = Column(Text, default="Keine")
+    abschreibungsbasis = Column(Float, default=0.0)
+    abschreibungssatz  = Column(Float, default=0.0)
+    kaufdatum          = Column(Date, nullable=True)
+
     def __repr__(self):
         return f"<PosRealEstate {self.adresse}>"
 
@@ -326,6 +342,27 @@ def get_or_create_user(session: Session, name: str, email: str = None, rolle: st
 
 def get_asset_class_by_slug(session: Session, slug: str) -> PosAssetClass:
     return session.query(PosAssetClass).filter_by(slug=slug).first()
+
+
+def save_real_estate(user_id: int, real_estate_id: int = None, **felder) -> int:
+    """
+    Legt eine Immobilie an (real_estate_id=None) oder aktualisiert eine
+    bestehende (real_estate_id gesetzt) – z.B. für die KI-Auswertung eines
+    Kreditvertrags, die nur einzelne Felder einer bereits angelegten
+    Immobilie nachträgt. Gibt die id der Immobilie zurück.
+    """
+    with get_session() as session:
+        if real_estate_id is not None:
+            obj = session.get(PosRealEstate, real_estate_id)
+            if obj is None:
+                raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
+        else:
+            obj = PosRealEstate(user_id=user_id)
+            session.add(obj)
+        for key, value in felder.items():
+            setattr(obj, key, value)
+        session.flush()
+        return obj.id
 
 
 def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, asset_breakdown: dict = None):

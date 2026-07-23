@@ -9,3 +9,4 @@ apscheduler>=3.10.0
 python-dotenv>=1.0.0
 pytz>=2024.1
 fpdf2>=2.7.9
+pypdf>=4.2.0
