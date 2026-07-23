@@ -17,6 +17,8 @@ from datetime import date, datetime
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import yfinance as yf
 
 from config import validate_config, BASE_URL
 from database import (
@@ -53,6 +55,135 @@ def fmt_menge(menge):
     if menge == int(menge):
         return str(int(menge))
     return f"{menge:.4f}".replace(".", ",")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _lade_kurshistorie(ticker: str) -> pd.DataFrame:
+    """
+    Lädt 2 Jahre Tageskurse (Schlusskurs) einer Position via yfinance für den
+    historischen Positions-Chart im Positionen-Tab. Cache 1h, damit der Chart bei
+    Streamlit-Reruns nicht jedes Mal neu lädt. Gibt einen DataFrame mit den Spalten
+    "Date" und "Close" zurück – bei Fehler oder unbekanntem Ticker einen leeren.
+    """
+    try:
+        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # yfinance liefert bei Einzel-Tickern je nach Version MultiIndex-Spalten
+        # (('Close', TICKER)) – flach machen, damit df["Close"] immer funktioniert.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.reset_index()[["Date", "Close"]].dropna()
+    except Exception as e:
+        print(f"⚠️  Kurshistorie für {ticker} nicht ladbar: {e}")
+        return pd.DataFrame()
+
+
+def _kauf_transaktionen(position_id: int) -> list:
+    """Alle Kauf-Buchungen einer Position (datum, price, quantity), chronologisch –
+    für die Kauf-Pins im Positions-Chart. Leere Liste, wenn keine vorhanden."""
+    with get_session() as session:
+        return [
+            {"datum": t.datum, "price": t.price, "quantity": t.quantity}
+            for t in session.query(PosTransaction)
+            .filter_by(position_id=position_id, typ="kauf")
+            .order_by(PosTransaction.datum)
+            .all()
+        ]
+
+
+def _positions_chart(pos: dict):
+    """
+    Historischer Kursverlauf einer Position als Plotly-Linienchart mit
+    Zeitraum-Buttons, Ø-Einstieg-Linie (grün über / rot unter Einstieg),
+    Kauf-Pins (Gold-Dreiecke aus pos_transactions) und aktueller Preis-Markierung.
+    Darunter eine Info-Zeile mit Ø-Einstieg, Kurs, G/V und erstem Kauf.
+    """
+    ticker = pos.get("ticker")
+    hist = _lade_kurshistorie(ticker)
+    if hist.empty:
+        st.info(f"Keine Kursdaten für {ticker} verfügbar (via yfinance).")
+        return
+
+    avg = pos.get("avg_buy_price") or 0.0
+    current = pos.get("current_price")
+    if current is None:
+        current = float(hist["Close"].iloc[-1])
+    kauefe = _kauf_transaktionen(pos["id"])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist["Date"], y=hist["Close"], mode="lines", name="Kurs",
+        line=dict(color="#60a5fa", width=2),
+        hovertemplate="%{x|%d.%m.%Y}: %{y:.2f} €<extra></extra>",
+    ))
+
+    # Ø-Einstieg als horizontale Linie – grün wenn aktueller Kurs darüber (Gewinn),
+    # rot wenn darunter (Verlust); gleiche Farblogik wie die G/V-Spalten der Tabelle.
+    if avg > 0:
+        linien_farbe = "#34d399" if current >= avg else "#f87171"
+        fig.add_hline(
+            y=avg, line=dict(color=linien_farbe, width=1.5, dash="dash"),
+            annotation_text=f"Ø-Einstieg: {fmt_eur(avg)}",
+            annotation_position="top left",
+            annotation_font=dict(color=linien_farbe),
+        )
+
+    # Kauf-Pins (nur wenn Transaktionen in der DB vorhanden sind)
+    if kauefe:
+        fig.add_trace(go.Scatter(
+            x=[k["datum"] for k in kauefe],
+            y=[k["price"] for k in kauefe],
+            mode="markers", name="Käufe",
+            marker=dict(symbol="triangle-up", size=13, color="gold",
+                        line=dict(color="#b45309", width=1)),
+            customdata=[[k["quantity"]] for k in kauefe],
+            hovertemplate="Kauf: %{x|%d.%m.%Y} @ %{y:.2f} € (%{customdata[0]:.0f} Stk)<extra></extra>",
+        ))
+
+    # Aktuelle Preis-Markierung: Punkt am Ende der Linie
+    pnl_pct = (current / avg - 1) * 100 if avg else 0.0
+    fig.add_trace(go.Scatter(
+        x=[hist["Date"].iloc[-1]], y=[current],
+        mode="markers", name="Aktuell",
+        marker=dict(symbol="circle", size=11, color="#f8fafc",
+                    line=dict(color="#60a5fa", width=2)),
+        hovertemplate=(f"Aktuell: {fmt_eur(current)} "
+                       f"({'+' if pnl_pct >= 0 else ''}{fmt_zahl(pnl_pct, 1)}%)<extra></extra>"),
+    ))
+
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
+        hovermode="closest",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb",
+        xaxis=dict(rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="1J", step="year", stepmode="backward"),
+                dict(count=2, label="2J", step="year", stepmode="backward"),
+                dict(label="Alles", step="all"),
+            ],
+            bgcolor="#1f2937", activecolor="#2563eb", font=dict(color="#f9fafb"),
+        )),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Info-Zeile unter dem Chart
+    pnl = pos.get("unrealized_pnl") or 0.0
+    pnl_pct_pos = pos.get("unrealized_pnl_pct")
+    trend = "📈" if pnl >= 0 else "📉"
+    info_teile = [
+        f"📍 Ø-Einstieg: {fmt_eur(avg)}",
+        f"📈 Aktuell: {fmt_eur(current)}",
+        f"{trend} G/V: {'+' if pnl >= 0 else ''}{fmt_eur(pnl)}"
+        + (f" ({'+' if (pnl_pct_pos or 0) >= 0 else ''}{fmt_zahl(pnl_pct_pos, 1)}%)"
+           if pnl_pct_pos is not None else ""),
+    ]
+    if kauefe:
+        info_teile.append(f"📅 Erster Kauf: {kauefe[0]['datum']:%d.%m.%Y}")
+    st.caption(" | ".join(info_teile))
 
 
 def _tabellen_safe(fn):
@@ -553,6 +684,15 @@ with tab2:
             })
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        # ---- Historischer Kursverlauf der gewählten Position ----------
+        st.markdown("### 📈 Kursverlauf")
+        chart_pos_options = {f"{row['name']} ({row['portfolio_name']})": row.to_dict()
+                             for _, row in gefiltert.iterrows()}
+        if chart_pos_options:
+            chart_pos_wahl = st.selectbox(
+                "Position für Chart", list(chart_pos_options.keys()), key="chart_pos_wahl")
+            _positions_chart(chart_pos_options[chart_pos_wahl])
 
         st.markdown("**Steuervorschau**")
         steuer_pos_options = {f"{row['name']} ({row['portfolio_name']})": row.to_dict()
@@ -1268,7 +1408,21 @@ with tab6:
                     anzahl_erkannt = len(ergebnis["buchungen"])
                     zusatz = f", {anzahl_erkannt - anzahl_neu} bereits vorhanden" if anzahl_erkannt > anzahl_neu else ""
                     st.success(f"{anzahl_neu} neue Buchung(en) gespeichert{zusatz}")
-                    st.rerun()
+
+                    # Erkannte Immobilienkaufpreiszahlungen (Darlehensauszahlungen an
+                    # Bauträger/Projektgesellschaften) hervorheben – siehe Tab 🏠 Immobilie.
+                    for imm in ergebnis.get("immobilienkaeufe", []):
+                        zeilen = [f"🏠 Möglicher Immobilienkauf erkannt: "
+                                  f"**{fmt_eur(imm.get('gesamtbetrag'))}** an "
+                                  f"{imm.get('empfaenger') or 'unbekannt'}"]
+                        if imm.get("objekt"):
+                            zeilen.append(f"Objekt: {imm['objekt']}")
+                        for ez in imm.get("einzelzahlungen") or []:
+                            zeilen.append(f"• {ez.get('datum')}: {fmt_eur(ez.get('betrag'))}")
+                        st.info("\n\n".join(zeilen))
+
+                    if not ergebnis.get("immobilienkaeufe"):
+                        st.rerun()
 
         with get_session() as session:
             buchungen_db = session.query(PosBuchung).filter_by(user_id=hb_uid).order_by(PosBuchung.datum.desc()).all()
