@@ -180,7 +180,7 @@ def suggest_target_weights(risikoprofil: str, aktive_klassen: list) -> dict:
 Nur diese Assetklassen: {aktive_klassen}
 Risikoprofil: {risikoprofil}
 Antworte NUR als JSON ohne Text: {{"etf": 55, "stocks": 15, ...}}
-Summe muss exakt 100 sein."""
+Summe MUSS exakt 100 ergeben. Bevorzuge runde Zahlen."""
 
     text = _ask(prompt, system=SYSTEM_PROMPT, max_tokens=512)
     if text is None:

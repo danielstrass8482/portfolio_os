@@ -194,6 +194,7 @@ class PosInvestmentPreference(Base):
     aktien_strategie    = Column(Text, nullable=True)   # dividende/wachstum/beides
     blacklist           = Column(JSON, nullable=True)   # ["waffen", "tabak", "fossil", ...]
     whitelist           = Column(JSON, nullable=True)   # ["esg", "tech", "healthcare", ...]
+    whitelist_branchen  = Column(JSON, nullable=True)   # bevorzugte Branchen ["esg", "technologie", ...]
     updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def __repr__(self):

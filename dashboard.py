@@ -57,16 +57,25 @@ def fmt_menge(menge):
     return f"{menge:.4f}".replace(".", ",")
 
 
+# Auswählbare Chart-Zeiträume → yfinance period-Strings.
+ZEITRAUM_MAP = {
+    "1M": "1mo", "3M": "3mo", "6M": "6mo",
+    "1J": "1y", "2J": "2y", "Alles": "max",
+}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def _lade_kurshistorie(ticker: str) -> pd.DataFrame:
+def load_chart_data(ticker: str, period: str) -> pd.DataFrame:
     """
-    Lädt 2 Jahre Tageskurse (Schlusskurs) einer Position via yfinance für den
-    historischen Positions-Chart im Positionen-Tab. Cache 1h, damit der Chart bei
-    Streamlit-Reruns nicht jedes Mal neu lädt. Gibt einen DataFrame mit den Spalten
-    "Date" und "Close" zurück – bei Fehler oder unbekanntem Ticker einen leeren.
+    Lädt Tageskurse (Schlusskurs) einer Position für den gewählten Zeitraum via
+    yfinance für den historischen Positions-Chart im Positionen-Tab. Cache 1h, damit
+    der Chart bei Streamlit-Reruns nicht jedes Mal neu lädt. Gibt einen DataFrame mit
+    den Spalten "Date" und "Close" zurück – bei Fehler oder unbekanntem Ticker einen
+    leeren. auto_adjust=False: Rohkurse, damit die Währungskorrektur (GBp/USD → €)
+    im Chart konsistent zum Ø-Einstieg bleibt.
     """
     try:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=False)
         if df is None or df.empty:
             return pd.DataFrame()
         # yfinance liefert bei Einzel-Tickern je nach Version MultiIndex-Spalten
@@ -77,6 +86,25 @@ def _lade_kurshistorie(ticker: str) -> pd.DataFrame:
     except Exception as e:
         print(f"⚠️  Kurshistorie für {ticker} nicht ladbar: {e}")
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _ticker_waehrung(ticker: str) -> str:
+    """Notierungswährung eines Tickers via yfinance (z.B. 'EUR', 'USD', 'GBp'). Bei
+    Fehler 'EUR' als Fallback."""
+    try:
+        return yf.Ticker(ticker).info.get("currency", "EUR") or "EUR"
+    except Exception:
+        return "EUR"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fx_kurs(pair: str, fallback: float) -> float:
+    """Aktueller FX-Kurs (regularMarketPrice) eines yfinance-Paars, mit Fallback."""
+    try:
+        return yf.Ticker(pair).info.get("regularMarketPrice", fallback) or fallback
+    except Exception:
+        return fallback
 
 
 def _kauf_transaktionen(position_id: int) -> list:
@@ -100,31 +128,53 @@ def _positions_chart(pos: dict):
     Darunter eine Info-Zeile mit Ø-Einstieg, Kurs, G/V und erstem Kauf.
     """
     ticker = pos.get("ticker")
-    hist = _lade_kurshistorie(ticker)
-    if hist.empty:
+
+    # Zeitraum-Auswahl (Standard: 2J). "Alles" → yfinance period "max".
+    selected_period = st.radio(
+        "Zeitraum", list(ZEITRAUM_MAP.keys()), horizontal=True, index=4,
+        key=f"chart_zeitraum_{pos['id']}",
+    )
+    df = load_chart_data(ticker, ZEITRAUM_MAP[selected_period])
+    if df.empty:
         st.info(f"Keine Kursdaten für {ticker} verfügbar (via yfinance).")
         return
 
-    avg = pos.get("avg_buy_price") or 0.0
+    # Währungskorrektur → Euro, damit Chartkurse und Ø-Einstieg (in €) vergleichbar sind.
+    currency = _ticker_waehrung(ticker)
+    if currency == "GBp":
+        fx = _fx_kurs("GBPEUR=X", 1.18)
+        df["Close"] = (df["Close"] / 100) * fx
+    elif currency == "USD":
+        fx = _fx_kurs("EURUSD=X", 1.08)
+        df["Close"] = df["Close"] / fx
+
+    avg_buy_price_eur = pos.get("avg_buy_price") or 0.0
+    avg = avg_buy_price_eur
     current = pos.get("current_price")
     if current is None:
-        current = float(hist["Close"].iloc[-1])
+        current = float(df["Close"].iloc[-1])
     kauefe = _kauf_transaktionen(pos["id"])
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=hist["Date"], y=hist["Close"], mode="lines", name="Kurs",
+        x=df["Date"], y=df["Close"], mode="lines", name="Kurs",
         line=dict(color="#60a5fa", width=2),
         hovertemplate="%{x|%d.%m.%Y}: %{y:.2f} €<extra></extra>",
     ))
+
+    # Liegt der (erste) Kauf vor dem gewählten Zeitraum? Dann Linie entsprechend labeln.
+    kauf_vor_zeitraum = bool(kauefe) and pd.Timestamp(kauefe[0]["datum"]) < df["Date"].min()
 
     # Ø-Einstieg als horizontale Linie – grün wenn aktueller Kurs darüber (Gewinn),
     # rot wenn darunter (Verlust); gleiche Farblogik wie die G/V-Spalten der Tabelle.
     if avg > 0:
         linien_farbe = "#34d399" if current >= avg else "#f87171"
+        annotation_text = f"Ø-Einstieg: {fmt_eur(avg)}"
+        if kauf_vor_zeitraum:
+            annotation_text += " (Kauf vor diesem Zeitraum)"
         fig.add_hline(
             y=avg, line=dict(color=linien_farbe, width=1.5, dash="dash"),
-            annotation_text=f"Ø-Einstieg: {fmt_eur(avg)}",
+            annotation_text=annotation_text,
             annotation_position="top left",
             annotation_font=dict(color=linien_farbe),
         )
@@ -144,7 +194,7 @@ def _positions_chart(pos: dict):
     # Aktuelle Preis-Markierung: Punkt am Ende der Linie
     pnl_pct = (current / avg - 1) * 100 if avg else 0.0
     fig.add_trace(go.Scatter(
-        x=[hist["Date"].iloc[-1]], y=[current],
+        x=[df["Date"].iloc[-1]], y=[current],
         mode="markers", name="Aktuell",
         marker=dict(symbol="circle", size=11, color="#f8fafc",
                     line=dict(color="#60a5fa", width=2)),
@@ -156,18 +206,14 @@ def _positions_chart(pos: dict):
         height=380, margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
         hovermode="closest",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb",
-        xaxis=dict(rangeselector=dict(
-            buttons=[
-                dict(count=1, label="1M", step="month", stepmode="backward"),
-                dict(count=3, label="3M", step="month", stepmode="backward"),
-                dict(count=6, label="6M", step="month", stepmode="backward"),
-                dict(count=1, label="1J", step="year", stepmode="backward"),
-                dict(count=2, label="2J", step="year", stepmode="backward"),
-                dict(label="Alles", step="all"),
-            ],
-            bgcolor="#1f2937", activecolor="#2563eb", font=dict(color="#f9fafb"),
-        )),
     )
+    fig.update_yaxes(title_text="Kurs in €")
+    # Einstiegspreis immer im sichtbaren Bereich halten – auch wenn er weit außerhalb
+    # der Kursspanne des gewählten Zeitraums liegt.
+    if avg_buy_price_eur > 0:
+        y_min = min(df["Close"].min(), avg_buy_price_eur) * 0.95
+        y_max = max(df["Close"].max(), avg_buy_price_eur) * 1.05
+        fig.update_yaxes(range=[y_min, y_max])
     st.plotly_chart(fig, use_container_width=True)
 
     # Info-Zeile unter dem Chart

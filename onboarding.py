@@ -28,12 +28,16 @@ def _fmt_eur(wert, nachkommastellen=0):
 
 def _eur_input(label, value, key, step=1000.0, container=None, help=None):
     """Einheitliches Eingabefeld für Geldbeträge – siehe dashboard._eur_input (gleiches Muster,
-    hier dupliziert statt importiert, um keinen Zyklus onboarding.py <-> dashboard.py zu erzeugen)."""
-    return (container or st).number_input(
+    hier dupliziert statt importiert, um keinen Zyklus onboarding.py <-> dashboard.py zu erzeugen).
+    Zeigt darunter den eingegebenen Betrag tausenderpunkt-formatiert an (z.B. "= 500.000 €")."""
+    c = container or st
+    betrag = c.number_input(
         label, min_value=0.0, step=step, value=float(value or 0.0), key=key,
         placeholder="z.B. 100.000",
         help=help or "Eingabe in Euro, z.B. 500000 für 500.000 €",
     )
+    c.caption(f"= {_fmt_eur(betrag)}")
+    return betrag
 
 
 # ─────────────────────────────────────────────
@@ -131,6 +135,16 @@ BLACKLIST_OPTIONEN = [
     ("pharma", "Pharma"), ("gluecksspiel", "Glücksspiel"), ("krypto_unternehmen", "Krypto-Unternehmen"),
 ]
 
+# Optionale Branchen-Präferenzen (Whitelist) – siehe _step_assetklassen.
+BRANCHEN_OPTIONEN = [
+    ("esg", "🌱 ESG / Nachhaltig"),
+    ("technologie", "💻 Technologie"),
+    ("healthcare", "🏥 Healthcare"),
+    ("dividenden", "💰 Dividenden"),
+    ("schwellenlaender", "🌍 Schwellenländer"),
+    ("infrastruktur", "🏗️ Infrastruktur"),
+]
+
 GEWICHTUNG_VORSCHLAEGE = {
     "konservativ": {"etf": 40, "anleihen": 30, "tagesgeld": 20, "gold": 10},
     "ausgewogen":  {"etf": 55, "stocks": 15, "tagesgeld": 10, "gold": 5, "immobilie": 15},
@@ -145,17 +159,21 @@ def ensure_100(weights: dict) -> dict:
     Rundungsfehler als auch echte Abweichungen aus (z.B. KI-Antwort, die trotz
     Anweisung nicht exakt 100 ergibt, oder ein statischer Vorschlag, dessen Summe
     nach dem Herausfiltern nicht gewählter Assetklassen nicht mehr 100 ergibt).
-    Restdifferenz nach dem Runden wandert auf die letzte Assetklasse.
+    Restdifferenz nach dem Runden wandert auf die größte Assetklasse, damit die Summe
+    exakt 100 ergibt.
     """
+    if not weights:
+        return weights
     total = sum(weights.values())
     if total == 0:
         return weights
-    normalized = {k: round(v / total * 100, 1) for k, v in weights.items()}
-    diff = 100 - sum(normalized.values())
+    normalized = {k: v / total * 100 for k, v in weights.items()}
+    rounded = {k: round(v, 1) for k, v in normalized.items()}
+    diff = round(100.0 - sum(rounded.values()), 1)
     if diff != 0:
-        last_key = list(normalized.keys())[-1]
-        normalized[last_key] = round(normalized[last_key] + diff, 1)
-    return normalized
+        max_key = max(rounded, key=rounded.get)
+        rounded[max_key] = round(rounded[max_key] + diff, 1)
+    return rounded
 
 
 def _risikoprofil_von_score(score: int) -> str:
@@ -363,18 +381,19 @@ def _step_ziele(user_id: int):
                         session.query(PosGoal).filter_by(id=z["id"]).delete()
                     st.rerun()
     else:
-        st.info("Noch kein Ziel angelegt. Bitte mindestens ein Ziel hinzufügen, um fortzufahren.")
+        st.info("Noch kein Ziel angelegt.")
+
+    st.caption("Ziele können später unter Einstellungen ergänzt werden.")
 
     col_zurueck, col_weiter = st.columns(2)
     if col_zurueck.button("← Zurück", key="ob_step3_zurueck"):
         st.session_state.onboarding_step = 2
         st.rerun()
-    if col_weiter.button("Weiter →", key="ob_step3_weiter", type="primary"):
-        if not vorhandene_ziele:
-            st.error("Bitte mindestens ein Ziel anlegen.")
-        else:
-            st.session_state.onboarding_step = 4
-            st.rerun()
+    # Ziele sind optional – ohne Ziel weiter zulassen, Button-Beschriftung passt sich an.
+    weiter_label = "Weiter →" if vorhandene_ziele else "Weiter ohne Ziele →"
+    if col_weiter.button(weiter_label, key="ob_step3_weiter", type="primary"):
+        st.session_state.onboarding_step = 4
+        st.rerun()
 
 
 # ─────────────────────────────────────────────
@@ -513,6 +532,17 @@ def _step_assetklassen(user_id: int):
                 if st.checkbox(blabel, key=f"ob_blacklist_{bkey}"):
                     blacklist.append(bkey)
 
+    # Optionale Branchen-Präferenzen (Whitelist) – unabhängig von der Assetklassen-Wahl.
+    whitelist_branchen = []
+    with st.expander("🎯 Bevorzugte Branchen (optional)", expanded=False):
+        keine_praeferenz = st.checkbox("Keine Präferenz (Standard)", value=True, key="ob_branche_keine")
+        st.caption("Wähle einzelne Branchen ab, wenn du bestimmte Bereiche bevorzugst.")
+        for wkey, wlabel in BRANCHEN_OPTIONEN:
+            if st.checkbox(wlabel, key=f"ob_branche_{wkey}", disabled=keine_praeferenz):
+                whitelist_branchen.append(wkey)
+        if keine_praeferenz:
+            whitelist_branchen = []
+
     col_zurueck, col_weiter = st.columns(2)
     if col_zurueck.button("← Zurück", key="ob_step5_zurueck"):
         st.session_state.onboarding_step = 4
@@ -531,6 +561,7 @@ def _step_assetklassen(user_id: int):
                 pref.etf_ausschuettend = bool(etf_ausschuettend)
                 pref.aktien_strategie = aktien_strategie
                 pref.blacklist = blacklist
+                pref.whitelist_branchen = whitelist_branchen
             st.session_state.onboarding_step = 6
             st.rerun()
 
@@ -703,6 +734,7 @@ def _step_import(user_id: int):
             m_qty = st.number_input("Anzahl", min_value=0.0, step=1.0)
             m_preis = st.number_input("Kaufpreis (€)", min_value=0.0, step=0.01,
                                        help="Preis pro Stück in Euro, z.B. 123.45")
+            st.caption(f"= {_fmt_eur(m_preis, 2)}")
             if st.form_submit_button("Position hinzufügen"):
                 if not m_ticker or m_qty <= 0:
                     st.error("Bitte Ticker und Anzahl angeben.")
