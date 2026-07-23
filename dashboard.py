@@ -1,13 +1,13 @@
 """
 dashboard.py – Streamlit-Dashboard für Portfolio-OS.
-8 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Familie,
-KI-Analyse, Verwaltung. Keine Sidebar – die Nutzer-/Familienauswahl steht
-oberhalb der Tabs (wird von allen Tabs benötigt), alle Anlege-/Bearbeiten-/
-Löschen-Formulare stecken im Tab „⚙️ Verwaltung“.
+9 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Haushaltsbuch,
+Familie, KI-Analyse, Verwaltung. Keine Sidebar – die Nutzer-/Familienauswahl
+steht oberhalb der Tabs (wird von allen Tabs benötigt), alle Anlege-/
+Bearbeiten-/Löschen-Formulare stecken im Tab „⚙️ Verwaltung“.
 
 Datenzugriff läuft ausschließlich über portfolio.py / tax_engine.py /
-rebalancing.py / llm_analyst.py – dashboard.py enthält keine eigene
-Geschäftslogik, nur Darstellung und Formulare.
+rebalancing.py / llm_analyst.py / kontoauszug_analyzer.py – dashboard.py
+enthält keine eigene Geschäftslogik, nur Darstellung und Formulare.
 """
 
 import os
@@ -21,15 +21,18 @@ import plotly.express as px
 from config import validate_config, BASE_URL
 from database import (
     init_db, get_session, get_or_create_user, save_real_estate,
-    update_real_estate, delete_real_estate,
+    update_real_estate, delete_real_estate, save_buchungen,
+    add_kategorisierungsregel, reset_onboarding,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
     PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction, PosGoal,
+    PosBuchung, PosKategorisierungsregel, PosInvestmentPreference,
 )
 import portfolio as portfolio_module
 import tax_engine
 import rebalancing
 import llm_analyst
 import trading_bot_connector
+import kontoauszug_analyzer
 from onboarding import show_onboarding, projiziertes_kapital, RISIKO_PROFILE, ZIEL_ICONS
 
 def fmt_eur(wert, nachkommastellen=2):
@@ -130,6 +133,13 @@ st.markdown("""
 
 AMPEL_LABEL = {"gruen": "🟢 im Ziel", "hellgelb": "🟡 leicht abweichend", "gelb": "🟠 Alert", "rot": "🔴 Verkauf prüfen"}
 
+KATEGORIE_ICONS = {
+    "Wohnen": "🏠", "Lebensmittel": "🛒", "Mobilität": "🚗", "Restaurant": "🍽️",
+    "Abonnements": "📱", "Gesundheit": "🏥", "Versicherung": "🛡️", "Sparen": "💰",
+    "Gehalt": "💼", "Sonstiges": "❓",
+}
+KATEGORIEN = list(KATEGORIE_ICONS.keys())
+
 
 # ─────────────────────────────────────────────
 # BESTÄTIGUNGSDIALOGE (Portfolio/Position löschen)
@@ -189,6 +199,24 @@ def _dialog_familienziel_loeschen(goal_id: int, name: str):
         st.success("Familienziel gelöscht")
         st.rerun()
     if col_nein.button("Abbrechen", key="cancel_delete_familienziel"):
+        st.rerun()
+
+
+@st.dialog("Onboarding neu starten?")
+def _dialog_onboarding_neustart(user_id: int):
+    st.warning(
+        "Möchtest du das Onboarding neu durchlaufen?\n\n"
+        "Deine Positionen und Transaktionen bleiben erhalten. "
+        "Nur Risikoprofil, Ziele und Zielgewichtungen werden zurückgesetzt."
+    )
+    col_ja, col_nein = st.columns(2)
+    if col_ja.button("Ja, neu starten", key="confirm_onboarding_reset"):
+        reset_onboarding(user_id)
+        for k in list(st.session_state.keys()):
+            if k == "onboarding_step" or k.startswith("ob_"):
+                del st.session_state[k]
+        st.rerun()
+    if col_nein.button("Abbrechen", key="cancel_onboarding_reset"):
         st.rerun()
 
 
@@ -287,15 +315,21 @@ def _kombinierte_summary(user_ids: list) -> dict:
     return gesamt
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📊 Übersicht", "📋 Positionen", "⚖️ Rebalancing", "🧾 Steuer",
-    "🏠 Immobilie", "👨‍👩‍👧‍👦 Familie", "🤖 KI-Analyse", "⚙️ Verwaltung",
+    "🏠 Immobilie", "💰 Haushaltsbuch", "👨‍👩‍👧‍👦 Familie", "🤖 KI-Analyse", "⚙️ Verwaltung",
 ])
 
 # ─────────────────────────────────────────────
 # TAB 1 – ÜBERSICHT
 # ─────────────────────────────────────────────
 with tab1:
+    if aktiver_user is not None:
+        _, col_reset = st.columns([5, 1])
+        with col_reset:
+            if st.button("🔄 Onboarding neu starten", key="onboarding_reset_btn"):
+                _dialog_onboarding_neustart(aktiver_user["id"])
+
     summary = _kombinierte_summary(aktive_user_ids) if familien_modus else portfolio_module.get_total_wealth(aktive_user_ids[0])
 
     c1, c2, c3, c4 = st.columns(4)
@@ -325,17 +359,25 @@ with tab1:
                  "Wert": list(summary["asset_breakdown"].values())}
             )
 
-            # Immobilie bekommt einen eigenen Hover-Text mit Schätzwert/Restschuld-
-            # Aufschlüsselung, alle anderen Slices zeigen nur Assetklasse + Wert.
+            # Trading Bot und Immobilie bekommen einen eigenen Hover-Text (Eigenkapital-
+            # Aufschlüsselung bzw. Berechnungshinweis), alle anderen Slices zeigen
+            # Assetklasse + Wert + Anteil am Gesamtwert der Verteilung.
+            gesamt_fuer_pct = df_alloc["Wert"].sum()
+
             def _hover_text(row):
-                basis = f"{row['Assetklasse']}: {fmt_eur(row['Wert'], 0)}"
-                if row["Assetklasse"] == "Immobilie" and summary.get("immobilien_eigenkapital"):
-                    basis += (
-                        f"<br>Schätzwert {fmt_eur(summary['immobilien_schaetzwert_summe'], 0)} "
-                        f"- Restschuld {fmt_eur(summary['immobilien_restschuld_summe'], 0)} "
-                        f"= Eigenkapital {fmt_eur(summary['immobilien_eigenkapital'], 0)}"
+                anteil_pct = (row["Wert"] / gesamt_fuer_pct * 100) if gesamt_fuer_pct else 0.0
+                if row["Assetklasse"] == "Trading Bot":
+                    return (
+                        f"Trading Bot: {fmt_eur(row['Wert'], 0)} ({fmt_zahl(anteil_pct, 1)}%)"
+                        f"<br>Startkapital + realisierter P&L"
                     )
-                return basis
+                if row["Assetklasse"] == "Immobilie" and summary.get("immobilien_eigenkapital"):
+                    return (
+                        f"Immobilie: {fmt_eur(row['Wert'], 0)} Eigenkapital ({fmt_zahl(anteil_pct, 1)}%)"
+                        f"<br>Schätzwert {fmt_eur(summary['immobilien_schaetzwert_summe'], 0)} "
+                        f"- Restschuld {fmt_eur(summary['immobilien_restschuld_summe'], 0)}"
+                    )
+                return f"{row['Assetklasse']}: {fmt_eur(row['Wert'], 0)} ({fmt_zahl(anteil_pct, 1)}%)"
 
             df_alloc["Hover"] = df_alloc.apply(_hover_text, axis=1)
             fig = px.pie(df_alloc, names="Assetklasse", values="Wert", hole=0.6,
@@ -344,8 +386,14 @@ with tab1:
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                                font_color="#f9fafb", legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig, use_container_width=True)
+
+            disclaimer_teile = []
             if summary.get("immobilien_eigenkapital"):
-                st.caption("ℹ️ Immobilienwert basiert auf Schätzung – kein Gutachterwert.")
+                disclaimer_teile.append("Immobilienwert basiert auf Schätzung – kein Gutachterwert.")
+            if summary.get("trading_bot_wert"):
+                disclaimer_teile.append("Trading Bot Wert = Startkapital + realisierter P&L.")
+            if disclaimer_teile:
+                st.caption("ℹ️ " + " ".join(disclaimer_teile))
         else:
             st.info("Noch keine Positionen erfasst – siehe Tab ⚙️ Verwaltung.")
 
@@ -1078,6 +1126,45 @@ with tab5:
                         except Exception as e:
                             st.error(f"Fehler beim Speichern: {e}")
 
+            # ---- Kredit aus Kontoauszügen analysieren (Feature 1) -----------
+            with st.expander("📄 Kredit aus Kontoauszügen analysieren"):
+                st.caption("KI erkennt Kreditbuchungen aus hochgeladenen Kontoauszügen automatisch.")
+                ka_kredit_files = st.file_uploader(
+                    "Kontoauszüge (PDF, mehrere möglich)", type=["pdf"], accept_multiple_files=True,
+                    key=f"ka_kredit_upload_{im['id']}")
+                if ka_kredit_files and st.button("KI-Analyse starten", key=f"ka_kredit_analyse_btn_{im['id']}"):
+                    pdf_daten = [(f.name, f.getvalue()) for f in ka_kredit_files]
+                    with st.spinner("KI analysiert Kontoauszüge..."):
+                        ka_kredit_ergebnis = kontoauszug_analyzer.analyze_kontoauszuege(pdf_daten)
+                    if not ka_kredit_ergebnis["verfuegbar"] or not ka_kredit_ergebnis["kreditbuchungen"]:
+                        st.error("Keine Kreditbuchungen erkannt. Bitte Werte manuell eintragen.")
+                    else:
+                        st.session_state[f"ka_kredit_erkannt_{im['id']}"] = ka_kredit_ergebnis
+
+                ka_erkannt = st.session_state.get(f"ka_kredit_erkannt_{im['id']}")
+                if ka_erkannt:
+                    ka_analyse = ka_erkannt["kreditanalyse"]
+                    st.success(f"{ka_analyse['anzahl_raten']} Kreditbuchung(en) erkannt – bitte prüfen:")
+                    kac1, kac2, kac3 = st.columns(3)
+                    kac1.metric("Erste Buchung", ka_analyse["erste_buchung"] or "–")
+                    kac2.metric("Letzte Buchung", ka_analyse["letzte_buchung"] or "–")
+                    kac3.metric("Ø Rate", fmt_eur(ka_analyse["durchschnittliche_rate"], 0))
+                    st.caption(f"Gesamt bezahlt: {fmt_eur(ka_analyse['gesamt_bezahlt'], 0)}")
+                    st.dataframe(pd.DataFrame(ka_erkannt["kreditbuchungen"]), use_container_width=True, hide_index=True)
+
+                    if st.button("✅ Werte in Immobilie übernehmen", key=f"ka_kredit_uebernehmen_{im['id']}"):
+                        try:
+                            save_real_estate(
+                                user_id=im["user_id"],
+                                real_estate_id=im["id"],
+                                monatliche_rate=ka_analyse["durchschnittliche_rate"],
+                            )
+                            st.session_state.pop(f"ka_kredit_erkannt_{im['id']}", None)
+                            st.success("Werte übernommen!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Fehler beim Speichern: {e}")
+
             # ---- Bearbeiten / Löschen (Fix 2) -------------------------------
             col_edit, col_del = st.columns(2)
             edit_offen_key = f"im_edit_offen_{im['id']}"
@@ -1144,9 +1231,147 @@ with tab5:
 
 
 # ─────────────────────────────────────────────
-# TAB 6 – FAMILIE
+# TAB 6 – HAUSHALTSBUCH
 # ─────────────────────────────────────────────
 with tab6:
+    if familien_modus:
+        st.info("Das Haushaltsbuch läuft je Nutzer – bitte oben einen Nutzer auswählen, um Kontoauszüge hochzuladen.")
+    else:
+        hb_uid = aktiver_user["id"]
+
+        with st.expander("📤 Kontoauszüge hochladen", expanded=False):
+            st.caption("Daten werden nur lokal verarbeitet.")
+            ka_files = st.file_uploader(
+                "Kontoauszüge (PDF, mehrere möglich, bis 50 Dateien)",
+                type=["pdf"], accept_multiple_files=True, key="ka_upload",
+            )
+            if ka_files and len(ka_files) > 50:
+                st.error(f"Maximal 50 Dateien gleichzeitig ({len(ka_files)} ausgewählt).")
+            elif ka_files and st.button("KI-Analyse starten", key="ka_analyse_btn"):
+                fortschritt_bar = st.progress(0.0)
+                status_text = st.empty()
+
+                def _ka_fortschritt(batch_idx, batch_anzahl):
+                    status_text.text(f"Analysiere Batch {batch_idx} von {batch_anzahl}...")
+                    fortschritt_bar.progress(batch_idx / batch_anzahl)
+
+                pdf_daten = [(f.name, f.getvalue()) for f in ka_files]
+                with st.spinner("Lese Kontoauszüge aus..."):
+                    ergebnis = kontoauszug_analyzer.analyze_kontoauszuege(pdf_daten, progress_callback=_ka_fortschritt)
+                fortschritt_bar.empty()
+                status_text.empty()
+
+                if not ergebnis["verfuegbar"]:
+                    st.error("Kontoauszüge konnten nicht ausgelesen werden. Bitte später erneut versuchen.")
+                else:
+                    anzahl_neu = save_buchungen(hb_uid, ergebnis["buchungen"])
+                    anzahl_erkannt = len(ergebnis["buchungen"])
+                    zusatz = f", {anzahl_erkannt - anzahl_neu} bereits vorhanden" if anzahl_erkannt > anzahl_neu else ""
+                    st.success(f"{anzahl_neu} neue Buchung(en) gespeichert{zusatz}")
+                    st.rerun()
+
+        with get_session() as session:
+            buchungen_db = session.query(PosBuchung).filter_by(user_id=hb_uid).order_by(PosBuchung.datum.desc()).all()
+            buchungen_data = [{
+                "id": b.id, "datum": b.datum, "betrag": b.betrag, "empfaenger": b.empfaenger,
+                "verwendungszweck": b.verwendungszweck, "kategorie": b.kategorie, "typ": b.typ,
+            } for b in buchungen_db]
+
+        if not buchungen_data:
+            st.info("Noch keine Buchungen erfasst – oben Kontoauszüge hochladen.")
+        else:
+            df_buchungen = pd.DataFrame(buchungen_data)
+            df_buchungen["monat"] = df_buchungen["datum"].apply(lambda d: d.strftime("%Y-%m"))
+
+            # ---- 1. Monatsübersicht ------------------------------------
+            st.subheader("Monatsübersicht")
+            monate_verfuegbar = sorted(df_buchungen["monat"].unique(), reverse=True)
+            gewaehlter_monat = st.selectbox("Monat", monate_verfuegbar, key="ka_monat_auswahl")
+            df_monat = df_buchungen[df_buchungen["monat"] == gewaehlter_monat]
+            einnahmen = df_monat[df_monat["typ"] == "einnahme"]["betrag"].sum()
+            ausgaben = df_monat[df_monat["typ"] == "ausgabe"]["betrag"].sum()
+
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Einnahmen", fmt_eur(einnahmen, 0))
+            mc2.metric("Ausgaben", fmt_eur(ausgaben, 0))
+            mc3.metric("Überschuss", fmt_eur(einnahmen - ausgaben, 0))
+
+            # ---- 2. Ausgaben nach Kategorie -----------------------------
+            st.subheader("Ausgaben nach Kategorie")
+            df_ausgaben_monat = df_monat[df_monat["typ"] == "ausgabe"]
+            if not df_ausgaben_monat.empty:
+                kat_summe = df_ausgaben_monat.groupby("kategorie")["betrag"].sum().sort_values(ascending=True)
+                kat_labels = [f"{KATEGORIE_ICONS.get(k, '❓')} {k}" for k in kat_summe.index]
+                fig_kat = px.bar(
+                    x=kat_summe.values, y=kat_labels, orientation="h",
+                    labels={"x": "Ausgaben (€)", "y": ""},
+                    color_discrete_sequence=["#60a5fa"],
+                )
+                fig_kat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
+                st.plotly_chart(fig_kat, use_container_width=True)
+            else:
+                st.caption("Keine Ausgaben in diesem Monat.")
+
+            # ---- 3. Alle Buchungen (filterbar) --------------------------
+            st.subheader("Alle Buchungen")
+            fc1, fc2 = st.columns(2)
+            kat_filter = fc1.multiselect(
+                "Kategorie", sorted(df_buchungen["kategorie"].dropna().unique().tolist()), key="ka_kat_filter")
+            typ_filter = fc2.multiselect(
+                "Typ", sorted(df_buchungen["typ"].dropna().unique().tolist()), key="ka_typ_filter")
+
+            gefiltert = df_buchungen.copy()
+            if kat_filter:
+                gefiltert = gefiltert[gefiltert["kategorie"].isin(kat_filter)]
+            if typ_filter:
+                gefiltert = gefiltert[gefiltert["typ"].isin(typ_filter)]
+
+            st.caption(f"{len(gefiltert)} Buchung(en) – zeige max. 200")
+            kopf1, kopf2, kopf3, kopf4, kopf5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
+            kopf1.markdown("**Datum**")
+            kopf2.markdown("**Empfänger**")
+            kopf3.markdown("**Betrag**")
+            kopf4.markdown("**Kategorie**")
+            kopf5.markdown("**Immer so kategorisieren**")
+
+            for _, row in gefiltert.head(200).iterrows():
+                bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
+                bc1.write(row["datum"].strftime("%d.%m.%Y"))
+                bc2.write(row["empfaenger"] or "–")
+                vz_symbol = "🟢" if row["typ"] == "einnahme" else "🔴"
+                bc3.write(f"{vz_symbol} {fmt_eur(row['betrag'], 2)}")
+                aktuelle_kat = row["kategorie"] if row["kategorie"] in KATEGORIEN else "Sonstiges"
+                neue_kat = bc4.selectbox(
+                    "Kategorie", KATEGORIEN, index=KATEGORIEN.index(aktuelle_kat),
+                    key=f"ka_kat_{row['id']}", label_visibility="collapsed")
+                immer_so = bc5.checkbox("", key=f"ka_immer_{row['id']}", label_visibility="collapsed")
+
+                if neue_kat != row["kategorie"]:
+                    with get_session() as session:
+                        buchung = session.get(PosBuchung, int(row["id"]))
+                        if buchung:
+                            buchung.kategorie = neue_kat
+                    if immer_so and row["empfaenger"]:
+                        add_kategorisierungsregel(hb_uid, row["empfaenger"], neue_kat)
+                    st.rerun()
+
+            # ---- 4. Jahresübersicht --------------------------------------
+            st.subheader("Jahresübersicht")
+            jahres_gruppe = df_buchungen.groupby(["monat", "typ"])["betrag"].sum().reset_index()
+            if not jahres_gruppe.empty:
+                fig_jahr = px.bar(
+                    jahres_gruppe, x="monat", y="betrag", color="typ", barmode="group",
+                    labels={"monat": "Monat", "betrag": "Betrag (€)", "typ": "Typ"},
+                    color_discrete_map={"einnahme": "#34d399", "ausgabe": "#f87171"},
+                )
+                fig_jahr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
+                st.plotly_chart(fig_jahr, use_container_width=True)
+
+
+# ─────────────────────────────────────────────
+# TAB 7 – FAMILIE
+# ─────────────────────────────────────────────
+with tab7:
     st.subheader("Alle Depots aggregiert")
     zeilen = []
     kinder_zeilen = []
@@ -1195,9 +1420,9 @@ with tab6:
 
 
 # ─────────────────────────────────────────────
-# TAB 7 – KI-ANALYSE
+# TAB 8 – KI-ANALYSE
 # ─────────────────────────────────────────────
-with tab7:
+with tab8:
     if familien_modus:
         st.info("KI-Analyse läuft je Nutzer – bitte oben einen Nutzer auswählen.")
     else:
@@ -1238,9 +1463,9 @@ with tab7:
 
 
 # ─────────────────────────────────────────────
-# TAB 8 – VERWALTUNG
+# TAB 9 – VERWALTUNG
 # ─────────────────────────────────────────────
-with tab8:
+with tab9:
     with get_session() as session:
         asset_classes = session.query(PosAssetClass).all()
         ac_options = {ac.name: ac.id for ac in asset_classes}

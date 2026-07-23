@@ -67,16 +67,23 @@ def get_total_wealth(user_id: int, include_trading_bot: bool = True) -> dict:
 
     with get_session() as session:
         immobilien = session.query(PosRealEstate).filter_by(user_id=user_id).all()
-        schaetzwert_summe = sum((im.letzter_schaetzwert or im.kaufpreis or 0.0) for im in immobilien)
-        restschuld_summe = sum((im.restschuld or 0.0) for im in immobilien)
+        # Nur Immobilien mit gepflegtem Schätzwert fließen in die Eigenkapital-Summe
+        # ein (kein Kaufpreis-Fallback mehr) – vermeidet, dass eine Immobilie ohne
+        # aktuellen Schätzwert das Gesamtvermögen mit einem veralteten Kaufpreis verzerrt.
+        bewertete_immobilien = [im for im in immobilien if im.letzter_schaetzwert and im.letzter_schaetzwert > 0]
+        schaetzwert_summe = sum(im.letzter_schaetzwert for im in bewertete_immobilien)
+        restschuld_summe = sum((im.restschuld or 0.0) for im in bewertete_immobilien)
     immobilien_eigenkapital = schaetzwert_summe - restschuld_summe
-    if immobilien:
+    # Nur bei positivem Eigenkapital in die Verteilung aufnehmen – ein Eintrag mit
+    # Wert <= 0 tauchte bisher in der Legende auf, ergab aber keinen sichtbaren/
+    # korrekten Donut-Slice (Plotly kann keine Null-/Negativ-Segmente rendern).
+    if immobilien_eigenkapital > 0:
         breakdown["Immobilie"] = breakdown.get("Immobilie", 0.0) + immobilien_eigenkapital
 
     trading_bot_wert = 0.0
     if include_trading_bot:
         trading_bot_wert = trading_bot_connector.get_trading_bot_value_eur()
-        if trading_bot_wert:
+        if trading_bot_wert > 0:
             breakdown["Trading Bot"] = breakdown.get("Trading Bot", 0.0) + trading_bot_wert
 
     return {

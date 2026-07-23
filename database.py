@@ -350,6 +350,40 @@ class PosDailySnapshot(Base):
         return f"<PosDailySnapshot {self.datum} {self.gesamtvermoegen}>"
 
 
+class PosBuchung(Base):
+    """Eine Buchung (Einnahme/Ausgabe) aus einem analysierten Kontoauszug (Haushaltsbuch)."""
+    __tablename__ = "pos_buchungen"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    user_id           = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    datum             = Column(Date, nullable=False)
+    betrag            = Column(Float, nullable=False)
+    empfaenger        = Column(Text, nullable=True)
+    verwendungszweck  = Column(Text, nullable=True)
+    kategorie         = Column(Text, nullable=True)
+    typ               = Column(Text, nullable=True)   # einnahme / ausgabe
+    quelle            = Column(Text, default="kontoauszug")
+    created_at        = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PosBuchung {self.datum} {self.betrag} {self.empfaenger}>"
+
+
+class PosKategorisierungsregel(Base):
+    """Regel 'wenn Empfänger X enthält, dann Kategorie Y' – aus dem Haushaltsbuch-Tab
+    ('Immer so kategorisieren'), wird bei künftigen Kontoauszug-Uploads angewendet."""
+    __tablename__ = "pos_kategorisierungsregeln"
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    user_id             = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    empfaenger_contains = Column(Text, nullable=False)
+    kategorie           = Column(Text, nullable=False)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PosKategorisierungsregel {self.empfaenger_contains} -> {self.kategorie}>"
+
+
 # ─────────────────────────────────────────────
 # SESSION / INIT
 # ─────────────────────────────────────────────
@@ -491,6 +525,78 @@ def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, 
         if asset_breakdown is not None:
             snap.set_breakdown(asset_breakdown)
         session.add(snap)
+
+
+def save_buchungen(user_id: int, buchungen: list) -> int:
+    """
+    Speichert per KI erkannte Kontoauszug-Buchungen (siehe kontoauszug_analyzer.py)
+    für einen Nutzer. Dedupliziert gegen bereits gespeicherte Buchungen (gleiche
+    datum+betrag+empfaenger) und wendet vorhandene Kategorisierungsregeln
+    (pos_kategorisierungsregeln, "Immer so kategorisieren" im Haushaltsbuch-Tab)
+    auf den Empfänger an, bevor gespeichert wird. Gibt die Anzahl NEU
+    gespeicherter Buchungen zurück (Duplikate werden übersprungen, kein Fehler).
+    """
+    with get_session() as session:
+        regeln = session.query(PosKategorisierungsregel).filter_by(user_id=user_id).all()
+        vorhandene = {
+            (b.datum, round(b.betrag, 2), (b.empfaenger or "").strip().lower())
+            for b in session.query(PosBuchung).filter_by(user_id=user_id).all()
+        }
+        neu = 0
+        for b in buchungen:
+            rohdatum = b.get("datum")
+            try:
+                datum = rohdatum if isinstance(rohdatum, date) else date.fromisoformat(str(rohdatum))
+            except (ValueError, TypeError):
+                continue
+            betrag = float(b.get("betrag") or 0.0)
+            empfaenger = (b.get("empfaenger") or "").strip()
+            key = (datum, round(betrag, 2), empfaenger.lower())
+            if key in vorhandene:
+                continue
+            vorhandene.add(key)
+
+            kategorie = b.get("kategorie")
+            for regel in regeln:
+                if regel.empfaenger_contains.lower() in empfaenger.lower():
+                    kategorie = regel.kategorie
+                    break
+
+            session.add(PosBuchung(
+                user_id=user_id, datum=datum, betrag=betrag, empfaenger=empfaenger,
+                verwendungszweck=b.get("verwendungszweck"), kategorie=kategorie,
+                typ=b.get("typ"), quelle=b.get("quelle") or "kontoauszug",
+            ))
+            neu += 1
+        return neu
+
+
+def add_kategorisierungsregel(user_id: int, empfaenger_contains: str, kategorie: str):
+    """Legt eine Kategorisierungsregel an (Checkbox 'Immer so kategorisieren' im Haushaltsbuch-Tab)."""
+    with get_session() as session:
+        session.add(PosKategorisierungsregel(
+            user_id=user_id, empfaenger_contains=empfaenger_contains.strip(), kategorie=kategorie,
+        ))
+
+
+def reset_onboarding(user_id: int):
+    """
+    Setzt das Onboarding eines Nutzers zurück ('🔄 Onboarding neu starten' im
+    Übersicht-Tab). Positionen/Transaktionen bleiben unangetastet – nur
+    Risikoprofil/Ziele/Zielgewichtungen/Anlagepräferenzen werden gelöscht bzw.
+    zurückgesetzt, damit der Wizard (siehe onboarding.py) beim nächsten Laden
+    wieder von vorn durchlaufen wird.
+    """
+    with get_session() as session:
+        user = session.get(PosUser, user_id)
+        if user is None:
+            raise ValueError(f"Nutzer {user_id} nicht gefunden")
+        user.onboarding_completed = False
+        user.risikoprofil = None
+        user.risikoscore = None
+        session.query(PosGoal).filter_by(user_id=user_id).delete()
+        session.query(PosTargetWeight).filter_by(user_id=user_id).delete()
+        session.query(PosInvestmentPreference).filter_by(user_id=user_id).delete()
 
 
 if __name__ == "__main__":
