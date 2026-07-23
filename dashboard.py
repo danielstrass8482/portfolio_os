@@ -22,12 +22,13 @@ from config import validate_config, BASE_URL
 from database import (
     init_db, get_session, get_or_create_user, save_real_estate,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
-    PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction,
+    PosRealEstate, PosFamilyGoal, PosTaxConfig, PosTransaction, PosGoal,
 )
 import portfolio as portfolio_module
 import tax_engine
 import rebalancing
 import llm_analyst
+from onboarding import show_onboarding, projiziertes_kapital, RISIKO_PROFILE, ZIEL_ICONS
 
 def fmt_eur(wert, nachkommastellen=2):
     if wert is None:
@@ -187,6 +188,16 @@ else:
     aktiver_user = None
     aktive_user_ids = [n["id"] for n in nutzer]
 
+# Onboarding-Wizard: greift nur bei Einzelnutzer-Ansicht (nicht im Familien-Modus),
+# da Risikoprofil/Ziele/Assetklassen-Präferenzen personenbezogen sind.
+if aktiver_user is not None:
+    with get_session() as session:
+        user_obj = session.query(PosUser).filter_by(id=aktiver_user["id"]).first()
+        onboarding_noetig = not (user_obj and user_obj.onboarding_completed)
+    if onboarding_noetig:
+        show_onboarding(aktiver_user["id"])
+        st.stop()
+
 with kontext_col3:
     st.caption(f"{'Familien-Portfolio' if familien_modus else aktiver_user['name']} · {BASE_URL}")
 
@@ -284,6 +295,44 @@ with tab1:
                 st.caption("Keine Verlierer heute")
         else:
             st.info("Noch keine bewerteten Positionen (Kurse aktualisieren).")
+
+    # ---- Meine Ziele (persönliche Ziele aus dem Onboarding) ---------------
+    if aktiver_user is not None:
+        st.subheader("Meine Ziele")
+        with get_session() as session:
+            user_row = session.get(PosUser, aktiver_user["id"])
+            sparrate = user_row.monatliche_sparrate or 0.0
+            meine_ziele = [
+                {"id": g.id, "name": g.name, "typ": g.typ, "zielbetrag": g.zielbetrag,
+                 "zeitraum_jahre": g.zeitraum_jahre, "erwartete_rendite": g.erwartete_rendite,
+                 "created_at": g.created_at}
+                for g in session.query(PosGoal).filter_by(user_id=aktiver_user["id"]).order_by(PosGoal.id).all()
+            ]
+        if meine_ziele:
+            aktueller_stand = summary["gesamtvermoegen"]
+            for z in meine_ziele:
+                icon = ZIEL_ICONS.get(z["typ"], "🎯")
+                jahre_seit_anlage = (date.today() - z["created_at"].date()).days / 365.25 if z["created_at"] else 0.0
+                restlaufzeit = max(0, round(z["zeitraum_jahre"] - jahre_seit_anlage))
+                fortschritt_pct = min(100.0, (aktueller_stand / z["zielbetrag"] * 100) if z["zielbetrag"] else 0.0)
+
+                with st.container(border=True):
+                    st.markdown(f"**{icon} {z['name']}**")
+                    st.progress(
+                        min(1.0, fortschritt_pct / 100),
+                        text=f"{fmt_zahl(fortschritt_pct, 0)}% ({fmt_eur(aktueller_stand, 0)} / {fmt_eur(z['zielbetrag'], 0)})"
+                    )
+                    endkapital_projiziert = projiziertes_kapital(
+                        sparrate, z["erwartete_rendite"] or 0.06, restlaufzeit, startkapital=aktueller_stand)
+                    cz1, cz2 = st.columns(2)
+                    if endkapital_projiziert >= z["zielbetrag"]:
+                        cz1.success("Auf Kurs ✅")
+                    else:
+                        cz1.warning("Sparrate erhöhen ⚠️")
+                    cz2.caption(f"Restlaufzeit: {restlaufzeit} Jahre")
+        else:
+            st.caption("Noch keine persönlichen Ziele hinterlegt (siehe Onboarding).")
+        st.divider()
 
     st.subheader("Zielfortschritt")
     with get_session() as session:

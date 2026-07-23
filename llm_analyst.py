@@ -32,6 +32,16 @@ Analysiere das Dokument und extrahiere folgende Daten als JSON:
 Wenn ein Wert nicht im Dokument steht: null setzen.
 Antworte NUR mit dem JSON, kein anderer Text."""
 
+PORTFOLIO_SCREENSHOT_SYSTEM_PROMPT = """Du liest Screenshots von Broker-/Banking-Apps
+(z.B. Trade Republic, Comdirect, Scalable Capital, ING) aus. Extrahiere alle sichtbaren
+Wertpapier-Positionen als JSON-Array:
+[
+    {"ticker": "z.B. AAPL oder ISIN", "name": "Name des Wertpapiers", "quantity": 0.0, "kaufpreis": 0.0}
+]
+"kaufpreis" ist der Kaufpreis/Einstandskurs pro Stück falls sichtbar, sonst der aktuelle Kurs.
+Wenn ein Wert nicht erkennbar ist: null setzen.
+Antworte NUR mit dem JSON-Array, kein anderer Text."""
+
 SYSTEM_PROMPT = """Du bist ein kritischer, unabhängiger Finanzanalyst.
 Du gibst keine Anlageberatung sondern zeigst Fakten und Risiken auf.
 Alle Empfehlungen sind Informationen, keine Handlungsanweisungen.
@@ -197,6 +207,41 @@ def analyze_kredit_vertrag(file_bytes: bytes, file_type: str) -> dict:
     except Exception as e:
         print(f"⚠️  Kreditvertrags-Analyse fehlgeschlagen: {e} (degraded mode)")
         return {}
+
+
+def analyze_portfolio_screenshot(file_bytes: bytes, file_type: str) -> list:
+    """
+    Liest einen Screenshot einer Broker-/Banking-App per KI aus und gibt die erkannten
+    Positionen als Liste von dicts zurück (ticker, name, quantity, kaufpreis). Bei
+    fehlendem API-Key, nicht lesbarem Bild oder ungültiger KI-Antwort: degraded mode,
+    gibt eine leere Liste zurück statt abzustürzen.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("⚠️  ANTHROPIC_API_KEY fehlt – Screenshot-Analyse übersprungen (degraded mode)")
+        return []
+
+    try:
+        media_type = file_type if file_type in ("image/jpeg", "image/png") else "image/jpeg"
+        b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+        user_content = [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+            {"type": "text", "text": "Extrahiere alle Positionen aus diesem Portfolio-Screenshot als JSON-Array."},
+        ]
+
+        antwort = _ask(user_content, system=PORTFOLIO_SCREENSHOT_SYSTEM_PROMPT, max_tokens=1536)
+        if antwort is None:
+            return []
+
+        bereinigt = antwort.strip()
+        if bereinigt.startswith("```"):
+            bereinigt = bereinigt.strip("`")
+            if bereinigt.lower().startswith("json"):
+                bereinigt = bereinigt[4:]
+        ergebnis = json.loads(bereinigt.strip())
+        return ergebnis if isinstance(ergebnis, list) else []
+    except Exception as e:
+        print(f"⚠️  Screenshot-Analyse fehlgeschlagen: {e} (degraded mode)")
+        return []
 
 
 def generate_quarterly_report(user_id: int) -> dict:

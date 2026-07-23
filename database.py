@@ -10,7 +10,7 @@ import json
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean,
-    DateTime, Date, Text, ForeignKey, func
+    DateTime, Date, Text, ForeignKey, func, JSON
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 
@@ -39,6 +39,15 @@ class PosUser(Base):
     email      = Column(String(200), nullable=True)
     rolle      = Column(String(20), default="member")   # admin / member
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Onboarding / Risikoprofil (siehe onboarding.py)
+    onboarding_completed = Column(Boolean, default=False)
+    alter_jahre           = Column(Integer, nullable=True)
+    familienstand          = Column(Text, nullable=True)
+    monatliche_sparrate    = Column(Float, default=0.0)
+    anlagehorizont_jahre   = Column(Integer, nullable=True)
+    risikoprofil           = Column(Text, nullable=True)   # konservativ/ausgewogen/wachstum/aggressiv
+    risikoscore            = Column(Integer, nullable=True)  # 0-10
 
     portfolios = relationship("PosPortfolio", back_populates="user", cascade="all, delete-orphan")
 
@@ -150,6 +159,42 @@ class PosTargetWeight(Base):
 
     def __repr__(self):
         return f"<PosTargetWeight asset_class_id={self.asset_class_id} target={self.target_pct}>"
+
+
+class PosGoal(Base):
+    """Ein finanzielles Ziel eines Nutzers (Altersvorsorge, Immobilie, ...), aus dem Onboarding."""
+    __tablename__ = "pos_goals"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    user_id           = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    name              = Column(Text, nullable=False)
+    typ               = Column(Text, nullable=True)   # rente/immobilie/studium/sonstiges
+    zielbetrag        = Column(Float, nullable=False)
+    zeitraum_jahre    = Column(Integer, nullable=False)
+    prioritaet        = Column(Text, default="haupt")   # haupt/neben
+    erwartete_rendite = Column(Float, default=0.06)
+    created_at        = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PosGoal {self.name} Ziel={self.zielbetrag}>"
+
+
+class PosInvestmentPreference(Base):
+    """Anlagepräferenzen eines Nutzers (Assetklassen, ETF/Aktien-Präferenzen, Aus-/Einschlusskriterien)."""
+    __tablename__ = "pos_investment_preferences"
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    user_id             = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    aktive_assetklassen = Column(JSON, nullable=True)   # ["etf", "stocks", "gold", ...]
+    etf_fokus           = Column(Text, nullable=True)   # world/em/europa/sektoren
+    etf_ausschuettend   = Column(Boolean, default=False)
+    aktien_strategie    = Column(Text, nullable=True)   # dividende/wachstum/beides
+    blacklist           = Column(JSON, nullable=True)   # ["waffen", "tabak", "fossil", ...]
+    whitelist           = Column(JSON, nullable=True)   # ["esg", "tech", "healthcare", ...]
+    updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PosInvestmentPreference user_id={self.user_id}>"
 
 
 class PosTaxConfig(Base):
