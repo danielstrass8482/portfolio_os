@@ -678,24 +678,73 @@ with tab2:
     if bot_positionen:
         st.subheader("🤖 Trading Bot Positionen")
         st.caption("Automatisch vom Trading Bot verwaltet – nur lesbar, kein Bearbeiten/Löschen.")
-        df_bot = pd.DataFrame(bot_positionen)
 
-        def _usd(w):
-            if w is None:
-                return "–"
-            return "$" + fmt_zahl(float(w), 2)
+        import yfinance as yf
+        # Der Bot handelt in USD; Kurse werden in $ angezeigt, G/V in €.
+        # EUR/USD einmal laden (Fallback 1.08), dann je Position Live-Kurs holen.
+        try:
+            fx = float(yf.Ticker("EURUSD=X").info.get("regularMarketPrice", 1.08)) or 1.08
+        except Exception:
+            fx = 1.08
 
-        df_bot_anzeige = pd.DataFrame({
-            "Ticker":   df_bot["ticker"],
-            "Typ":      df_bot["instrument_type"],
-            "Einstieg": df_bot["entry_price"].map(_usd),
-            "SL":       df_bot["stop_loss"].map(_usd),
-            "TP":       df_bot["take_profit"].map(_usd),
-            "Kapital":  df_bot["capital_used"].map(_usd),
-            "Score":    df_bot["rule_score"],
-            "Modus":    df_bot["mode"],
-        })
-        st.dataframe(df_bot_anzeige, use_container_width=True, hide_index=True)
+        bot_zeilen = []
+        for trade in bot_positionen:
+            entry_usd = float(trade["entry_price"])
+            quantity = float(trade["quantity"])
+            try:
+                current_price = float(yf.Ticker(trade["ticker"]).fast_info.get("lastPrice", entry_usd))
+                entry_price_eur = entry_usd / fx
+                current_price_eur = current_price / fx
+                unrealized_pnl = (current_price_eur - entry_price_eur) * quantity
+                unrealized_pct = (current_price_eur - entry_price_eur) / entry_price_eur * 100 if entry_price_eur else 0.0
+            except Exception:
+                current_price = entry_usd
+                unrealized_pnl = 0.0
+                unrealized_pct = 0.0
+            bot_zeilen.append({
+                "Ticker":       trade["ticker"],
+                "Einstieg ($)": entry_usd,
+                "Aktuell ($)":  current_price,
+                "G/V €":        unrealized_pnl,
+                "G/V %":        unrealized_pct,
+                "SL ($)":       float(trade["stop_loss"]),
+                "TP ($)":       float(trade["take_profit"]),
+                "Score":        trade["rule_score"],
+                "Modus":        trade["mode"],
+            })
+
+        df_bot = pd.DataFrame(bot_zeilen)
+
+        # G/V grün bei Gewinn, rot bei Verlust (gleiche Farben wie die normalen
+        # Positionen); Kurse als $-Strings, G/V mit Vorzeichen in €/%.
+        def _bot_pnl_farbe(wert):
+            if pd.isna(wert):
+                return ""
+            farbe = "#34d399" if wert >= 0 else "#f87171"
+            return f"color: {farbe}; font-weight: 600"
+
+        def _bot_usd(w):
+            return "–" if pd.isna(w) else "$" + fmt_zahl(float(w), 2)
+
+        def _bot_vz_eur(w):
+            return "–" if pd.isna(w) else ("+" if w >= 0 else "") + fmt_eur(w)
+
+        def _bot_vz_pct(w):
+            return "–" if pd.isna(w) else ("+" if w >= 0 else "") + fmt_zahl(w, 1) + "%"
+
+        styled_bot = (
+            df_bot.style
+            .map(_bot_pnl_farbe, subset=["G/V €", "G/V %"])
+            .format({
+                "Einstieg ($)": _bot_usd,
+                "Aktuell ($)":  _bot_usd,
+                "SL ($)":       _bot_usd,
+                "TP ($)":       _bot_usd,
+                "G/V €":        _bot_vz_eur,
+                "G/V %":        _bot_vz_pct,
+            })
+        )
+        st.dataframe(styled_bot, use_container_width=True, hide_index=True)
         st.divider()
 
     col_head, col_btn = st.columns([4, 1])
