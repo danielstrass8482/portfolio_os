@@ -329,6 +329,8 @@ with tab1:
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                                font_color="#f9fafb", legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig, use_container_width=True)
+            if summary.get("immobilien_eigenkapital"):
+                st.caption("ℹ️ Immobilienwert basiert auf Schätzung – kein Gutachterwert.")
         else:
             st.info("Noch keine Positionen erfasst – siehe Tab ⚙️ Verwaltung.")
 
@@ -550,39 +552,67 @@ with tab3:
         st.info("Rebalancing wird je Nutzer einzeln berechnet – bitte oben einen Nutzer auswählen.")
     else:
         uid = aktiver_user["id"]
-        st.subheader("Aktuelle Abweichungen von der Zielgewichtung")
+        st.subheader(f"Rebalancing-Analyse vom {date.today():%d.%m.%Y}")
+        st.caption(
+            "Mathematische Abweichung von deiner Zielgewichtung – reine Berechnung, "
+            "keine Anlageberatung und keine automatische Orderausführung."
+        )
         deviations = rebalancing.calculate_deviations(uid)
         if deviations:
+            st.markdown("**Aktuelle Allokation vs. Ziel:**")
             for d in deviations:
                 badge = AMPEL_LABEL.get(d["status"], d["status"])
+                richtung = "Untergewichtet" if d["abweichung_pct"] < 0 else "Übergewichtet"
                 st.markdown(
                     f'<span class="badge badge-{d["status"]}">{badge}</span>&nbsp;&nbsp;'
-                    f'**{d["asset_class"]}** — Ist {d["ist_pct"]*100:.1f}% / Ziel {d["ziel_pct"]*100:.1f}% '
-                    f'(Δ {d["abweichung_pct"]*100:+.1f} Punkte)',
+                    f'**{d["asset_class"]}**: {d["ist_pct"]*100:.0f}% (Ziel: {d["ziel_pct"]*100:.0f}%) '
+                    f'→ {richtung} um {abs(d["abweichung_pct"])*100:.0f}%',
                     unsafe_allow_html=True,
                 )
+
+            with get_session() as session:
+                sparrate = (session.get(PosUser, uid).monatliche_sparrate or 0.0)
+            if sparrate:
+                sparrate_verteilung = rebalancing.get_sparrate_empfehlung(uid, sparrate)
+                if sparrate_verteilung:
+                    st.markdown(f"**Bei deiner monatlichen Sparrate von {fmt_eur(sparrate, 0)}:**")
+                    if len(sparrate_verteilung) == 1:
+                        st.markdown(f"→ Gesamte Sparrate in {sparrate_verteilung[0]['asset_class']} lenken (statt aufteilen)")
+                    else:
+                        for s in sparrate_verteilung:
+                            st.markdown(f"→ {fmt_eur(s['betrag'], 0)} in {s['asset_class']} lenken")
+
+            orders = rebalancing.get_full_rebalance_orders(uid)
+            if orders:
+                st.markdown("**Für vollständigen Ausgleich wären nötig:**")
+                for o in orders:
+                    vz = "+" if o["betrag"] > 0 else ""
+                    st.markdown(f"→ {o['asset_class']}: {vz}{fmt_eur(o['betrag'], 0)} ({o['richtung']})")
         else:
             st.info("Keine Ziel-Gewichtung hinterlegt (siehe Tab ⚙️ Verwaltung).")
 
-        st.subheader("Offene Vorschläge")
+        st.subheader("Offene Analysen")
         offene = [p for p in rebalancing.get_rebalancing_history(uid) if p["status"] == "pending"]
         if offene:
             for p in offene:
-                with st.expander(f"Vorschlag #{p['id']} – {p['erstellt_am']:%d.%m.%Y}"):
+                with st.expander(f"Analyse #{p['id']} – {p['erstellt_am']:%d.%m.%Y}"):
                     st.write(p["begruendung"])
                     if p["ki_analyse"]:
                         st.caption(f"KI-Einordnung: {p['ki_analyse']}")
                     col_ok, col_no = st.columns(2)
-                    if col_ok.button("✅ Bestätigen", key=f"ok_{p['id']}"):
+                    if col_ok.button(
+                        "Ich habe die Analyse verstanden und möchte die Orders bei meinem Broker selbst platzieren →",
+                        key=f"ok_{p['id']}",
+                    ):
                         rebalancing.confirm_proposal(p["id"], "confirmed")
                         st.rerun()
-                    if col_no.button("❌ Ablehnen", key=f"no_{p['id']}"):
+                    if col_no.button("Zur Kenntnis genommen", key=f"no_{p['id']}"):
                         rebalancing.confirm_proposal(p["id"], "rejected")
                         st.rerun()
         else:
-            st.caption("Keine offenen Vorschläge.")
+            st.caption("Keine offenen Analysen.")
 
-        if st.button("🔎 Neuen Vorschlag erstellen (Schwellwert-Check)"):
+        if st.button("🔎 Neue Analyse erstellen (Schwellwert-Check)"):
             rebalancing.create_rebalancing_proposal(uid, "schwellwert")
             st.rerun()
 
@@ -707,7 +737,7 @@ def _immobilie_basis_felder(key_prefix: str, defaults: dict = None) -> dict:
     gibt die eingegebenen Werte als dict zurück. `defaults` befüllt sie vor (Edit)."""
     d = defaults or {}
     adresse = st.text_input("Adresse", value=d.get("adresse", ""), key=f"{key_prefix}_adresse")
-    kaufpreis = st.number_input("Kaufpreis (€)", min_value=0.0, step=1000.0,
+    kaufpreis = st.number_input("Kaufpreis gesamt (€)", min_value=0.0, step=1000.0,
                                  value=float(d.get("kaufpreis") or 0.0), key=f"{key_prefix}_kaufpreis")
     kaufjahr = st.number_input(
         "Kaufjahr", min_value=1950, max_value=date.today().year,
@@ -725,23 +755,62 @@ def _immobilie_basis_felder(key_prefix: str, defaults: dict = None) -> dict:
     schaetzwert = st.number_input(
         "Letzter Schätzwert (€, optional – Default: Kaufpreis)", min_value=0.0, step=1000.0,
         value=float(d.get("letzter_schaetzwert") or kaufpreis or 0.0), key=f"{key_prefix}_schaetzwert")
+
+    # ---- Kaufpreisaufteilung für die AfA (§7 EStG) ------------------------
+    # Der Grundstücksanteil ist gesetzlich NICHT abschreibungsfähig – AfA darf
+    # nur auf Gebäudewert (Standard-AfA) bzw. bescheinigte Sanierungskosten
+    # (Denkmalschutz/Energetisch) berechnet werden, niemals auf den Gesamtkaufpreis.
+    st.markdown("**Kaufpreisaufteilung (Basis für die Abschreibung)**")
+    gc1, gc2, gc3 = st.columns(3)
+    grundstuecksanteil = gc1.number_input(
+        "Grundstücksanteil (€)", min_value=0.0, step=1000.0,
+        value=float(d.get("grundstuecksanteil") or 0.0), key=f"{key_prefix}_grundstuecksanteil",
+        help="Wert des Grundstücks ohne Gebäude – nicht abschreibungsfähig.")
+    gebaeudewert = gc2.number_input(
+        "Gebäudewert (€)", min_value=0.0, step=1000.0,
+        value=float(d.get("gebaeudewert") or 0.0), key=f"{key_prefix}_gebaeudewert",
+        help="Wert der Altbausubstanz – Basis der Standard-AfA (2% p.a.).")
+    sanierungskosten = gc3.number_input(
+        "Bescheinigte Sanierungskosten (€)", min_value=0.0, step=1000.0,
+        value=float(d.get("sanierungskosten") or 0.0), key=f"{key_prefix}_sanierungskosten",
+        help="Nur vom Finanzamt anerkannte Sanierungskosten (§7i Bescheinigung) – Basis der "
+             "Denkmalschutz-/Energetisch-Abschreibung.")
+
+    summe_aufteilung = grundstuecksanteil + gebaeudewert + sanierungskosten
+    toleranz = max(1000.0, kaufpreis * 0.02)
+    if kaufpreis and abs(summe_aufteilung - kaufpreis) > toleranz:
+        st.warning(
+            f"Summe aus Grundstücksanteil + Gebäudewert + Sanierungskosten "
+            f"({fmt_eur(summe_aufteilung, 0)}) weicht vom Gesamtkaufpreis "
+            f"({fmt_eur(kaufpreis, 0)}) ab – bitte prüfen."
+        )
+
     return {
         "adresse": adresse, "kaufpreis": kaufpreis, "kaufjahr": int(kaufjahr),
         "wohnflaeche_qm": qm, "eigenkapital": ek, "restschuld": restschuld,
         "monatliche_rate": rate, "mieteinnahmen": miete,
         "letzter_schaetzwert": schaetzwert or kaufpreis,
+        "kaufpreis_gesamt": kaufpreis,
+        "grundstuecksanteil": grundstuecksanteil,
+        "gebaeudewert": gebaeudewert,
+        "sanierungskosten": sanierungskosten,
     }
 
 
-def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None) -> dict:
+def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None, basis: dict = None) -> dict:
     """
     Rendert die Sektionen 'Abschreibung' und 'Finanzierung & Vermietung' für die
     Immobilien-Erfassung und gibt die eingegebenen Werte als dict zurück. Wird
     bewusst AUSSERHALB eines st.form aufgerufen, damit der Abschreibungssatz-
     Vorschlag beim Wechsel der Abschreibungsart sofort (per Rerun) aktualisiert wird.
-    `defaults` befüllt die Felder vor (Edit).
+    `defaults` befüllt die Felder vor (Edit). `basis` ist der Rückgabewert des
+    zugehörigen _immobilie_basis_felder()-Aufrufs (Grundstücksanteil/Gebäudewert/
+    Sanierungskosten) – die Abschreibungsbasis wird DARAUS abgeleitet, nicht mehr
+    frei eingegeben, damit AfA niemals versehentlich auf den Gesamtkaufpreis
+    (inkl. nicht abschreibungsfähigem Grundstücksanteil) berechnet werden kann.
     """
     d = defaults or {}
+    b = basis or {}
     st.markdown("**Abschreibung**")
     afa_index = ABSCHREIBUNGSARTEN.index(d["abschreibungsart"]) if d.get("abschreibungsart") in ABSCHREIBUNGSARTEN else 0
     afa_art = st.selectbox("Abschreibungsart", ABSCHREIBUNGSARTEN, index=afa_index, key=f"{key_prefix}_afa_art")
@@ -750,10 +819,17 @@ def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None) -> dict
         felder["abschreibungsbasis"] = 0.0
         felder["abschreibungssatz"] = 0.0
     else:
+        if afa_art == "Standard AfA (2% p.a.)":
+            abschreibungsbasis = b.get("gebaeudewert", d.get("gebaeudewert") or 0.0)
+            basis_label = "Gebäudewert"
+        else:  # Denkmalschutz §7i / Energetisch §35c
+            abschreibungsbasis = b.get("sanierungskosten", d.get("sanierungskosten") or 0.0)
+            basis_label = "Bescheinigte Sanierungskosten"
         c1, c2 = st.columns(2)
-        felder["abschreibungsbasis"] = c1.number_input(
-            "Abschreibungsbasis (€)", min_value=0.0, step=1000.0,
-            value=float(d.get("abschreibungsbasis") or 0.0), key=f"{key_prefix}_afa_basis")
+        c1.metric(f"Abschreibungsbasis ({basis_label})", fmt_eur(abschreibungsbasis, 0))
+        c1.caption("Automatisch aus der Kaufpreisaufteilung oben übernommen – der "
+                   "Grundstücksanteil ist gesetzlich nicht abschreibungsfähig (§7 EStG).")
+        felder["abschreibungsbasis"] = abschreibungsbasis
         felder["abschreibungssatz"] = c2.number_input(
             "Abschreibungssatz (%)", min_value=0.0, step=0.1,
             value=float(d.get("abschreibungssatz") or AFA_STANDARDSAETZE.get(afa_art, 2.0)),
@@ -806,6 +882,8 @@ with tab5:
             "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
             "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
             "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
+            "grundstuecksanteil": i.grundstuecksanteil, "gebaeudewert": i.gebaeudewert,
+            "kaufpreis_gesamt": i.kaufpreis_gesamt, "sanierungskosten": i.sanierungskosten,
         } for i in immobilien]
 
     if not immobilien_data:
@@ -854,21 +932,37 @@ with tab5:
                 else:
                     fc3.metric("Zinsbindung läuft ab in", "–")
 
+            # ---- Kaufpreisaufteilung (Fix: Grundstücksanteil nicht abschreibungsfähig) ----
+            summe_aufteilung = (im["grundstuecksanteil"] or 0.0) + (im["gebaeudewert"] or 0.0) + (im["sanierungskosten"] or 0.0)
+            kp_gesamt = im["kaufpreis_gesamt"] or im["kaufpreis"] or 0.0
+            if summe_aufteilung:
+                st.markdown("**Kaufpreisaufteilung**")
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Grundstücksanteil", fmt_eur(im["grundstuecksanteil"], 0))
+                pc2.metric("Gebäudewert", fmt_eur(im["gebaeudewert"], 0))
+                pc3.metric("Sanierungskosten (bescheinigt)", fmt_eur(im["sanierungskosten"], 0))
+                if kp_gesamt and abs(summe_aufteilung - kp_gesamt) > max(1000.0, kp_gesamt * 0.02):
+                    st.warning(
+                        f"Summe ({fmt_eur(summe_aufteilung, 0)}) weicht vom Gesamtkaufpreis "
+                        f"({fmt_eur(kp_gesamt, 0)}) ab – bitte prüfen."
+                    )
+
             # ---- Abschreibung (Feature 2) -----------------------------------
             if im["abschreibungsart"] not in (None, "Keine", "Keine Abschreibung", "Selbst genutzt (keine AfA)"):
                 jaehrliche_afa = (im["abschreibungsbasis"] or 0.0) * (im["abschreibungssatz"] or 0.0) / 100
                 steuerersparnis_jahr = jaehrliche_afa * STEUERSATZ_SCHAETZUNG
                 gesamte_steuerersparnis = (im["abschreibungsbasis"] or 0.0) * STEUERSATZ_SCHAETZUNG
-                effektiver_kaufpreis = im["kaufpreis"] - gesamte_steuerersparnis
+                effektiver_kaufpreis = kp_gesamt - gesamte_steuerersparnis
 
                 st.markdown("**Abschreibung (AfA)**")
                 ac1, ac2, ac3 = st.columns(3)
                 ac1.metric("Jährliche Abschreibung", fmt_eur(jaehrliche_afa, 0))
                 ac2.metric("Steuerersparnis p.a.", fmt_eur(steuerersparnis_jahr, 0))
                 ac3.metric("Gesamte Steuerersparnis", fmt_eur(gesamte_steuerersparnis, 0))
+                st.caption(f"Effektiver Kaufpreis nach Steuerersparnis: {fmt_eur(effektiver_kaufpreis, 0)}")
                 st.caption(
-                    f"Effektiver Kaufpreis nach Steuerersparnis: {fmt_eur(effektiver_kaufpreis, 0)} · "
-                    "Geschätzt bei 42% Grenzsteuersatz – bitte mit Steuerberater abstimmen."
+                    "⚠️ Schätzung bei 42% Grenzsteuersatz – kein offizieller Steuerbescheid. "
+                    "Bitte mit Steuerberater abstimmen."
                 )
 
                 if im["abschreibungsart"] == "Denkmalschutz Sonderabschreibung (§7i EStG)":
@@ -987,7 +1081,7 @@ with tab5:
                     edit_prefix = f"im_edit_{im['id']}"
                     edit_basis = _immobilie_basis_felder(edit_prefix, defaults=im)
                     st.divider()
-                    edit_erweitert = _immobilie_erweiterte_felder(edit_prefix, defaults=im)
+                    edit_erweitert = _immobilie_erweiterte_felder(edit_prefix, defaults=im, basis=edit_basis)
                     st.divider()
                     if st.button("💾 Speichern", key=f"im_edit_speichern_{im['id']}"):
                         if not edit_basis["adresse"]:
@@ -1018,7 +1112,7 @@ with tab5:
             with st.expander("Neue Immobilie", expanded=True):
                 neu_basis = _immobilie_basis_felder("im_neu")
                 st.divider()
-                neu_erweitert = _immobilie_erweiterte_felder("im_neu")
+                neu_erweitert = _immobilie_erweiterte_felder("im_neu", basis=neu_basis)
                 st.divider()
                 if st.button("Speichern", key="im_neu_speichern_btn"):
                     if not neu_basis["adresse"]:
@@ -1469,6 +1563,8 @@ with tab8:
                     "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
                     "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
                     "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
+                    "grundstuecksanteil": i.grundstuecksanteil, "gebaeudewert": i.gebaeudewert,
+                    "kaufpreis_gesamt": i.kaufpreis_gesamt, "sanierungskosten": i.sanierungskosten,
                 } for i in verw_immobilien
             }
 
@@ -1478,7 +1574,7 @@ with tab8:
             st.markdown("**Neue Immobilie anlegen**")
             verw_neu_basis = _immobilie_basis_felder("verw_im_neu")
             st.divider()
-            verw_neu_erweitert = _immobilie_erweiterte_felder("verw_im_neu")
+            verw_neu_erweitert = _immobilie_erweiterte_felder("verw_im_neu", basis=verw_neu_basis)
             if st.button("Anlegen", key="verw_im_neu_anlegen_btn"):
                 if not verw_neu_basis["adresse"]:
                     st.error("Bitte eine Adresse angeben.")
@@ -1510,7 +1606,7 @@ with tab8:
 
                 verw_edit_basis = _immobilie_basis_felder("verw_im_edit", defaults=verw_gewaehlte_im)
                 st.divider()
-                verw_edit_erweitert = _immobilie_erweiterte_felder("verw_im_edit", defaults=verw_gewaehlte_im)
+                verw_edit_erweitert = _immobilie_erweiterte_felder("verw_im_edit", defaults=verw_gewaehlte_im, basis=verw_edit_basis)
                 if st.button("💾 Speichern", key="verw_im_edit_speichern_btn"):
                     if not verw_edit_basis["adresse"]:
                         st.error("Bitte eine Adresse angeben.")

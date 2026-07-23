@@ -13,7 +13,7 @@ from config import (
     REBALANCING_THRESHOLD_SELL,
 )
 from database import get_session, PosRebalancingProposal
-from portfolio import calculate_allocation
+from portfolio import calculate_allocation, get_portfolio_summary
 
 
 def _status_fuer_abweichung(abweichung_pct: float) -> str:
@@ -91,19 +91,47 @@ def get_sparrate_empfehlung(user_id: int, sparrate_betrag: float) -> list:
 
 
 def _begruendung_text(typ: str, deviations: list) -> str:
-    """Regelbasierte Begründung (unabhängig von der KI verfügbar, s. llm_analyst.py)."""
+    """
+    Regelbasierte Begründung (unabhängig von der KI verfügbar, s. llm_analyst.py).
+    Bewusst als mathematische Feststellung formuliert, NICHT als Kauf-/Verkaufs-
+    empfehlung – das System ist ein Rechenwerkzeug, keine Anlageberatung (BaFin-
+    Abgrenzung). Jede Order platziert der Nutzer eigenständig bei seinem Broker.
+    """
     relevante = [d for d in deviations if d["status"] in ("gelb", "rot")]
     if not relevante:
-        return f"Rebalancing-Check ({typ}): Alle Assetklassen liegen innerhalb der Toleranz."
+        return f"Mathematischer Ausgleich ({typ}): Alle Assetklassen liegen innerhalb der Toleranz."
 
-    zeilen = [f"Rebalancing-Check ({typ}): {len(relevante)} Assetklasse(n) außerhalb der Toleranz."]
+    zeilen = [f"Mathematischer Ausgleich ({typ}): {len(relevante)} Assetklasse(n) außerhalb der Toleranz."]
     for d in relevante:
         richtung = "übergewichtet" if d["abweichung_pct"] > 0 else "untergewichtet"
         zeilen.append(
-            f"- {d['asset_class']}: Ist {d['ist_pct']*100:.1f}% vs. Ziel {d['ziel_pct']*100:.1f}% "
-            f"({richtung} um {abs(d['abweichung_pct'])*100:.1f} Punkte, Status: {d['status']})"
+            f"- Mathematischer Ausgleich: {d['asset_class']} {richtung} um {abs(d['abweichung_pct'])*100:.1f}% "
+            f"(Ist {d['ist_pct']*100:.1f}% vs. Ziel {d['ziel_pct']*100:.1f}%, Status: {d['status']})"
         )
     return "\n".join(zeilen)
+
+
+def get_full_rebalance_orders(user_id: int) -> list:
+    """
+    Rein informativ: der €-Betrag je Assetklasse, der für einen VOLLSTÄNDIGEN
+    Ausgleich auf die Zielgewichtung nötig wäre (positiv = Zukauf, negativ =
+    Verkauf). Platziert selbst KEINE Order – der Nutzer entscheidet und handelt
+    eigenständig bei seinem Broker (siehe Modulkommentar).
+    """
+    gesamt = get_portfolio_summary(user_id)["gesamtvermoegen"]
+    deviations = calculate_deviations(user_id)
+
+    orders = []
+    for d in deviations:
+        betrag = (d["ziel_pct"] - d["ist_pct"]) * gesamt
+        if abs(betrag) < 1.0:
+            continue
+        orders.append({
+            "asset_class": d["asset_class"],
+            "betrag": round(betrag, 2),
+            "richtung": "Kauf" if betrag > 0 else "Verkauf",
+        })
+    return sorted(orders, key=lambda o: -abs(o["betrag"]))
 
 
 def create_rebalancing_proposal(user_id: int, typ: str, sparrate_betrag: float = None) -> dict:
@@ -121,7 +149,7 @@ def create_rebalancing_proposal(user_id: int, typ: str, sparrate_betrag: float =
     if typ == "sparrate" and sparrate_betrag:
         vorschlag["sparrate_verteilung"] = get_sparrate_empfehlung(user_id, sparrate_betrag)
     else:
-        # quartal/schwellwert: Verkaufs-/Kaufempfehlung für alle Klassen außerhalb der Toleranz
+        # quartal/schwellwert: mathematischer Ausgleichsbedarf für alle Klassen außerhalb der Toleranz
         vorschlag["massnahmen"] = [
             {
                 "asset_class": d["asset_class"],

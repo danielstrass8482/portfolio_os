@@ -238,6 +238,14 @@ class PosRealEstate(Base):
     adresse            = Column(String(300), nullable=False)
     kaufpreis          = Column(Float, nullable=False)
     kaufjahr           = Column(Integer, nullable=True)
+
+    # Kaufpreisaufteilung für die AfA (§7 EStG: der Grundstücksanteil ist nicht
+    # abschreibungsfähig, nur das Gebäude bzw. bescheinigte Sanierungskosten
+    # dürfen als Abschreibungsbasis dienen – siehe abschreibungsbasis unten).
+    grundstuecksanteil = Column(Float, default=0.0)
+    gebaeudewert       = Column(Float, default=0.0)
+    kaufpreis_gesamt   = Column(Float, default=0.0)
+    sanierungskosten   = Column(Float, default=0.0)
     wohnflaeche_qm     = Column(Float, nullable=True)
     eigenkapital       = Column(Float, default=0.0)
     restschuld         = Column(Float, default=0.0)
@@ -360,8 +368,28 @@ def get_session():
 def init_db():
     """Erstellt alle pos_*-Tabellen (idempotent – safe to call multiple times)."""
     Base.metadata.create_all(engine)
+    _migrate_real_estate_columns()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_real_estate_columns():
+    """
+    Base.metadata.create_all() legt nur FEHLENDE Tabellen an, ändert aber keine
+    Spalten einer bereits bestehenden Tabelle. Für neu hinzugekommene Spalten auf
+    pos_real_estate (Kaufpreisaufteilung Grundstück/Gebäude für die AfA) daher
+    ein idempotentes ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    statements = [
+        "ALTER TABLE pos_real_estate ADD COLUMN IF NOT EXISTS grundstuecksanteil FLOAT DEFAULT 0",
+        "ALTER TABLE pos_real_estate ADD COLUMN IF NOT EXISTS gebaeudewert FLOAT DEFAULT 0",
+        "ALTER TABLE pos_real_estate ADD COLUMN IF NOT EXISTS kaufpreis_gesamt FLOAT DEFAULT 0",
+        "ALTER TABLE pos_real_estate ADD COLUMN IF NOT EXISTS sanierungskosten FLOAT DEFAULT 0",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))
 
 
 def _seed_asset_classes(session: Session):
