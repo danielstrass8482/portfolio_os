@@ -81,8 +81,12 @@ def get_total_wealth(user_id: int, include_trading_bot: bool = True) -> dict:
         breakdown["Immobilie"] = breakdown.get("Immobilie", 0.0) + immobilien_eigenkapital
 
     trading_bot_wert = 0.0
+    trading_bot_info = None
     if include_trading_bot:
-        trading_bot_wert = trading_bot_connector.get_trading_bot_value_eur()
+        # Live-Kontowert (offene Positionen + freies Guthaben), siehe
+        # trading_bot_connector.get_bot_account_value_eur().
+        trading_bot_info = trading_bot_connector.get_bot_account_value_eur()
+        trading_bot_wert = trading_bot_info["total_eur"]
         if trading_bot_wert > 0:
             breakdown["Trading Bot"] = breakdown.get("Trading Bot", 0.0) + trading_bot_wert
 
@@ -96,6 +100,7 @@ def get_total_wealth(user_id: int, include_trading_bot: bool = True) -> dict:
         "immobilien_schaetzwert_summe": schaetzwert_summe,
         "immobilien_restschuld_summe": restschuld_summe,
         "trading_bot_wert": trading_bot_wert,
+        "trading_bot_info": trading_bot_info,
     }
 
 

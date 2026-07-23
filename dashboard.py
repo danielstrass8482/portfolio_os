@@ -471,6 +471,7 @@ def _kombinierte_summary(user_ids: list) -> dict:
         "portfolios_count": 0, "asset_breakdown": {},
         "immobilien_eigenkapital": 0.0, "immobilien_schaetzwert_summe": 0.0,
         "immobilien_restschuld_summe": 0.0, "trading_bot_wert": 0.0,
+        "trading_bot_info": None,
     }
     for uid in user_ids:
         s = portfolio_module.get_total_wealth(uid, include_trading_bot=False)
@@ -484,10 +485,12 @@ def _kombinierte_summary(user_ids: list) -> dict:
         for klass, wert in s["asset_breakdown"].items():
             gesamt["asset_breakdown"][klass] = gesamt["asset_breakdown"].get(klass, 0.0) + wert
 
-    trading_bot_wert = trading_bot_connector.get_trading_bot_value_eur()
+    trading_bot_info = trading_bot_connector.get_bot_account_value_eur()
+    trading_bot_wert = trading_bot_info["total_eur"]
     if trading_bot_wert:
         gesamt["gesamtvermoegen"] += trading_bot_wert
         gesamt["trading_bot_wert"] = trading_bot_wert
+        gesamt["trading_bot_info"] = trading_bot_info
         gesamt["asset_breakdown"]["Trading Bot"] = gesamt["asset_breakdown"].get("Trading Bot", 0.0) + trading_bot_wert
     return gesamt
 
@@ -544,10 +547,16 @@ with tab1:
             def _hover_text(row):
                 anteil_pct = (row["Wert"] / gesamt_fuer_pct * 100) if gesamt_fuer_pct else 0.0
                 if row["Assetklasse"] == "Trading Bot":
-                    return (
-                        f"Trading Bot: {fmt_eur(row['Wert'], 0)} ({fmt_zahl(anteil_pct, 1)}%)"
-                        f"<br>Startkapital + realisierter P&L"
-                    )
+                    tb = summary.get("trading_bot_info") or {}
+                    zeilen = [f"Trading Bot: {fmt_eur(row['Wert'], 0)} ({fmt_zahl(anteil_pct, 1)}%)"]
+                    for d in tb.get("positionen_detail", []):
+                        zeilen.append(
+                            f"{d['ticker']} {fmt_menge(d['quantity'])} Aktien @ "
+                            f"${fmt_zahl(d['current_price_usd'], 2)} = {fmt_eur(d['market_value_eur'], 0)}"
+                        )
+                    if tb.get("cash_eur"):
+                        zeilen.append(f"Freies Guthaben: {fmt_eur(tb['cash_eur'], 0)}")
+                    return "<br>".join(zeilen)
                 if row["Assetklasse"] == "Immobilie" and summary.get("immobilien_eigenkapital"):
                     return (
                         f"Immobilie: {fmt_eur(row['Wert'], 0)} Eigenkapital ({fmt_zahl(anteil_pct, 1)}%)"
@@ -568,7 +577,7 @@ with tab1:
             if summary.get("immobilien_eigenkapital"):
                 disclaimer_teile.append("Immobilienwert basiert auf Schätzung – kein Gutachterwert.")
             if summary.get("trading_bot_wert"):
-                disclaimer_teile.append("Trading Bot Wert = Startkapital + realisierter P&L.")
+                disclaimer_teile.append("Trading Bot Wert = offene Positionen (Live-Kurs) + freies Guthaben.")
             if disclaimer_teile:
                 st.caption("ℹ️ " + " ".join(disclaimer_teile))
         else:
@@ -662,6 +671,33 @@ with tab1:
 # TAB 2 – POSITIONEN
 # ─────────────────────────────────────────────
 with tab2:
+    # ---- Trading Bot Positionen (read-only, aus der gemeinsamen DB) -------
+    # Eigene Sektion über den normalen Positionen. Nicht editierbar – der Bot
+    # verwaltet diese Positionen selbst (Einstieg/SL/TP/Modus nur zur Ansicht).
+    bot_positionen = trading_bot_connector.get_bot_positions()
+    if bot_positionen:
+        st.subheader("🤖 Trading Bot Positionen")
+        st.caption("Automatisch vom Trading Bot verwaltet – nur lesbar, kein Bearbeiten/Löschen.")
+        df_bot = pd.DataFrame(bot_positionen)
+
+        def _usd(w):
+            if w is None:
+                return "–"
+            return "$" + fmt_zahl(float(w), 2)
+
+        df_bot_anzeige = pd.DataFrame({
+            "Ticker":   df_bot["ticker"],
+            "Typ":      df_bot["instrument_type"],
+            "Einstieg": df_bot["entry_price"].map(_usd),
+            "SL":       df_bot["stop_loss"].map(_usd),
+            "TP":       df_bot["take_profit"].map(_usd),
+            "Kapital":  df_bot["capital_used"].map(_usd),
+            "Score":    df_bot["rule_score"],
+            "Modus":    df_bot["mode"],
+        })
+        st.dataframe(df_bot_anzeige, use_container_width=True, hide_index=True)
+        st.divider()
+
     col_head, col_btn = st.columns([4, 1])
     with col_head:
         st.subheader("Alle Positionen")
@@ -2124,3 +2160,84 @@ with tab9:
                 _dialog_familienziel_loeschen(gewaehltes_fz["id"], gewaehltes_fz["name"])
         else:
             st.caption("Noch kein Familienziel angelegt.")
+
+    st.divider()
+
+    # ---- Trading Bot Einstellungen (schreibt in bot_config, shared DB) -----
+    # Globale Parameter des Trading Bots (ein gemeinsames Konto). Werte kommen
+    # aus der bot_config Tabelle; Speichern schreibt zurück und wirkt beim
+    # nächsten Bot-Zyklus, da der Bot get_live_config() pro Zyklus neu liest.
+    st.subheader("🤖 Trading Bot Einstellungen")
+    st.warning(
+        "⚠️ Änderungen wirken beim nächsten Bot-Zyklus (09:00 ET). "
+        "Aktuelle offene Positionen sind nicht betroffen."
+    )
+    _bot_cfg = trading_bot_connector.get_bot_config_all()
+
+    def _bot_cfg_float(key, default):
+        try:
+            return float(_bot_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _bot_cfg_int(key, default):
+        try:
+            return int(float(_bot_cfg.get(key, default)))
+        except (TypeError, ValueError):
+            return int(default)
+
+    with st.form("bot_einstellungen"):
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            bot_max_total = st.number_input(
+                "Max. Kapital gesamt ($)", min_value=0.0, step=25.0,
+                value=_bot_cfg_float("MAX_CAPITAL_TOTAL", 475.0))
+            bot_max_trade = st.number_input(
+                "Max. pro Trade ($)", min_value=0.0, step=10.0,
+                value=_bot_cfg_float("MAX_CAPITAL_PER_TRADE", 50.0))
+            bot_max_trades = st.number_input(
+                "Max. Trades/Tag", min_value=1, max_value=10,
+                value=_bot_cfg_int("MAX_TRADES_PER_DAY", 3))
+            bot_max_open = st.number_input(
+                "Max. offene Positionen", min_value=1, max_value=10,
+                value=_bot_cfg_int("MAX_OPEN_POSITIONS", 5))
+            bot_vix = st.number_input(
+                "VIX-Limit", min_value=0.0, step=1.0,
+                value=_bot_cfg_float("VIX_PAUSE_THRESHOLD", 30.0))
+        with bc2:
+            bot_sl = st.slider(
+                "Stop Loss (%)", 1.0, 10.0,
+                value=_bot_cfg_float("STOP_LOSS_PCT", 0.03) * 100, step=0.5)
+            bot_tp = st.slider(
+                "Take Profit (%)", 2.0, 20.0,
+                value=_bot_cfg_float("TAKE_PROFIT_PCT", 0.06) * 100, step=0.5)
+            bot_min_score = st.slider(
+                "Min. Signal Score", 50, 90,
+                value=_bot_cfg_int("MIN_SIGNAL_SCORE", 65))
+            _interval_opts = [5, 10, 15, 30, 60]
+            _cur_interval = _bot_cfg_int("MONITORING_INTERVAL_MIN", 15)
+            bot_interval = st.selectbox(
+                "Monitoring-Intervall (Min)", _interval_opts,
+                index=_interval_opts.index(_cur_interval) if _cur_interval in _interval_opts else 2)
+
+        st.caption(
+            "⚠️ Höhere Positionsgrößen erhöhen das Risiko proportional. "
+            "Max. empfohlen: 10% des Gesamtkapitals pro Trade."
+        )
+        if st.form_submit_button("💾 Bot-Einstellungen speichern"):
+            try:
+                trading_bot_connector.set_bot_config({
+                    "MAX_CAPITAL_TOTAL":       round(bot_max_total, 2),
+                    "MAX_CAPITAL_PER_TRADE":   round(bot_max_trade, 2),
+                    "MAX_TRADES_PER_DAY":      int(bot_max_trades),
+                    "MAX_OPEN_POSITIONS":      int(bot_max_open),
+                    "VIX_PAUSE_THRESHOLD":     round(bot_vix, 2),
+                    "STOP_LOSS_PCT":           round(bot_sl / 100, 4),
+                    "TAKE_PROFIT_PCT":         round(bot_tp / 100, 4),
+                    "MIN_SIGNAL_SCORE":        int(bot_min_score),
+                    "MONITORING_INTERVAL_MIN": int(bot_interval),
+                })
+                st.success("Bot-Einstellungen gespeichert – wirksam beim nächsten Zyklus.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Fehler beim Speichern: {e}")
