@@ -88,7 +88,10 @@ def get_total_wealth(user_id: int, include_trading_bot: bool = True) -> dict:
         trading_bot_info = trading_bot_connector.get_bot_account_value_eur()
         trading_bot_wert = trading_bot_info["total_eur"]
         if trading_bot_wert > 0:
-            breakdown["Trading Bot"] = breakdown.get("Trading Bot", 0.0) + trading_bot_wert
+            # Bot-Positionen als Aktien/ETF einsortieren, freies Guthaben als
+            # "Liquidität (Bot)" – kein eigener "Trading Bot"-Slice mehr.
+            for klasse, wert in trading_bot_connector.bot_asset_breakdown_from_account(trading_bot_info).items():
+                breakdown[klasse] = breakdown.get(klasse, 0.0) + wert
 
     return {
         "gesamtvermoegen": summary["gesamtvermoegen"] + immobilien_eigenkapital + trading_bot_wert,

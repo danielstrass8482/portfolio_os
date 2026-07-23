@@ -129,9 +129,40 @@ def _positions_chart(pos: dict):
     """
     ticker = pos.get("ticker")
 
-    # Zeitraum-Auswahl (Standard: 2J). "Alles" → yfinance period "max".
+    # Zeitraum-Auswahl. Der Standard-Zeitraum wird automatisch anhand des
+    # ältesten Kaufs gewählt, damit der Chart den gesamten Haltezeitraum sinnvoll
+    # abdeckt (frisch gekaufte Position → 1M, langjährige Position → "Alles").
+    kauefe = _kauf_transaktionen(pos["id"])
+
+    oldest_date = None
+    if kauefe:
+        oldest_date = min(t["datum"] for t in kauefe)
+        if isinstance(oldest_date, str):
+            oldest_date = datetime.strptime(oldest_date, "%Y-%m-%d")
+        elif isinstance(oldest_date, date) and not isinstance(oldest_date, datetime):
+            # reines date → datetime, damit die Subtraktion unten funktioniert
+            oldest_date = datetime(oldest_date.year, oldest_date.month, oldest_date.day)
+
+    if oldest_date:
+        days_since_buy = (datetime.today() - oldest_date).days
+        if days_since_buy <= 30:
+            default_period = "1M"
+        elif days_since_buy <= 90:
+            default_period = "3M"
+        elif days_since_buy <= 180:
+            default_period = "6M"
+        elif days_since_buy <= 365:
+            default_period = "1J"
+        elif days_since_buy <= 730:
+            default_period = "2J"
+        else:
+            default_period = "Alles"
+    else:
+        default_period = "2J"
+
     selected_period = st.radio(
-        "Zeitraum", list(ZEITRAUM_MAP.keys()), horizontal=True, index=4,
+        "Zeitraum", list(ZEITRAUM_MAP.keys()), horizontal=True,
+        index=list(ZEITRAUM_MAP.keys()).index(default_period),
         key=f"chart_zeitraum_{pos['id']}",
     )
     df = load_chart_data(ticker, ZEITRAUM_MAP[selected_period])
@@ -153,7 +184,7 @@ def _positions_chart(pos: dict):
     current = pos.get("current_price")
     if current is None:
         current = float(df["Close"].iloc[-1])
-    kauefe = _kauf_transaktionen(pos["id"])
+    # kauefe wurde oben bereits geladen (für die automatische Zeitraum-Wahl).
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -491,7 +522,10 @@ def _kombinierte_summary(user_ids: list) -> dict:
         gesamt["gesamtvermoegen"] += trading_bot_wert
         gesamt["trading_bot_wert"] = trading_bot_wert
         gesamt["trading_bot_info"] = trading_bot_info
-        gesamt["asset_breakdown"]["Trading Bot"] = gesamt["asset_breakdown"].get("Trading Bot", 0.0) + trading_bot_wert
+        # Bot-Positionen als Aktien/ETF einsortieren, freies Guthaben als
+        # "Liquidität (Bot)" – kein eigener "Trading Bot"-Slice mehr.
+        for klasse, wert in trading_bot_connector.bot_asset_breakdown_from_account(trading_bot_info).items():
+            gesamt["asset_breakdown"][klasse] = gesamt["asset_breakdown"].get(klasse, 0.0) + wert
     return gesamt
 
 
@@ -539,24 +573,15 @@ with tab1:
                  "Wert": list(summary["asset_breakdown"].values())}
             )
 
-            # Trading Bot und Immobilie bekommen einen eigenen Hover-Text (Eigenkapital-
-            # Aufschlüsselung bzw. Berechnungshinweis), alle anderen Slices zeigen
-            # Assetklasse + Wert + Anteil am Gesamtwert der Verteilung.
+            # Immobilie bekommt einen eigenen Hover-Text (Eigenkapital-Aufschlüsselung),
+            # alle anderen Slices zeigen Assetklasse + Wert + Anteil am Gesamtwert.
+            # Bot-Positionen sind in die Slices "Aktien"/"ETF"/"Liquidität (Bot)"
+            # eingeflossen (siehe bot_asset_breakdown_from_account) und brauchen
+            # keinen eigenen Hover mehr.
             gesamt_fuer_pct = df_alloc["Wert"].sum()
 
             def _hover_text(row):
                 anteil_pct = (row["Wert"] / gesamt_fuer_pct * 100) if gesamt_fuer_pct else 0.0
-                if row["Assetklasse"] == "Trading Bot":
-                    tb = summary.get("trading_bot_info") or {}
-                    zeilen = [f"Trading Bot: {fmt_eur(row['Wert'], 0)} ({fmt_zahl(anteil_pct, 1)}%)"]
-                    for d in tb.get("positionen_detail", []):
-                        zeilen.append(
-                            f"{d['ticker']} {fmt_menge(d['quantity'])} Aktien @ "
-                            f"${fmt_zahl(d['current_price_usd'], 2)} = {fmt_eur(d['market_value_eur'], 0)}"
-                        )
-                    if tb.get("cash_eur"):
-                        zeilen.append(f"Freies Guthaben: {fmt_eur(tb['cash_eur'], 0)}")
-                    return "<br>".join(zeilen)
                 if row["Assetklasse"] == "Immobilie" and summary.get("immobilien_eigenkapital"):
                     return (
                         f"Immobilie: {fmt_eur(row['Wert'], 0)} Eigenkapital ({fmt_zahl(anteil_pct, 1)}%)"
@@ -577,7 +602,8 @@ with tab1:
             if summary.get("immobilien_eigenkapital"):
                 disclaimer_teile.append("Immobilienwert basiert auf Schätzung – kein Gutachterwert.")
             if summary.get("trading_bot_wert"):
-                disclaimer_teile.append("Trading Bot Wert = offene Positionen (Live-Kurs) + freies Guthaben.")
+                disclaimer_teile.append("Trading-Bot-Positionen sind nach Assetklasse (Aktien/ETF) eingeordnet, "
+                                        "freies Bot-Guthaben als „Liquidität (Bot)“.")
             if disclaimer_teile:
                 st.caption("ℹ️ " + " ".join(disclaimer_teile))
         else:
@@ -671,82 +697,6 @@ with tab1:
 # TAB 2 – POSITIONEN
 # ─────────────────────────────────────────────
 with tab2:
-    # ---- Trading Bot Positionen (read-only, aus der gemeinsamen DB) -------
-    # Eigene Sektion über den normalen Positionen. Nicht editierbar – der Bot
-    # verwaltet diese Positionen selbst (Einstieg/SL/TP/Modus nur zur Ansicht).
-    bot_positionen = trading_bot_connector.get_bot_positions()
-    if bot_positionen:
-        st.subheader("🤖 Trading Bot Positionen")
-        st.caption("Automatisch vom Trading Bot verwaltet – nur lesbar, kein Bearbeiten/Löschen.")
-
-        import yfinance as yf
-        # Der Bot handelt in USD; Kurse werden in $ angezeigt, G/V in €.
-        # EUR/USD einmal laden (Fallback 1.08), dann je Position Live-Kurs holen.
-        try:
-            fx = float(yf.Ticker("EURUSD=X").info.get("regularMarketPrice", 1.08)) or 1.08
-        except Exception:
-            fx = 1.08
-
-        bot_zeilen = []
-        for trade in bot_positionen:
-            entry_usd = float(trade["entry_price"])
-            quantity = float(trade["quantity"])
-            try:
-                current_price = float(yf.Ticker(trade["ticker"]).fast_info.get("lastPrice", entry_usd))
-                entry_price_eur = entry_usd / fx
-                current_price_eur = current_price / fx
-                unrealized_pnl = (current_price_eur - entry_price_eur) * quantity
-                unrealized_pct = (current_price_eur - entry_price_eur) / entry_price_eur * 100 if entry_price_eur else 0.0
-            except Exception:
-                current_price = entry_usd
-                unrealized_pnl = 0.0
-                unrealized_pct = 0.0
-            bot_zeilen.append({
-                "Ticker":       trade["ticker"],
-                "Einstieg ($)": entry_usd,
-                "Aktuell ($)":  current_price,
-                "G/V €":        unrealized_pnl,
-                "G/V %":        unrealized_pct,
-                "SL ($)":       float(trade["stop_loss"]),
-                "TP ($)":       float(trade["take_profit"]),
-                "Score":        trade["rule_score"],
-                "Modus":        trade["mode"],
-            })
-
-        df_bot = pd.DataFrame(bot_zeilen)
-
-        # G/V grün bei Gewinn, rot bei Verlust (gleiche Farben wie die normalen
-        # Positionen); Kurse als $-Strings, G/V mit Vorzeichen in €/%.
-        def _bot_pnl_farbe(wert):
-            if pd.isna(wert):
-                return ""
-            farbe = "#34d399" if wert >= 0 else "#f87171"
-            return f"color: {farbe}; font-weight: 600"
-
-        def _bot_usd(w):
-            return "–" if pd.isna(w) else "$" + fmt_zahl(float(w), 2)
-
-        def _bot_vz_eur(w):
-            return "–" if pd.isna(w) else ("+" if w >= 0 else "") + fmt_eur(w)
-
-        def _bot_vz_pct(w):
-            return "–" if pd.isna(w) else ("+" if w >= 0 else "") + fmt_zahl(w, 1) + "%"
-
-        styled_bot = (
-            df_bot.style
-            .map(_bot_pnl_farbe, subset=["G/V €", "G/V %"])
-            .format({
-                "Einstieg ($)": _bot_usd,
-                "Aktuell ($)":  _bot_usd,
-                "SL ($)":       _bot_usd,
-                "TP ($)":       _bot_usd,
-                "G/V €":        _bot_vz_eur,
-                "G/V %":        _bot_vz_pct,
-            })
-        )
-        st.dataframe(styled_bot, use_container_width=True, hide_index=True)
-        st.divider()
-
     col_head, col_btn = st.columns([4, 1])
     with col_head:
         st.subheader("Alle Positionen")
@@ -761,60 +711,107 @@ with tab2:
     for uid in aktive_user_ids:
         alle_pos.extend(portfolio_module.get_positions(uid))
 
-    if not alle_pos:
+    # Bot-Positionen (read-only, gemeinsame DB) mit Live-Marktwert – erscheinen
+    # gemeinsam mit den Depot-Positionen in EINER Tabelle (Spalte "Quelle").
+    # Nicht editierbar; der Bot verwaltet Einstieg/SL/TP selbst.
+    bot_detail = trading_bot_connector.get_bot_positions_detail()
+    bot_klasse = trading_bot_connector.BOT_INSTRUMENT_ASSET_CLASS
+
+    if not alle_pos and not bot_detail:
         st.info("Noch keine Positionen erfasst.")
     else:
-        df = pd.DataFrame(alle_pos)
+        df = pd.DataFrame(alle_pos) if alle_pos else pd.DataFrame()
+
+        # Filteroptionen: Broker nur aus Depot-Positionen (Bot hat keinen Broker),
+        # Assetklassen aus Depot UND Bot (damit z.B. "Aktien" beide erfasst).
+        broker_optionen = sorted(df["broker"].dropna().unique().tolist()) if not df.empty else []
+        klassen_depot = df["asset_class"].dropna().unique().tolist() if not df.empty else []
+        klassen_bot = [bot_klasse.get(d.get("instrument_type"), "Aktien") for d in bot_detail]
+        klasse_optionen = sorted(set(klassen_depot) | set(klassen_bot))
+
         col_f1, col_f2 = st.columns(2)
-        broker_filter = col_f1.multiselect("Broker", sorted(df["broker"].dropna().unique().tolist()))
-        klasse_filter = col_f2.multiselect("Assetklasse", sorted(df["asset_class"].dropna().unique().tolist()))
+        broker_filter = col_f1.multiselect("Broker", broker_optionen)
+        klasse_filter = col_f2.multiselect("Assetklasse", klasse_optionen)
 
+        # Depot-Positionen filtern – bleibt auch Grundlage für Chart/Steuervorschau.
         gefiltert = df.copy()
-        if broker_filter:
-            gefiltert = gefiltert[gefiltert["broker"].isin(broker_filter)]
-        if klasse_filter:
-            gefiltert = gefiltert[gefiltert["asset_class"].isin(klasse_filter)]
+        if not gefiltert.empty:
+            if broker_filter:
+                gefiltert = gefiltert[gefiltert["broker"].isin(broker_filter)]
+            if klasse_filter:
+                gefiltert = gefiltert[gefiltert["asset_class"].isin(klasse_filter)]
 
-        anzeige = gefiltert[[
-            "name", "asset_class", "portfolio_name", "quantity",
-            "avg_buy_price", "current_price", "market_value", "unrealized_pnl", "unrealized_pnl_pct",
-        ]].rename(columns={
-            "name": "Wertpapier", "asset_class": "Assetklasse", "portfolio_name": "Depot",
-            "quantity": "Menge", "avg_buy_price": "Ø-Kaufpreis", "current_price": "Kurs",
-            "market_value": "Wert", "unrealized_pnl": "G/V", "unrealized_pnl_pct": "G/V %",
-        })
+        # Gemeinsame Tabellenzeilen: erst Depot, dann Bot.
+        depot_rows = [{
+            "Wertpapier": r["name"],
+            "Assetklasse": r["asset_class"],
+            "Quelle": "Depot",
+            "Anzahl": r["quantity"],
+            "Ø-Kaufpreis": r["avg_buy_price"],
+            "Aktuell": r["current_price"],
+            "Wert": r["market_value"],
+            "G/V": r["unrealized_pnl"],
+            "G/V %": r["unrealized_pnl_pct"],
+        } for _, r in gefiltert.iterrows()]
 
-        # G/V = (aktueller_kurs - avg_kaufpreis) * menge, G/V% analog –
-        # grün bei Gewinn, rot bei Verlust (gleiche Farben wie die KPI-Karten).
-        def _pnl_farbe(wert):
-            if pd.isna(wert):
-                return ""
-            farbe = "#34d399" if wert >= 0 else "#f87171"
-            return f"color: {farbe}; font-weight: 600"
+        # Bot-Positionen haben keinen Broker → bei aktivem Broker-Filter ausblenden.
+        bot_rows = []
+        if not broker_filter:
+            for d in bot_detail:
+                klasse = bot_klasse.get(d.get("instrument_type"), "Aktien")
+                if klasse_filter and klasse not in klasse_filter:
+                    continue
+                bot_rows.append({
+                    "Wertpapier": d["ticker"],
+                    "Assetklasse": klasse,
+                    "Quelle": "🤖 Bot",
+                    "Anzahl": d["quantity"],
+                    "Ø-Kaufpreis": d["entry_price_eur"],
+                    "Aktuell": d["current_price_eur"],
+                    "Wert": d["market_value_eur"],
+                    "G/V": d["gv_eur"],
+                    "G/V %": d["gv_pct"],
+                })
 
-        def _vz_eur(w):
-            if pd.isna(w):
-                return "–"
-            return ("+" if w >= 0 else "") + fmt_eur(w)
-
-        def _vz_pct(w):
-            if pd.isna(w):
-                return "–"
-            return ("+" if w >= 0 else "") + fmt_zahl(w, 1) + "%"
-
-        styled = (
-            anzeige.style
-            .map(_pnl_farbe, subset=["G/V", "G/V %"])
-            .format({
-                "Menge": _tabellen_safe(fmt_menge),
-                "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
-                "Kurs": _tabellen_safe(fmt_eur),
-                "Wert": _tabellen_safe(fmt_eur),
-                "G/V": _vz_eur,
-                "G/V %": _vz_pct,
-            })
+        anzeige = pd.DataFrame(
+            depot_rows + bot_rows,
+            columns=["Wertpapier", "Assetklasse", "Quelle", "Anzahl",
+                     "Ø-Kaufpreis", "Aktuell", "Wert", "G/V", "G/V %"],
         )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        if anzeige.empty:
+            st.info("Keine Positionen für die gewählten Filter.")
+        else:
+            # G/V grün bei Gewinn, rot bei Verlust (gleiche Farben wie die KPI-Karten).
+            def _pnl_farbe(wert):
+                if pd.isna(wert):
+                    return ""
+                farbe = "#34d399" if wert >= 0 else "#f87171"
+                return f"color: {farbe}; font-weight: 600"
+
+            def _vz_eur(w):
+                if pd.isna(w):
+                    return "–"
+                return ("+" if w >= 0 else "") + fmt_eur(w)
+
+            def _vz_pct(w):
+                if pd.isna(w):
+                    return "–"
+                return ("+" if w >= 0 else "") + fmt_zahl(w, 1) + "%"
+
+            styled = (
+                anzeige.style
+                .map(_pnl_farbe, subset=["G/V", "G/V %"])
+                .format({
+                    "Anzahl": _tabellen_safe(fmt_menge),
+                    "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
+                    "Aktuell": _tabellen_safe(fmt_eur),
+                    "Wert": _tabellen_safe(fmt_eur),
+                    "G/V": _vz_eur,
+                    "G/V %": _vz_pct,
+                })
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
         # ---- Historischer Kursverlauf der gewählten Position ----------
         st.markdown("### 📈 Kursverlauf")
@@ -829,8 +826,10 @@ with tab2:
         steuer_pos_options = {f"{row['name']} ({row['portfolio_name']})": row.to_dict()
                                for _, row in gefiltert.iterrows()}
         steuer_pos_wahl = st.selectbox("Position wählen", list(steuer_pos_options.keys()))
-        gewaehlte_pos = steuer_pos_options[steuer_pos_wahl]
-        if st.button("Steuervorschau anzeigen"):
+        # Bot-Positionen sind read-only und nicht in gefiltert → nur Depot-Positionen
+        # stehen für die Steuervorschau zur Verfügung (kann leer sein).
+        gewaehlte_pos = steuer_pos_options.get(steuer_pos_wahl) if steuer_pos_wahl else None
+        if gewaehlte_pos and st.button("Steuervorschau anzeigen"):
             try:
                 verkaufspreis = gewaehlte_pos["current_price"] or gewaehlte_pos["avg_buy_price"]
                 preview = tax_engine.get_tax_preview(gewaehlte_pos["id"], verkaufspreis)

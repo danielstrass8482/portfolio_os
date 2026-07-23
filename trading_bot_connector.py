@@ -19,12 +19,26 @@ from sqlalchemy import text
 from database import engine
 
 
-def _usd_to_eur(betrag_usd: float) -> float:
+def _eurusd_rate() -> float:
+    """Aktueller EUR/USD-Kurs (regularMarketPrice), Fallback 1.08."""
     try:
-        fx = yf.Ticker("EURUSD=X").info.get("regularMarketPrice", 1.08)
+        return float(yf.Ticker("EURUSD=X").info.get("regularMarketPrice", 1.08)) or 1.08
     except Exception:
-        fx = 1.08
-    return betrag_usd / fx
+        return 1.08
+
+
+def _usd_to_eur(betrag_usd: float) -> float:
+    return betrag_usd / _eurusd_rate()
+
+
+# Bot-instrument_type → Portfolio-OS-Assetklasse (Donut-Slice-Name). Bewusst auf
+# die im Depot bereits vorhandenen Slice-Namen gemappt ("Aktien"/"ETF", nicht
+# "ETFs"), damit Bot-Positionen mit den passenden Depot-Slices verschmelzen statt
+# einen eigenen Mini-Slice zu erzeugen.
+BOT_INSTRUMENT_ASSET_CLASS = {
+    "STOCK": "Aktien",
+    "INVERSE_ETF": "ETF",
+}
 
 
 def get_trading_bot_value_eur() -> float:
@@ -75,6 +89,7 @@ def get_bot_positions_detail() -> list[dict]:
     market_value_usd = aktueller Kurs (yfinance) × Menge; Fallback Einstiegskurs.
     Für Donut-Tooltip und Marktwert-Summe (siehe get_bot_positions_value_eur).
     """
+    fx = _eurusd_rate()
     detail = []
     for p in get_bot_positions():
         try:
@@ -82,15 +97,54 @@ def get_bot_positions_detail() -> list[dict]:
         except Exception:
             kurs = p["entry_price"]
         kurs = float(kurs)
-        mv_usd = kurs * float(p["quantity"])
+        menge = float(p["quantity"])
+        entry_usd = float(p["entry_price"])
+        mv_usd = kurs * menge
+        # G/V je nach Richtung: SHORT/INVERSE profitiert bei fallendem Kurs.
+        richtung = (p.get("direction") or "LONG").upper()
+        if richtung in ("SHORT", "SELL"):
+            gv_usd = (entry_usd - kurs) * menge
+        else:
+            gv_usd = (kurs - entry_usd) * menge
+        einstand_usd = entry_usd * menge
+        gv_pct = (gv_usd / einstand_usd * 100) if einstand_usd else 0.0
         detail.append({
             "ticker": p["ticker"],
-            "quantity": float(p["quantity"]),
+            "instrument_type": p.get("instrument_type"),
+            "direction": richtung,
+            "quantity": menge,
+            "entry_price_usd": round(entry_usd, 2),
+            "entry_price_eur": round(entry_usd / fx, 2),
             "current_price_usd": round(kurs, 2),
+            "current_price_eur": round(kurs / fx, 2),
             "market_value_usd": round(mv_usd, 2),
-            "market_value_eur": round(_usd_to_eur(mv_usd), 2),
+            "market_value_eur": round(mv_usd / fx, 2),
+            "gv_eur": round(gv_usd / fx, 2),
+            "gv_pct": round(gv_pct, 2),
         })
     return detail
+
+
+def bot_asset_breakdown_from_account(account: dict) -> dict:
+    """
+    Schlüsselt einen bereits geladenen Bot-Kontowert (get_bot_account_value_eur)
+    nach Assetklasse auf: offene Positionen nach instrument_type in Depot-Klassen
+    (STOCK→Aktien, INVERSE_ETF→ETF), freies Guthaben als "Liquidität (Bot)".
+    Nimmt das account-Dict entgegen, um einen zweiten DB-/yfinance-Abruf zu sparen.
+    """
+    breakdown: dict[str, float] = {}
+    for d in account.get("positionen_detail", []):
+        klasse = BOT_INSTRUMENT_ASSET_CLASS.get(d.get("instrument_type"), "Aktien")
+        breakdown[klasse] = breakdown.get(klasse, 0.0) + d.get("market_value_eur", 0.0)
+    cash = account.get("cash_eur", 0.0) or 0.0
+    if cash > 0:
+        breakdown["Liquidität (Bot)"] = breakdown.get("Liquidität (Bot)", 0.0) + cash
+    return {k: round(v, 2) for k, v in breakdown.items()}
+
+
+def get_bot_asset_breakdown_eur() -> dict:
+    """Bot-Wert nach Assetklasse für den Donut (lädt Kontowert selbst)."""
+    return bot_asset_breakdown_from_account(get_bot_account_value_eur())
 
 
 def get_bot_positions_value_eur() -> float:

@@ -85,15 +85,39 @@ def yearly_job():
             print(f"⚠️  Yearly Job für Nutzer {user_id} fehlgeschlagen: {e}")
 
 
+def update_all_prices():
+    """Alle 15 Min während der US-Handelszeit: nur Kurse aktualisieren (kein
+    Alert/Snapshot – das übernimmt weiterhin der daily_job). update_prices()
+    verwaltet Session und Commit selbst."""
+    try:
+        aktualisiert = portfolio_module.update_prices()
+        print(f"✅ Preise aktualisiert ({aktualisiert} Position(en))")
+    except Exception as e:
+        print(f"⚠️ Preisupdate fehlgeschlagen: {e}")
+
+
 def main():
     init_db()
     for warnung in validate_config():
         print(f"⚠️  {warnung}")
 
     tz = pytz.timezone("Europe/Berlin")
+    et_tz = pytz.timezone("America/New_York")
     scheduler = BlockingScheduler(timezone=tz)
 
     scheduler.add_job(daily_job, CronTrigger(hour=DAILY_UPDATE_HOUR, minute=0, timezone=tz), id="daily_job")
+    scheduler.add_job(
+        update_all_prices,
+        CronTrigger(
+            hour="9-16",
+            minute="*/15",
+            day_of_week="mon-fri",
+            timezone=et_tz,
+        ),
+        id="price_update",
+        name="Preise alle 15 Min aktualisieren",
+        replace_existing=True,
+    )
     scheduler.add_job(weekly_job, CronTrigger(day_of_week="mon", hour=WEEKLY_SUMMARY_HOUR, minute=0, timezone=tz), id="weekly_job")
     scheduler.add_job(monthly_job, CronTrigger(day=1, hour=MONTHLY_REPORT_HOUR, minute=0, timezone=tz), id="monthly_job")
     scheduler.add_job(
