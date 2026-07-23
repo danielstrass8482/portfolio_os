@@ -26,6 +26,16 @@ def _fmt_eur(wert, nachkommastellen=0):
     return f"{wert:,.{nachkommastellen}f}".replace(",", "X").replace(".", ",").replace("X", ".") + " €"
 
 
+def _eur_input(label, value, key, step=1000.0, container=None, help=None):
+    """Einheitliches Eingabefeld für Geldbeträge – siehe dashboard._eur_input (gleiches Muster,
+    hier dupliziert statt importiert, um keinen Zyklus onboarding.py <-> dashboard.py zu erzeugen)."""
+    return (container or st).number_input(
+        label, min_value=0.0, step=step, value=float(value or 0.0), key=key,
+        placeholder="z.B. 100.000",
+        help=help or "Eingabe in Euro, z.B. 500000 für 500.000 €",
+    )
+
+
 # ─────────────────────────────────────────────
 # STAMMDATEN
 # ─────────────────────────────────────────────
@@ -129,6 +139,25 @@ GEWICHTUNG_VORSCHLAEGE = {
 }
 
 
+def ensure_100(weights: dict) -> dict:
+    """
+    Normalisiert eine Gewichtung so, dass sie exakt 100 ergibt – gleicht sowohl
+    Rundungsfehler als auch echte Abweichungen aus (z.B. KI-Antwort, die trotz
+    Anweisung nicht exakt 100 ergibt, oder ein statischer Vorschlag, dessen Summe
+    nach dem Herausfiltern nicht gewählter Assetklassen nicht mehr 100 ergibt).
+    Restdifferenz nach dem Runden wandert auf die letzte Assetklasse.
+    """
+    total = sum(weights.values())
+    if total == 0:
+        return weights
+    normalized = {k: round(v / total * 100, 1) for k, v in weights.items()}
+    diff = 100 - sum(normalized.values())
+    if diff != 0:
+        last_key = list(normalized.keys())[-1]
+        normalized[last_key] = round(normalized[last_key] + diff, 1)
+    return normalized
+
+
 def _risikoprofil_von_score(score: int) -> str:
     if score <= 2:
         return "konservativ"
@@ -214,9 +243,9 @@ def _step_profil(user_id: int):
         "Familienstand", familienstand_optionen,
         index=familienstand_optionen.index(familienstand_default) if familienstand_default in familienstand_optionen else 0,
         key="ob_familienstand")
-    sparrate = st.number_input(
-        "Monatlich zum Investieren verfügbar (€)", min_value=0.0, step=10.0,
-        value=float(sparrate_default), key="ob_sparrate")
+    sparrate = _eur_input(
+        "Monatlich zum Investieren verfügbar (€)", sparrate_default, "ob_sparrate", step=100.0,
+        help="Eingabe in Euro, z.B. 500 für 500 €")
     horizont = st.slider("Anlagehorizont (Jahre)", 1, 50, int(horizont_default), key="ob_horizont")
 
     if st.button("Weiter →", key="ob_step1_weiter", type="primary"):
@@ -300,7 +329,7 @@ def _step_ziele(user_id: int):
         with st.form("ob_neues_ziel_form", clear_on_submit=True):
             st.markdown(f"**Neues Ziel** {ZIEL_ICONS.get(st.session_state['ob_neues_ziel_typ'], '🎯')}")
             zname = st.text_input("Name des Ziels", value=st.session_state.get("ob_neues_ziel_name", ""))
-            zbetrag = st.number_input("Zielbetrag (€)", min_value=0.0, step=1000.0, value=100000.0)
+            zbetrag = _eur_input("Zielbetrag (€)", 100000.0, "ob_ziel_zbetrag", step=1000.0)
             zjahre = st.number_input("In wie vielen Jahren?", min_value=1, max_value=60, value=20)
             zprio = st.radio("Priorität", ["Haupt", "Neben"], horizontal=True)
             if st.form_submit_button("Ziel hinzufügen"):
@@ -354,7 +383,8 @@ def _step_ziele(user_id: int):
 
 def _step_rechner(user_id: int):
     st.header("Erreichst du deine Ziele? 📈")
-    st.caption("Basierend auf deiner Sparrate und historischen Renditen.")
+    st.caption("Teile deine monatliche Sparrate auf deine Ziele auf – die Hochrechnung "
+               "nutzt je Ziel NUR den ihm zugewiesenen Anteil.")
 
     with get_session() as session:
         user = session.get(PosUser, user_id)
@@ -362,27 +392,36 @@ def _step_rechner(user_id: int):
         basis_rendite = RISIKO_PROFILE.get(user.risikoprofil, RISIKO_PROFILE["ausgewogen"])["rendite"]
         ziele = [
             {"id": g.id, "name": g.name, "typ": g.typ, "zielbetrag": g.zielbetrag,
-             "zeitraum_jahre": g.zeitraum_jahre, "erwartete_rendite": g.erwartete_rendite}
+             "zeitraum_jahre": g.zeitraum_jahre, "erwartete_rendite": g.erwartete_rendite,
+             "sparrate_anteil_pct": g.sparrate_anteil_pct}
             for g in session.query(PosGoal).filter_by(user_id=user_id).order_by(PosGoal.id).all()
         ]
 
+    st.markdown(f"**Verfügbare monatliche Sparrate: {_fmt_eur(basis_sparrate)}**")
+
+    default_anteil = round(100 / len(ziele)) if ziele else 0
+
     aktualisierte_renditen = {}
+    aktualisierte_anteile = {}
+    summe_anteil = 0.0
+
     for z in ziele:
         icon = ZIEL_ICONS.get(z["typ"], "🎯")
-        sparrate_key = f"ob_rechner_sparrate_{z['id']}"
+        anteil_key = f"ob_rechner_anteil_{z['id']}"
         rendite_key = f"ob_rechner_rendite_{z['id']}"
 
-        sparrate = st.session_state.get(sparrate_key, basis_sparrate)
+        anteil_default = z["sparrate_anteil_pct"] if z["sparrate_anteil_pct"] is not None else default_anteil
+        anteil_pct = st.session_state.get(anteil_key, anteil_default)
         rendite_pct = st.session_state.get(rendite_key, round((z["erwartete_rendite"] or basis_rendite) * 100, 1))
 
-        monate = z["zeitraum_jahre"] * 12
-        eingezahlt = sparrate * monate
-        endkapital = projiziertes_kapital(sparrate, rendite_pct / 100, z["zeitraum_jahre"])
+        sparrate_ziel = basis_sparrate * anteil_pct / 100
+        endkapital = projiziertes_kapital(sparrate_ziel, rendite_pct / 100, z["zeitraum_jahre"])
+        eingezahlt = sparrate_ziel * z["zeitraum_jahre"] * 12
         rendite_anteil = endkapital - eingezahlt
 
         with st.container(border=True):
             st.markdown(f"**{icon} {z['name']} – Ziel: {_fmt_eur(z['zielbetrag'])}**")
-            st.write(f"Bei {_fmt_eur(sparrate)}/Monat und {rendite_pct:.1f}% p.a.:")
+            st.write(f"Bei {anteil_pct:.0f}% deiner Sparrate ({_fmt_eur(sparrate_ziel)}/Monat) und {rendite_pct:.1f}% p.a.:")
 
             rc1, rc2, rc3 = st.columns(3)
             rc1.metric("Erreichtes Kapital", _fmt_eur(endkapital))
@@ -392,20 +431,33 @@ def _step_rechner(user_id: int):
             if endkapital >= z["zielbetrag"]:
                 st.success("✅ Ziel erreicht")
             else:
-                empfohlene_sparrate = benoetigte_sparrate(z["zielbetrag"], rendite_pct / 100, z["zeitraum_jahre"])
-                st.warning(
-                    f"⚠️ Ziel knapp verfehlt – Empfehlung: Sparrate auf "
-                    f"{_fmt_eur(empfohlene_sparrate)}/Monat erhöhen"
-                )
+                benoetigte_sparrate_abs = benoetigte_sparrate(z["zielbetrag"], rendite_pct / 100, z["zeitraum_jahre"])
+                benoetigter_anteil_pct = (benoetigte_sparrate_abs / basis_sparrate * 100) if basis_sparrate else None
+                hinweis = f"⚠️ Ziel mit {anteil_pct:.0f}% Anteil knapp verfehlt – benötigt wären "
+                if benoetigter_anteil_pct is not None:
+                    hinweis += f"{benoetigter_anteil_pct:.0f}% deiner Sparrate ({_fmt_eur(benoetigte_sparrate_abs)}/Monat)"
+                else:
+                    hinweis += f"{_fmt_eur(benoetigte_sparrate_abs)}/Monat"
+                st.warning(hinweis)
 
-            st.slider("Sparrate anpassen (€/Monat)", 0, max(2000, int(sparrate * 2) + 100),
-                       value=int(sparrate), step=10, key=sparrate_key)
+            st.slider("Anteil dieser Sparrate (%)", 0, 100, value=int(round(anteil_pct)),
+                       step=1, key=anteil_key)
             st.slider("Rendite anpassen (%)", 4.0, 10.0, value=float(rendite_pct), step=0.5, key=rendite_key)
             st.caption(
                 "⚠️ Hochrechnung basiert auf historischen Durchschnittswerten. "
                 "Tatsächliche Renditen können stark abweichen. Keine Anlageberatung."
             )
+            aktueller_anteil = st.session_state.get(anteil_key, anteil_pct)
+            aktualisierte_anteile[z["id"]] = aktueller_anteil
             aktualisierte_renditen[z["id"]] = st.session_state.get(rendite_key, rendite_pct) / 100
+            summe_anteil += aktueller_anteil
+
+    st.divider()
+    if summe_anteil > 100:
+        st.error(f"⚠️ Gesamtanteil überschreitet 100% (aktuell: {summe_anteil:.0f}%)")
+    else:
+        restbetrag = basis_sparrate * (100 - summe_anteil) / 100
+        st.info(f"Zugewiesen: {summe_anteil:.0f}% · Noch nicht zugewiesen: {_fmt_eur(restbetrag)}")
 
     col_zurueck, col_weiter = st.columns(2)
     if col_zurueck.button("← Zurück", key="ob_step4_zurueck"):
@@ -417,6 +469,7 @@ def _step_rechner(user_id: int):
                 g = session.get(PosGoal, goal_id)
                 if g:
                     g.erwartete_rendite = rendite
+                    g.sparrate_anteil_pct = aktualisierte_anteile.get(goal_id)
         st.session_state.onboarding_step = 5
         st.rerun()
 
@@ -501,15 +554,21 @@ def _step_gewichtung(user_id: int):
         }
 
     vorschlag = GEWICHTUNG_VORSCHLAEGE.get(profil_key, GEWICHTUNG_VORSCHLAEGE["ausgewogen"])
-    vorschlag_gefiltert = {k: v for k, v in vorschlag.items() if k in gewaehlte_klassen}
+    # ensure_100() ist hier nötig, weil das Herausfiltern nicht gewählter Assetklassen
+    # (z.B. "gold" abgewählt) die Summe des statischen Vorschlags unter 100 drücken würde.
+    vorschlag_gefiltert = ensure_100({k: v for k, v in vorschlag.items() if k in gewaehlte_klassen})
 
     st.caption(
         f"KI-Vorschlag basierend auf deinem Risikoprofil "
-        f"({RISIKO_PROFILE.get(profil_key, RISIKO_PROFILE['ausgewogen'])['label']}) und gewählten Assetklassen."
+        f"({RISIKO_PROFILE.get(profil_key, RISIKO_PROFILE['ausgewogen'])['label']}) und gewählten Assetklassen. "
+        "Die Summe ergibt immer exakt 100%."
     )
     if st.button("🤖 KI-Vorschlag übernehmen", key="ob_gewicht_uebernehmen"):
+        with st.spinner("KI erstellt Zielgewichtung..."):
+            ki_gewichte = llm_analyst.suggest_target_weights(profil_key, gewaehlte_klassen)
+        gewichtung = ensure_100(ki_gewichte) if ki_gewichte else vorschlag_gefiltert
         for k in gewaehlte_klassen:
-            st.session_state[f"ob_gewicht_{k}"] = vorschlag_gefiltert.get(k, 0)
+            st.session_state[f"ob_gewicht_{k}"] = int(round(gewichtung.get(k, 0)))
         st.rerun()
 
     summe = 0
@@ -642,7 +701,8 @@ def _step_import(user_id: int):
         with st.form("ob_manuelle_position", clear_on_submit=True):
             m_ticker = st.text_input("Ticker (z.B. AAPL, SAP.DE)")
             m_qty = st.number_input("Anzahl", min_value=0.0, step=1.0)
-            m_preis = st.number_input("Kaufpreis (€)", min_value=0.0, step=0.01)
+            m_preis = st.number_input("Kaufpreis (€)", min_value=0.0, step=0.01,
+                                       help="Preis pro Stück in Euro, z.B. 123.45")
             if st.form_submit_button("Position hinzufügen"):
                 if not m_ticker or m_qty <= 0:
                     st.error("Bitte Ticker und Anzahl angeben.")

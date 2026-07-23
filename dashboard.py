@@ -60,6 +60,21 @@ def _tabellen_safe(fn):
     return lambda w: fn(None if pd.isna(w) else w)
 
 
+def _eur_input(label, value, key, step=1000.0, container=None, help=None):
+    """
+    Einheitliches Eingabefeld für Geldbeträge (große Summen wie Kaufpreis,
+    Kredit, Zielbetrag – step=1000 als Default): min_value=0, Platzhalter-
+    Beispiel und Hilfetext, damit überall klar ist, dass die Eingabe in vollen
+    Euro erfolgt (kein Tausenderpunkt/Komma nötig). `container` ist z.B. eine
+    st.columns()-Spalte, Default ist das st-Modul selbst.
+    """
+    return (container or st).number_input(
+        label, min_value=0.0, step=step, value=float(value or 0.0), key=key,
+        placeholder="z.B. 100.000",
+        help=help or "Eingabe in Euro, z.B. 500000 für 500.000 €",
+    )
+
+
 PORTFOLIO_TYPEN = ["depot", "krypto", "immobilie", "konto"]
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
@@ -737,24 +752,19 @@ def _immobilie_basis_felder(key_prefix: str, defaults: dict = None) -> dict:
     gibt die eingegebenen Werte als dict zurück. `defaults` befüllt sie vor (Edit)."""
     d = defaults or {}
     adresse = st.text_input("Adresse", value=d.get("adresse", ""), key=f"{key_prefix}_adresse")
-    kaufpreis = st.number_input("Kaufpreis gesamt (€)", min_value=0.0, step=1000.0,
-                                 value=float(d.get("kaufpreis") or 0.0), key=f"{key_prefix}_kaufpreis")
+    kaufpreis = _eur_input("Kaufpreis gesamt (€)", d.get("kaufpreis"), f"{key_prefix}_kaufpreis", step=1000.0)
     kaufjahr = st.number_input(
         "Kaufjahr", min_value=1950, max_value=date.today().year,
         value=int(d.get("kaufjahr") or date.today().year), key=f"{key_prefix}_kaufjahr")
     qm = st.number_input("Wohnfläche (qm)", min_value=0.0, step=1.0,
                           value=float(d.get("wohnflaeche_qm") or 0.0), key=f"{key_prefix}_qm")
-    ek = st.number_input("Eigenkapital (€)", min_value=0.0, step=1000.0,
-                          value=float(d.get("eigenkapital") or 0.0), key=f"{key_prefix}_ek")
-    restschuld = st.number_input("Restschuld (€)", min_value=0.0, step=1000.0,
-                                  value=float(d.get("restschuld") or 0.0), key=f"{key_prefix}_restschuld")
-    rate = st.number_input("Monatliche Rate (€)", min_value=0.0, step=10.0,
-                            value=float(d.get("monatliche_rate") or 0.0), key=f"{key_prefix}_rate")
-    miete = st.number_input("Mieteinnahmen (€, optional)", min_value=0.0, step=10.0,
-                             value=float(d.get("mieteinnahmen") or 0.0), key=f"{key_prefix}_miete")
-    schaetzwert = st.number_input(
-        "Letzter Schätzwert (€, optional – Default: Kaufpreis)", min_value=0.0, step=1000.0,
-        value=float(d.get("letzter_schaetzwert") or kaufpreis or 0.0), key=f"{key_prefix}_schaetzwert")
+    ek = _eur_input("Eigenkapital (€)", d.get("eigenkapital"), f"{key_prefix}_ek", step=1000.0)
+    restschuld = _eur_input("Restschuld (€)", d.get("restschuld"), f"{key_prefix}_restschuld", step=1000.0)
+    rate = _eur_input("Monatliche Rate (€)", d.get("monatliche_rate"), f"{key_prefix}_rate", step=100.0)
+    miete = _eur_input("Mieteinnahmen (€, optional)", d.get("mieteinnahmen"), f"{key_prefix}_miete", step=100.0)
+    schaetzwert = _eur_input(
+        "Letzter Schätzwert (€, optional – Default: Kaufpreis)",
+        d.get("letzter_schaetzwert") or kaufpreis, f"{key_prefix}_schaetzwert", step=1000.0)
 
     # ---- Kaufpreisaufteilung für die AfA (§7 EStG) ------------------------
     # Der Grundstücksanteil ist gesetzlich NICHT abschreibungsfähig – AfA darf
@@ -765,14 +775,17 @@ def _immobilie_basis_felder(key_prefix: str, defaults: dict = None) -> dict:
     grundstuecksanteil = gc1.number_input(
         "Grundstücksanteil (€)", min_value=0.0, step=1000.0,
         value=float(d.get("grundstuecksanteil") or 0.0), key=f"{key_prefix}_grundstuecksanteil",
+        placeholder="z.B. 100.000",
         help="Wert des Grundstücks ohne Gebäude – nicht abschreibungsfähig.")
     gebaeudewert = gc2.number_input(
         "Gebäudewert (€)", min_value=0.0, step=1000.0,
         value=float(d.get("gebaeudewert") or 0.0), key=f"{key_prefix}_gebaeudewert",
+        placeholder="z.B. 100.000",
         help="Wert der Altbausubstanz – Basis der Standard-AfA (2% p.a.).")
     sanierungskosten = gc3.number_input(
         "Bescheinigte Sanierungskosten (€)", min_value=0.0, step=1000.0,
         value=float(d.get("sanierungskosten") or 0.0), key=f"{key_prefix}_sanierungskosten",
+        placeholder="z.B. 100.000",
         help="Nur vom Finanzamt anerkannte Sanierungskosten (§7i Bescheinigung) – Basis der "
              "Denkmalschutz-/Energetisch-Abschreibung.")
 
@@ -840,12 +853,12 @@ def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None, basis: 
     felder["vermietung_start"] = st.date_input(
         "Vermietung gestartet am (optional)", value=d.get("vermietung_start"), key=f"{key_prefix}_vermietung_start")
     c1, c2 = st.columns(2)
-    felder["kredit_gesamtbetrag"] = c1.number_input(
-        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0,
-        value=float(d.get("kredit_gesamtbetrag") or 0.0), key=f"{key_prefix}_kredit_gesamt")
-    felder["kredit_abgerufen"] = c2.number_input(
-        "Davon bereits abgerufen (€)", min_value=0.0, step=1000.0,
-        value=float(d.get("kredit_abgerufen") or 0.0), key=f"{key_prefix}_kredit_abgerufen")
+    felder["kredit_gesamtbetrag"] = _eur_input(
+        "Kredit Gesamtbetrag (€)", d.get("kredit_gesamtbetrag"), f"{key_prefix}_kredit_gesamt",
+        step=1000.0, container=c1)
+    felder["kredit_abgerufen"] = _eur_input(
+        "Davon bereits abgerufen (€)", d.get("kredit_abgerufen"), f"{key_prefix}_kredit_abgerufen",
+        step=1000.0, container=c2)
     c3, c4 = st.columns(2)
     felder["kredit_zinssatz"] = c3.number_input(
         "Zinssatz (% p.a.)", min_value=0.0, step=0.1,
@@ -859,9 +872,9 @@ def _immobilie_erweiterte_felder(key_prefix: str, defaults: dict = None, basis: 
         "Vorfälligkeitsentschädigung im Vertrag (% des Restdarlehens)",
         min_value=0.0, step=0.1, value=float(d.get("vorfaelligkeitsgebuehr_pct") or 0.0),
         key=f"{key_prefix}_vorfaelligkeit")
-    felder["finanzierungskosten"] = st.number_input(
-        "Finanzierungskosten p.a. (€)", min_value=0.0, step=100.0,
-        value=float(d.get("finanzierungskosten") or 0.0), key=f"{key_prefix}_finanzierungskosten")
+    felder["finanzierungskosten"] = _eur_input(
+        "Finanzierungskosten p.a. (€)", d.get("finanzierungskosten"),
+        f"{key_prefix}_finanzierungskosten", step=100.0)
     return felder
 
 
@@ -1014,12 +1027,12 @@ with tab5:
                 if erkannt:
                     st.success("KI hat folgende Werte erkannt – bitte prüfen und ggf. korrigieren:")
                     kc1, kc2 = st.columns(2)
-                    kv_gesamt = kc1.number_input(
-                        "Kredit Gesamtbetrag (€)", min_value=0.0, step=1000.0,
-                        value=float(erkannt.get("kredit_gesamtbetrag") or 0.0), key=f"kv_gesamt_{im['id']}")
-                    kv_abgerufen = kc2.number_input(
-                        "Davon abgerufen (€)", min_value=0.0, step=1000.0,
-                        value=float(erkannt.get("kredit_abgerufen") or 0.0), key=f"kv_abgerufen_{im['id']}")
+                    kv_gesamt = _eur_input(
+                        "Kredit Gesamtbetrag (€)", erkannt.get("kredit_gesamtbetrag"),
+                        f"kv_gesamt_{im['id']}", step=1000.0, container=kc1)
+                    kv_abgerufen = _eur_input(
+                        "Davon abgerufen (€)", erkannt.get("kredit_abgerufen"),
+                        f"kv_abgerufen_{im['id']}", step=1000.0, container=kc2)
                     kc3, kc4 = st.columns(2)
                     kv_zins = kc3.number_input(
                         "Zinssatz (% p.a.)", min_value=0.0, step=0.1,
@@ -1368,8 +1381,10 @@ with tab8:
             tx_typ = st.selectbox("Typ", ["kauf", "verkauf", "dividende", "sparrate"])
             tx_asset_class = st.selectbox("Assetklasse", list(ac_options.keys()) if ac_options else ["(keine vorhanden)"])
             tx_qty = st.number_input("Menge", min_value=0.0, step=1.0)
-            tx_price = st.number_input("Preis", min_value=0.0, step=0.01)
-            tx_fees = st.number_input("Gebühren", min_value=0.0, step=0.01)
+            tx_price = st.number_input("Preis (€)", min_value=0.0, step=0.01,
+                                        help="Preis pro Stück in Euro, z.B. 123.45")
+            tx_fees = st.number_input("Gebühren (€)", min_value=0.0, step=0.01,
+                                       help="Eingabe in Euro, z.B. 4.95")
             tx_datum = st.date_input("Datum", value=date.today())
             if st.form_submit_button("Buchen") and pf_options and tx_qty > 0:
                 try:
@@ -1446,8 +1461,9 @@ with tab8:
                         "Anzahl", min_value=0.0, step=1.0,
                         value=float(gewaehlte_pos["quantity"] or 0.0), key=f"edit_quantity_{gewaehlte_pos['id']}")
                     edit_avg_price = st.number_input(
-                        "Ø-Kaufpreis", min_value=0.0, step=0.01,
-                        value=float(gewaehlte_pos["avg_buy_price"] or 0.0), key=f"edit_price_{gewaehlte_pos['id']}")
+                        "Ø-Kaufpreis (€)", min_value=0.0, step=0.01,
+                        value=float(gewaehlte_pos["avg_buy_price"] or 0.0), key=f"edit_price_{gewaehlte_pos['id']}",
+                        help="Preis pro Stück in Euro, z.B. 123.45")
                     if st.form_submit_button("Speichern"):
                         try:
                             portfolio_module.update_position(
@@ -1498,11 +1514,11 @@ with tab8:
                             "Menge", min_value=0.0, step=1.0, value=float(t["quantity"] or 0.0),
                             key=f"tx_edit_qty_{t['id']}")
                         tx_edit_price = st.number_input(
-                            "Preis", min_value=0.0, step=0.01, value=float(t["price"] or 0.0),
-                            key=f"tx_edit_price_{t['id']}")
+                            "Preis (€)", min_value=0.0, step=0.01, value=float(t["price"] or 0.0),
+                            key=f"tx_edit_price_{t['id']}", help="Preis pro Stück in Euro, z.B. 123.45")
                         tx_edit_fees = st.number_input(
-                            "Gebühren", min_value=0.0, step=0.01, value=float(t["fees"] or 0.0),
-                            key=f"tx_edit_fees_{t['id']}")
+                            "Gebühren (€)", min_value=0.0, step=0.01, value=float(t["fees"] or 0.0),
+                            key=f"tx_edit_fees_{t['id']}", help="Eingabe in Euro, z.B. 4.95")
                         tx_edit_datum = st.date_input("Datum", value=t["datum"], key=f"tx_edit_datum_{t['id']}")
                         if st.form_submit_button("Speichern"):
                             try:
@@ -1641,8 +1657,8 @@ with tab8:
         st.markdown("**Neues Familienziel**")
         with st.form("neues_ziel"):
             z_name = st.text_input("Name (z.B. Notgroschen, Kinderstudium)")
-            z_betrag = st.number_input("Zielbetrag", min_value=0.0, step=100.0)
-            z_aktuell = st.number_input("Aktueller Stand", min_value=0.0, step=100.0)
+            z_betrag = _eur_input("Zielbetrag (€)", None, "fz_neu_betrag", step=1000.0)
+            z_aktuell = _eur_input("Aktueller Stand (€)", None, "fz_neu_aktuell", step=100.0)
             z_datum = st.date_input("Zieldatum", value=None)
             if st.form_submit_button("Anlegen") and z_name:
                 with get_session() as session:
@@ -1665,12 +1681,10 @@ with tab8:
 
             with st.form("familienziel_bearbeiten"):
                 neuer_fz_name = st.text_input("Name", value=gewaehltes_fz["name"], key="fz_edit_name")
-                neuer_fz_betrag = st.number_input(
-                    "Zielbetrag", min_value=0.0, step=100.0,
-                    value=float(gewaehltes_fz["ziel_betrag"] or 0.0), key="fz_edit_betrag")
-                neuer_fz_aktuell = st.number_input(
-                    "Aktueller Stand", min_value=0.0, step=100.0,
-                    value=float(gewaehltes_fz["aktuell_betrag"] or 0.0), key="fz_edit_aktuell")
+                neuer_fz_betrag = _eur_input(
+                    "Zielbetrag (€)", gewaehltes_fz["ziel_betrag"], "fz_edit_betrag", step=1000.0)
+                neuer_fz_aktuell = _eur_input(
+                    "Aktueller Stand (€)", gewaehltes_fz["aktuell_betrag"], "fz_edit_aktuell", step=100.0)
                 neues_fz_datum = st.date_input("Zieldatum", value=gewaehltes_fz["zieldatum"], key="fz_edit_datum")
                 if st.form_submit_button("Speichern"):
                     with get_session() as session:

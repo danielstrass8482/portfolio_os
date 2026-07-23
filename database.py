@@ -173,6 +173,9 @@ class PosGoal(Base):
     zeitraum_jahre    = Column(Integer, nullable=False)
     prioritaet        = Column(Text, default="haupt")   # haupt/neben
     erwartete_rendite = Column(Float, default=0.06)
+    # Anteil der monatlichen Gesamtsparrate (in %), der diesem Ziel im Sparplan-Rechner
+    # (onboarding.py Schritt 4) zugewiesen wurde. None = noch nicht zugewiesen.
+    sparrate_anteil_pct = Column(Float, nullable=True)
     created_at        = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -369,8 +372,18 @@ def init_db():
     """Erstellt alle pos_*-Tabellen (idempotent – safe to call multiple times)."""
     Base.metadata.create_all(engine)
     _migrate_real_estate_columns()
+    _migrate_goal_columns()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_goal_columns():
+    """Idempotente Migration für pos_goals.sparrate_anteil_pct (siehe _migrate_real_estate_columns)."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE pos_goals ADD COLUMN IF NOT EXISTS sparrate_anteil_pct FLOAT"
+        ))
 
 
 def _migrate_real_estate_columns():

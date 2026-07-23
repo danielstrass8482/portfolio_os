@@ -166,6 +166,40 @@ Letzter bekannter Schätzwert: {immobilie.get('letzter_schaetzwert')} EUR"""
     }
 
 
+def suggest_target_weights(risikoprofil: str, aktive_klassen: list) -> dict:
+    """
+    KI-Vorschlag für die Ziel-Gewichtung im Onboarding (Schritt 6, siehe onboarding.py
+    _step_gewichtung). Reine unverbindliche Verteilungsidee je Assetklasse (in %), keine
+    Anlageberatung. Bei fehlendem API-Key, API-Fehler oder ungültiger/unparsbarer Antwort:
+    leeres dict – der Aufrufer fällt dann auf die statische GEWICHTUNG_VORSCHLAEGE-Tabelle
+    zurück (degraded mode, kein Absturz). Die Summe wird NICHT hier, sondern vom Aufrufer
+    über onboarding.ensure_100() auf exakt 100 normalisiert, da auch die KI-Antwort trotz
+    Anweisung leicht abweichen kann.
+    """
+    prompt = f"""Erstelle eine Zielgewichtung. Die Werte MÜSSEN exakt 100 ergeben.
+Nur diese Assetklassen: {aktive_klassen}
+Risikoprofil: {risikoprofil}
+Antworte NUR als JSON ohne Text: {{"etf": 55, "stocks": 15, ...}}
+Summe muss exakt 100 sein."""
+
+    text = _ask(prompt, system=SYSTEM_PROMPT, max_tokens=512)
+    if text is None:
+        return {}
+    try:
+        bereinigt = text.strip()
+        if bereinigt.startswith("```"):
+            bereinigt = bereinigt.strip("`")
+            if bereinigt.lower().startswith("json"):
+                bereinigt = bereinigt[4:]
+        gewichte = json.loads(bereinigt.strip())
+        if not isinstance(gewichte, dict):
+            return {}
+        return {k: float(v) for k, v in gewichte.items() if k in aktive_klassen}
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        print(f"⚠️  Zielgewichtungs-Vorschlag nicht parsebar: {e} (degraded mode)")
+        return {}
+
+
 def analyze_kredit_vertrag(file_bytes: bytes, file_type: str) -> dict:
     """
     Liest einen hochgeladenen Immobilienkredit-Vertrag (PDF oder Bild) per KI aus
