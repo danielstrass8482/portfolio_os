@@ -210,15 +210,23 @@ def _positions_chart(pos: dict):
             annotation_font=dict(color=linien_farbe),
         )
 
-    # Kauf-Pins (nur wenn Transaktionen in der DB vorhanden sind)
-    if kauefe:
+    # Kauf-Pins nur für Käufe INNERHALB des gewählten Zeitraums – ein Pin außerhalb
+    # der geladenen Kursdaten würde Plotly zwingen, die X-Achse bis zu diesem
+    # (u.U. Jahre entfernten) Datum aufzuspannen, wodurch der eigentliche Zeitraum
+    # auf einen winzigen Streifen zusammenschrumpft. Käufe außerhalb bekommen
+    # stattdessen einen Hinweistext unter dem Chart (siehe unten).
+    kauefe_im_zeitraum = [
+        k for k in kauefe
+        if df["Date"].min() <= pd.Timestamp(k["datum"]) <= df["Date"].max()
+    ]
+    if kauefe_im_zeitraum:
         fig.add_trace(go.Scatter(
-            x=[k["datum"] for k in kauefe],
-            y=[k["price"] for k in kauefe],
+            x=[k["datum"] for k in kauefe_im_zeitraum],
+            y=[k["price"] for k in kauefe_im_zeitraum],
             mode="markers", name="Käufe",
             marker=dict(symbol="triangle-up", size=13, color="gold",
                         line=dict(color="#b45309", width=1)),
-            customdata=[[k["quantity"]] for k in kauefe],
+            customdata=[[k["quantity"]] for k in kauefe_im_zeitraum],
             hovertemplate="Kauf: %{x|%d.%m.%Y} @ %{y:.2f} € (%{customdata[0]:.0f} Stk)<extra></extra>",
         ))
 
@@ -234,10 +242,14 @@ def _positions_chart(pos: dict):
     ))
 
     fig.update_layout(
+        width=None,  # keine feste Breite – Chart skaliert immer auf volle Container-Breite
         height=380, margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
         hovermode="closest",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb",
     )
+    # X-Achse fix auf den geladenen Zeitraum begrenzen, damit außerhalb liegende
+    # Kauf-Pins (siehe oben) die Achse nicht sprengen können.
+    fig.update_xaxes(range=[df["Date"].min(), df["Date"].max()])
     fig.update_yaxes(title_text="Kurs in €")
     # Einstiegspreis immer im sichtbaren Bereich halten – auch wenn er weit außerhalb
     # der Kursspanne des gewählten Zeitraums liegt.
@@ -245,7 +257,7 @@ def _positions_chart(pos: dict):
         y_min = min(df["Close"].min(), avg_buy_price_eur) * 0.95
         y_max = max(df["Close"].max(), avg_buy_price_eur) * 1.05
         fig.update_yaxes(range=[y_min, y_max])
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
 
     # Info-Zeile unter dem Chart
     pnl = pos.get("unrealized_pnl") or 0.0
@@ -258,9 +270,16 @@ def _positions_chart(pos: dict):
         + (f" ({'+' if (pnl_pct_pos or 0) >= 0 else ''}{fmt_zahl(pnl_pct_pos, 1)}%)"
            if pnl_pct_pos is not None else ""),
     ]
-    if kauefe:
+    # Erster Kauf liegt außerhalb des gewählten Zeitraums → kein Pin im Chart
+    # (siehe oben), stattdessen expliziter Hinweis statt der normalen Zeile.
+    if kauefe and not kauf_vor_zeitraum:
         info_teile.append(f"📅 Erster Kauf: {kauefe[0]['datum']:%d.%m.%Y}")
     st.caption(" | ".join(info_teile))
+    if kauefe and kauf_vor_zeitraum:
+        st.caption(
+            f"📍 Erster Kauf: {kauefe[0]['datum']:%d.%m.%Y} – "
+            f"liegt vor dem gewählten Zeitraum"
+        )
 
 
 def _tabellen_safe(fn):
