@@ -10,12 +10,19 @@ vollständigen React-Umstellung weiterläuft. Port 8503.
 
 import os
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 
 import portfolio as portfolio_module
@@ -29,6 +36,7 @@ from database import (
     get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
+    decrypt_field,
 )
 
 # Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
@@ -36,12 +44,125 @@ from database import (
 init_db()
 
 app = FastAPI(title="Portfolio-OS API")
+
+# CORS einschränken (nur eigene Domain + lokaler Dev-Betrieb).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        "https://portfolio.diestraesschens.de",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# ─────────────────────────────────────────────
+# SSRF-SCHUTZ (Allowlist für vom Server aus angesteuerte externe Domains)
+# ─────────────────────────────────────────────
+ALLOWED_DOMAINS = [
+    "api.alpaca.markets",
+    "paper-api.alpaca.markets",
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+    "api.anthropic.com",
+]
+
+
+def validate_external_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return any(parsed.netloc.endswith(d) for d in ALLOWED_DOMAINS)
+
+
+# ─────────────────────────────────────────────
+# AUTH (JWT)
+# ─────────────────────────────────────────────
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY nicht gesetzt!")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Nicht autorisiert",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        raw_sub = payload.get("sub")
+        if raw_sub is None:
+            raise credentials_exception
+        user_id = int(raw_sub)
+    except (JWTError, ValueError):
+        raise credentials_exception
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(id=user_id).first()
+        if not user:
+            raise credentials_exception
+        return user
+
+
+@app.post("/api/auth/login")
+@limiter.limit("5/minute")
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(email=form_data.username).first()
+        if not user or not user.password_hash:
+            raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch")
+        if not verify_password(form_data.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch")
+        user.last_login = datetime.utcnow()
+        session.commit()
+        token = create_access_token({"sub": str(user.id)})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user": {"id": user.id, "name": user.name, "email": user.email, "rolle": user.rolle},
+        }
+
+
+@app.get("/api/auth/me")
+async def get_me(current_user=Depends(get_current_user)):
+    return {
+        "id": current_user.id, "name": current_user.name,
+        "email": current_user.email, "rolle": current_user.rolle,
+    }
+
+
+@app.post("/api/auth/refresh")
+async def refresh_token(current_user=Depends(get_current_user)):
+    token = create_access_token({"sub": str(current_user.id)})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
+# Router-weite Dependency erzwingt ein gültiges JWT für JEDEN Endpoint darunter,
+# ohne dass jede einzelne Funktionssignatur angepasst werden muss. Nur
+# /api/auth/* (oben) und /api/health (unten) bleiben öffentlich auf `app`.
+protected = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 KATEGORIEN = [
@@ -94,7 +215,7 @@ def _user_or_404(user_id: int) -> PosUser:
 # USERS
 # ─────────────────────────────────────────────
 
-@app.get("/api/users")
+@protected.get("/api/users")
 def list_users():
     with get_session() as session:
         return [
@@ -103,7 +224,7 @@ def list_users():
         ]
 
 
-@app.post("/api/users")
+@protected.post("/api/users")
 def create_user(payload: dict):
     with get_session() as session:
         user = get_or_create_user(
@@ -112,7 +233,7 @@ def create_user(payload: dict):
         return {"id": user.id}
 
 
-@app.put("/api/users/{user_id}")
+@protected.put("/api/users/{user_id}")
 def update_user(user_id: int, payload: dict):
     with get_session() as session:
         user = session.get(PosUser, user_id)
@@ -131,7 +252,7 @@ def update_user(user_id: int, payload: dict):
 # ÜBERSICHT
 # ─────────────────────────────────────────────
 
-@app.get("/api/overview")
+@protected.get("/api/overview")
 def overview(user_id: Optional[int] = None, family: bool = False):
     """family=true aggregiert über alle Nutzer (Trading-Bot-Wert wird dabei nur
     EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring)."""
@@ -185,7 +306,7 @@ def overview(user_id: Optional[int] = None, family: bool = False):
 # POSITIONEN
 # ─────────────────────────────────────────────
 
-@app.get("/api/positions")
+@protected.get("/api/positions")
 def positions(user_id: int):
     _user_or_404(user_id)
     depot = portfolio_module.get_positions(user_id)
@@ -193,13 +314,13 @@ def positions(user_id: int):
     return {"depot": depot, "bot": bot_detail}
 
 
-@app.post("/api/positions/refresh-prices")
+@protected.post("/api/positions/refresh-prices")
 def refresh_prices():
     n = portfolio_module.update_prices()
     return {"aktualisiert": n}
 
 
-@app.put("/api/positions/{position_id}")
+@protected.put("/api/positions/{position_id}")
 def edit_position(position_id: int, payload: dict):
     asset_class_id = payload.get("asset_class_id")
     portfolio_module.update_position(
@@ -213,13 +334,13 @@ def edit_position(position_id: int, payload: dict):
     return {"ok": True}
 
 
-@app.delete("/api/positions/{position_id}")
+@protected.delete("/api/positions/{position_id}")
 def remove_position(position_id: int):
     portfolio_module.delete_position(position_id)
     return {"ok": True}
 
 
-@app.get("/api/positions/{position_id}/transactions")
+@protected.get("/api/positions/{position_id}/transactions")
 def position_transactions(position_id: int):
     """Kauf-/Verkaufshistorie einer Position – für die Kauf-Pins im Chart (Positionen-Tab)."""
     with get_session() as session:
@@ -233,7 +354,7 @@ def position_transactions(position_id: int):
         ]
 
 
-@app.get("/api/chart/{ticker}")
+@protected.get("/api/chart/{ticker}")
 def get_chart(ticker: str, period: str = "2y"):
     """
     Kursverlauf für den Positions-Chart. Rechnet auf EUR um (GBp-Notierung
@@ -269,7 +390,7 @@ def get_chart(ticker: str, period: str = "2y"):
         return {"dates": [], "prices": [], "currency": "EUR", "verfuegbar": False}
 
 
-@app.get("/api/tax-preview")
+@protected.get("/api/tax-preview")
 def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float] = None):
     return tax_engine.get_tax_preview(position_id, verkauf_preis, quantity)
 
@@ -278,7 +399,7 @@ def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float
 # STEUER
 # ─────────────────────────────────────────────
 
-@app.get("/api/tax")
+@protected.get("/api/tax")
 def tax(user_id: int):
     _user_or_404(user_id)
     return {
@@ -288,13 +409,13 @@ def tax(user_id: int):
     }
 
 
-@app.get("/api/tax/jahresuebersicht")
+@protected.get("/api/tax/jahresuebersicht")
 def tax_jahresuebersicht(user_id: int, jahr: int):
     _user_or_404(user_id)
     return tax_engine.generate_jahresuebersicht_detail(user_id, jahr)
 
 
-@app.get("/api/tax/config")
+@protected.get("/api/tax/config")
 def get_tax_config(user_id: int):
     _user_or_404(user_id)
     with get_session() as session:
@@ -313,7 +434,7 @@ def get_tax_config(user_id: int):
         }
 
 
-@app.put("/api/tax/config")
+@protected.put("/api/tax/config")
 def update_tax_config(payload: dict):
     user_id = payload["user_id"]
     _user_or_404(user_id)
@@ -336,7 +457,7 @@ def update_tax_config(payload: dict):
 # REBALANCING
 # ─────────────────────────────────────────────
 
-@app.get("/api/rebalancing/analysis")
+@protected.get("/api/rebalancing/analysis")
 def rebalancing_analysis(user_id: int):
     """
     Mathematischer Ist/Soll-Abgleich (pos_target_weights vs. aktuelles Portfolio)
@@ -360,14 +481,14 @@ def rebalancing_analysis(user_id: int):
 # TRADING BOT
 # ─────────────────────────────────────────────
 
-@app.get("/api/trading-bot")
+@protected.get("/api/trading-bot")
 def trading_bot_overview():
     account = trading_bot_connector.get_bot_account_value_eur()
     config = trading_bot_connector.get_bot_config_all()
     return {"account": account, "config": config}
 
 
-@app.get("/api/trading-bot/performance")
+@protected.get("/api/trading-bot/performance")
 def trading_bot_performance():
     try:
         with engine.connect() as conn:
@@ -383,7 +504,7 @@ def trading_bot_performance():
         return []
 
 
-@app.get("/api/trading-bot/trades")
+@protected.get("/api/trading-bot/trades")
 def trading_bot_trades(limit: int = 100):
     try:
         with engine.connect() as conn:
@@ -399,7 +520,7 @@ def trading_bot_trades(limit: int = 100):
         return []
 
 
-@app.get("/api/scan-log")
+@protected.get("/api/scan-log")
 def get_scan_log(limit: int = 100, ticker: str = None):
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -429,7 +550,7 @@ def get_scan_log(limit: int = 100, ticker: str = None):
     return list(scans.values())
 
 
-@app.get("/api/scan-log/latest")
+@protected.get("/api/scan-log/latest")
 def get_latest_scan():
     with engine.connect() as conn:
         result = conn.execute(text("""
@@ -451,24 +572,24 @@ def get_latest_scan():
     return dict(result._mapping)
 
 
-@app.put("/api/trading-bot/config")
+@protected.put("/api/trading-bot/config")
 def update_trading_bot_config(werte: dict):
     trading_bot_connector.set_bot_config(werte)
     return trading_bot_connector.get_bot_config_all()
 
 
-@app.get("/api/bot-config")
+@protected.get("/api/bot-config")
 def bot_config():
     return trading_bot_connector.get_bot_config_all()
 
 
-@app.put("/api/bot-config/{key}")
+@protected.put("/api/bot-config/{key}")
 def update_bot_config_key(key: str, payload: dict):
     trading_bot_connector.set_bot_config({key: payload["value"]})
     return trading_bot_connector.get_bot_config_all()
 
 
-@app.get("/api/settings/monitoring-interval")
+@protected.get("/api/settings/monitoring-interval")
 def get_monitoring_interval():
     """
     Gemeinsames Update-Intervall (Minuten) für Trading-Bot-SL/TP-Monitoring
@@ -478,7 +599,7 @@ def get_monitoring_interval():
     return {"monitoring_interval_min": int(cfg.get("MONITORING_INTERVAL_MIN", 15))}
 
 
-@app.put("/api/settings/monitoring-interval")
+@protected.put("/api/settings/monitoring-interval")
 def set_monitoring_interval(payload: dict):
     minuten = int(payload["monitoring_interval_min"])
     trading_bot_connector.set_bot_config({"MONITORING_INTERVAL_MIN": minuten})
@@ -489,12 +610,12 @@ def set_monitoring_interval(payload: dict):
 # EINSTIEGSZEITPUNKTE (Entry-Time-Slots)
 # ─────────────────────────────────────────────
 
-@app.get("/api/entry-time-slots")
+@protected.get("/api/entry-time-slots")
 def entry_time_slots():
     return trading_bot_connector.get_entry_time_slots()
 
 
-@app.put("/api/entry-time-slots/{slot_id}")
+@protected.put("/api/entry-time-slots/{slot_id}")
 def update_entry_time_slot(slot_id: int, payload: dict):
     trading_bot_connector.update_entry_time_slot(
         slot_id, payload.get("gewichtung"), payload.get("aktiv")
@@ -502,12 +623,12 @@ def update_entry_time_slot(slot_id: int, payload: dict):
     return {"ok": True}
 
 
-@app.get("/api/entry-time-proposal")
+@protected.get("/api/entry-time-proposal")
 def entry_time_proposal():
     return trading_bot_connector.get_pending_entry_proposal()
 
 
-@app.post("/api/entry-time-proposal/confirm")
+@protected.post("/api/entry-time-proposal/confirm")
 def confirm_entry_time_proposal(payload: dict):
     proposal = trading_bot_connector.get_pending_entry_proposal()
     if not proposal:
@@ -519,7 +640,7 @@ def confirm_entry_time_proposal(payload: dict):
     return {"ok": True, "lernmodus": lernmodus}
 
 
-@app.post("/api/entry-time-proposal/reject")
+@protected.post("/api/entry-time-proposal/reject")
 def reject_entry_time_proposal():
     trading_bot_connector.clear_pending_entry_proposal("rejected")
     return {"ok": True}
@@ -529,7 +650,7 @@ def reject_entry_time_proposal():
 # IMMOBILIE
 # ─────────────────────────────────────────────
 
-@app.get("/api/real-estate")
+@protected.get("/api/real-estate")
 def real_estate(user_id: int):
     _user_or_404(user_id)
     with get_session() as session:
@@ -543,7 +664,7 @@ def real_estate(user_id: int):
             )
             result.append({
                 "id": im.id,
-                "adresse": im.adresse,
+                "adresse": decrypt_field(im.adresse),
                 "kaufpreis_gesamt": im.kaufpreis_gesamt,
                 "kaufjahr": im.kaufjahr,
                 "letzter_schaetzwert": im.letzter_schaetzwert,
@@ -561,7 +682,7 @@ def real_estate(user_id: int):
 _REAL_ESTATE_DATE_FIELDS = ("kaufdatum", "vermietung_start", "zinsbindung_bis")
 
 
-@app.post("/api/real-estate")
+@protected.post("/api/real-estate")
 def create_real_estate(payload: dict):
     from database import save_real_estate
     user_id = payload.pop("user_id")
@@ -572,7 +693,7 @@ def create_real_estate(payload: dict):
     return {"id": real_estate_id}
 
 
-@app.delete("/api/real-estate/{real_estate_id}")
+@protected.delete("/api/real-estate/{real_estate_id}")
 def remove_real_estate(real_estate_id: int):
     from database import delete_real_estate
     delete_real_estate(real_estate_id)
@@ -583,7 +704,7 @@ def remove_real_estate(real_estate_id: int):
 # FAMILIE
 # ─────────────────────────────────────────────
 
-@app.get("/api/family")
+@protected.get("/api/family")
 def family():
     with get_session() as session:
         depots = [
@@ -604,7 +725,7 @@ def family():
 # HAUSHALTSBUCH
 # ─────────────────────────────────────────────
 
-@app.get("/api/haushaltsbuch")
+@protected.get("/api/haushaltsbuch")
 def haushaltsbuch(user_id: int):
     _user_or_404(user_id)
     with get_session() as session:
@@ -622,7 +743,7 @@ def haushaltsbuch(user_id: int):
     }
 
 
-@app.put("/api/haushaltsbuch/{buchung_id}")
+@protected.put("/api/haushaltsbuch/{buchung_id}")
 def update_buchung(buchung_id: int, payload: dict):
     with get_session() as session:
         buchung = session.get(PosBuchung, buchung_id)
@@ -637,7 +758,7 @@ def update_buchung(buchung_id: int, payload: dict):
     return {"ok": True}
 
 
-@app.post("/api/haushaltsbuch/upload")
+@protected.post("/api/haushaltsbuch/upload")
 async def haushaltsbuch_upload(user_id: int = Form(...), files: list[UploadFile] = File(...)):
     return await _kontoauszug_import(user_id, files)
 
@@ -647,7 +768,7 @@ async def haushaltsbuch_upload(user_id: int = Form(...), files: list[UploadFile]
 # Laden der Seite; Antwortzeit kann mehrere Sekunden betragen)
 # ─────────────────────────────────────────────
 
-@app.get("/api/ki-analyse/klumpenrisiko")
+@protected.get("/api/ki-analyse/klumpenrisiko")
 def klumpenrisiko(user_id: int, schwelle_pct: float = 20.0):
     """Rein rechnerische Konzentrationsprüfung (keine LLM-Latenz) – größte
     Positionen als Anteil am Gesamtwert."""
@@ -662,17 +783,17 @@ def klumpenrisiko(user_id: int, schwelle_pct: float = 20.0):
     return {"positionen": top, "warnung": any(p["anteil_pct"] > schwelle_pct for p in top)}
 
 
-@app.post("/api/ki-analyse/portfolio")
+@protected.post("/api/ki-analyse/portfolio")
 def ki_analyse_portfolio(payload: dict):
     return llm_analyst.analyze_portfolio(payload["user_id"])
 
 
-@app.post("/api/ki-analyse/quarterly-report")
+@protected.post("/api/ki-analyse/quarterly-report")
 def ki_quarterly_report(payload: dict):
     return llm_analyst.generate_quarterly_report(payload["user_id"])
 
 
-@app.post("/api/ki-analyse/ask")
+@protected.post("/api/ki-analyse/ask")
 def ki_ask(payload: dict):
     antwort = llm_analyst.answer_portfolio_question(payload["user_id"], payload["frage"])
     return {"antwort": antwort}
@@ -684,7 +805,7 @@ def ki_ask(payload: dict):
 # volle CRUD-Oberfläche des Streamlit-Tabs)
 # ─────────────────────────────────────────────
 
-@app.get("/api/portfolios")
+@protected.get("/api/portfolios")
 def list_portfolios(user_id: int):
     from database import PosPortfolio
     with get_session() as session:
@@ -694,7 +815,7 @@ def list_portfolios(user_id: int):
         ]
 
 
-@app.post("/api/portfolios")
+@protected.post("/api/portfolios")
 def create_portfolio(payload: dict):
     from database import PosPortfolio
     with get_session() as session:
@@ -707,7 +828,7 @@ def create_portfolio(payload: dict):
         return {"id": pf.id}
 
 
-@app.put("/api/portfolios/{portfolio_id}")
+@protected.put("/api/portfolios/{portfolio_id}")
 def edit_portfolio(portfolio_id: int, payload: dict):
     portfolio_module.update_portfolio(
         portfolio_id, name=payload.get("name"), typ=payload.get("typ"),
@@ -716,13 +837,13 @@ def edit_portfolio(portfolio_id: int, payload: dict):
     return {"ok": True}
 
 
-@app.delete("/api/portfolios/{portfolio_id}")
+@protected.delete("/api/portfolios/{portfolio_id}")
 def remove_portfolio(portfolio_id: int):
     portfolio_module.delete_portfolio(portfolio_id)
     return {"ok": True}
 
 
-@app.get("/api/asset-classes")
+@protected.get("/api/asset-classes")
 def list_asset_classes():
     with get_session() as session:
         return [
@@ -731,12 +852,12 @@ def list_asset_classes():
         ]
 
 
-@app.get("/api/ticker-search")
+@protected.get("/api/ticker-search")
 def ticker_search(q: str):
     return portfolio_module.resolve_ticker(q)
 
 
-@app.post("/api/transactions")
+@protected.post("/api/transactions")
 def create_transaction(payload: dict):
     datum = datetime.strptime(payload["datum"], "%Y-%m-%d").date()
     return portfolio_module.add_transaction(
@@ -746,7 +867,7 @@ def create_transaction(payload: dict):
     )
 
 
-@app.put("/api/transactions/{transaction_id}")
+@protected.put("/api/transactions/{transaction_id}")
 def edit_transaction(transaction_id: int, payload: dict):
     datum = datetime.strptime(payload["datum"], "%Y-%m-%d").date() if payload.get("datum") else None
     portfolio_module.update_transaction(
@@ -756,13 +877,13 @@ def edit_transaction(transaction_id: int, payload: dict):
     return {"ok": True}
 
 
-@app.delete("/api/transactions/{transaction_id}")
+@protected.delete("/api/transactions/{transaction_id}")
 def remove_transaction(transaction_id: int):
     portfolio_module.delete_transaction(transaction_id)
     return {"ok": True}
 
 
-@app.post("/api/depot/import-csv")
+@protected.post("/api/depot/import-csv")
 async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...), file: UploadFile = File(...)):
     """
     Importiert eine Transaktionshistorie-CSV (Comdirect/Trade Republic/ING/DKB/
@@ -783,7 +904,7 @@ async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...
         os.unlink(tmp_path)
 
 
-@app.post("/api/positions/tagesgeld")
+@protected.post("/api/positions/tagesgeld")
 def add_tagesgeld_position(payload: dict):
     """
     Legt eine Tagesgeld-Position an oder aktualisiert ihren Kontostand (siehe
@@ -797,7 +918,7 @@ def add_tagesgeld_position(payload: dict):
     )
 
 
-@app.post("/api/target-weights")
+@protected.post("/api/target-weights")
 def set_target_weight(payload: dict):
     user_id = payload["user_id"]
     asset_class_id = payload["asset_class_id"]
@@ -824,7 +945,7 @@ def set_target_weight(payload: dict):
 TARGET_WEIGHT_ASSET_CLASSES = [2, 8, 9, 10, 11, 5, 4]  # ETF, Einzelaktie, Anleihe, Gold/Rohstoff, Tagesgeld, Immobilie, Krypto
 
 
-@app.get("/api/target-weights")
+@protected.get("/api/target-weights")
 def get_target_weights(user_id: int):
     _user_or_404(user_id)
     with get_session() as session:
@@ -838,7 +959,7 @@ def get_target_weights(user_id: int):
     ]
 
 
-@app.put("/api/target-weights")
+@protected.put("/api/target-weights")
 def set_target_weights(payload: dict):
     user_id = payload["user_id"]
     weights = payload["weights"]
@@ -893,12 +1014,12 @@ async def _kontoauszug_import(user_id: int, files: list[UploadFile]) -> dict:
     return result
 
 
-@app.post("/api/kontoauszug-import")
+@protected.post("/api/kontoauszug-import")
 async def kontoauszug_import(user_id: int = Form(...), files: list[UploadFile] = File(...)):
     return await _kontoauszug_import(user_id, files)
 
 
-@app.post("/api/screenshot-import")
+@protected.post("/api/screenshot-import")
 async def screenshot_import(user_id: int = Form(...), file: UploadFile = File(...)):
     """Liest einen Portfolio-Screenshot per Claude Vision aus (siehe llm_analyst.py)
     und gibt die erkannten Positionen zur Bestätigung durch den Nutzer zurück –
@@ -916,6 +1037,9 @@ async def screenshot_import(user_id: int = Form(...), file: UploadFile = File(..
 @app.get("/api/health")
 def health():
     return {"ok": True, "warnungen": validate_config(), "base_url": BASE_URL}
+
+
+app.include_router(protected)
 
 
 if __name__ == "__main__":

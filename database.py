@@ -7,7 +7,9 @@ das Präfix "pos_", damit es keine Konflikte mit den Trading-Bot-Tabellen gibt.
 from datetime import datetime, date
 from contextlib import contextmanager
 import json
+import os
 
+from cryptography.fernet import Fernet
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean,
     DateTime, Date, Text, ForeignKey, func, JSON
@@ -17,6 +19,40 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from config import DATABASE_URL, DEFAULT_ASSET_CLASSES, FREISTELLUNGSAUFTRAG_DEFAULT
 
 Base = declarative_base()
+
+# ─────────────────────────────────────────────
+# VERSCHLÜSSELUNG SENSIBLER FELDER (z.B. pos_real_estate.adresse)
+# ─────────────────────────────────────────────
+# Ohne ENCRYPTION_KEY (z.B. lokal ohne .env) bleibt fernet None – encrypt_field/
+# decrypt_field werden dann zu No-Ops statt abzustürzen.
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
+
+
+def encrypt_field(value: str) -> str:
+    if not fernet or not value:
+        return value
+    return fernet.encrypt(value.encode()).decode()
+
+
+def decrypt_field(value: str) -> str:
+    if not fernet or not value:
+        return value
+    try:
+        return fernet.decrypt(value.encode()).decode()
+    except Exception:
+        # Vor der Verschlüsselungseinführung gespeicherte Klartext-Werte sind
+        # kein gültiges Fernet-Token – unverändert zurückgeben statt abzustürzen.
+        return value
+
+
+def sanitize_csv_field(value: str) -> str:
+    """CSV-Injection-Schutz: Felder aus Kontoauszug-/CSV-Importen (z.B. Empfänger,
+    Verwendungszweck), die später in Excel/Sheets geöffnet werden könnten, dürfen
+    nicht mit einem Formel-Trigger beginnen."""
+    if value and value[0] in ("=", "@", "+", "-", "\t", "\r"):
+        return "'" + value
+    return value
 # pool_pre_ping: verwirft tote Connections (z.B. "SSL connection has been closed
 # unexpectedly" nach DB-seitigem Idle-Timeout) vor der Nutzung statt mit ihnen
 # fehlzuschlagen. pool_recycle: ersetzt Connections vorsorglich nach 280s.
@@ -42,6 +78,10 @@ class PosUser(Base):
     email      = Column(String(200), nullable=True)
     rolle      = Column(String(20), default="member")   # admin / member
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Login (siehe Security-Layer: JWT-Auth in api.py)
+    password_hash = Column(Text, nullable=True)
+    last_login    = Column(DateTime, nullable=True)
 
     # Onboarding / Risikoprofil (siehe onboarding.py)
     onboarding_completed = Column(Boolean, default=False)
@@ -416,8 +456,17 @@ def init_db():
     _migrate_goal_columns()
     _migrate_tax_config_columns()
     _migrate_position_columns()
+    _migrate_user_columns()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_user_columns():
+    """Idempotente Migration für pos_users.password_hash/last_login (siehe _migrate_real_estate_columns)."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP"))
 
 
 def _migrate_tax_config_columns():
@@ -510,6 +559,8 @@ def save_real_estate(user_id: int, real_estate_id: int = None, **felder) -> int:
             obj = PosRealEstate(user_id=user_id)
             session.add(obj)
         for key, value in felder.items():
+            if key == "adresse" and value:
+                value = encrypt_field(value)
             setattr(obj, key, value)
         session.flush()
         return obj.id
@@ -528,6 +579,8 @@ def update_real_estate(real_estate_id: int, **kwargs):
             raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
         for key, value in kwargs.items():
             if hasattr(obj, key) and value is not None:
+                if key == "adresse":
+                    value = encrypt_field(value)
                 setattr(obj, key, value)
         session.commit()
         return obj
@@ -593,8 +646,10 @@ def save_buchungen(user_id: int, buchungen: list) -> int:
                     break
 
             session.add(PosBuchung(
-                user_id=user_id, datum=datum, betrag=betrag, empfaenger=empfaenger,
-                verwendungszweck=b.get("verwendungszweck"), kategorie=kategorie,
+                user_id=user_id, datum=datum, betrag=betrag,
+                empfaenger=sanitize_csv_field(empfaenger),
+                verwendungszweck=sanitize_csv_field((b.get("verwendungszweck") or "").strip()) or None,
+                kategorie=kategorie,
                 typ=b.get("typ"), quelle=b.get("quelle") or "kontoauszug",
             ))
             neu += 1

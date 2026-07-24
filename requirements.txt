@@ -11,3 +11,9 @@ pytz>=2024.1
 fpdf2>=2.7.9
 pypdf>=4.2.0
 pdf2image>=1.17.0
+bcrypt==4.0.1
+python-jose[cryptography]>=3.3.0
+passlib>=1.7.4
+slowapi>=0.1.9
+cryptography>=42.0.0
+python-multipart>=0.0.9
