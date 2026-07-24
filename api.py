@@ -399,6 +399,58 @@ def trading_bot_trades(limit: int = 100):
         return []
 
 
+@app.get("/api/scan-log")
+def get_scan_log(limit: int = 100, ticker: str = None):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                id, scan_time, slot_et, ticker, score,
+                approved, instrument_type, current_price,
+                rsi, rsi_score, sma_score, volume_score,
+                pe_score, de_score, rev_score,
+                ko_reason, guardrail_reason,
+                trade_executed, trade_id, mode
+            FROM scan_log
+            WHERE (:ticker IS NULL OR ticker = :ticker)
+            ORDER BY scan_time DESC
+            LIMIT :limit
+        """), {"ticker": ticker, "limit": limit}).fetchall()
+
+        rows = [dict(r._mapping) for r in rows]
+
+    # Scan-Zeitpunkte gruppieren
+    scans = {}
+    for row in rows:
+        key = row["scan_time"].strftime("%Y-%m-%d %H:%M") if row["scan_time"] else "?"
+        if key not in scans:
+            scans[key] = {"time": key, "slot": row["slot_et"], "tickers": []}
+        scans[key]["tickers"].append(row)
+
+    return list(scans.values())
+
+
+@app.get("/api/scan-log/latest")
+def get_latest_scan():
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT scan_time, slot_et,
+                   COUNT(*) as total_scanned,
+                   SUM(CASE WHEN approved THEN 1 ELSE 0 END) as approved_count,
+                   SUM(CASE WHEN trade_executed THEN 1 ELSE 0 END) as trades_executed,
+                   MAX(score) as max_score,
+                   MIN(score) as min_score,
+                   AVG(score) as avg_score
+            FROM scan_log
+            WHERE scan_time = (SELECT MAX(scan_time) FROM scan_log)
+            GROUP BY scan_time, slot_et
+        """)).fetchone()
+
+    if not result:
+        return {"message": "Noch keine Scans vorhanden"}
+
+    return dict(result._mapping)
+
+
 @app.put("/api/trading-bot/config")
 def update_trading_bot_config(werte: dict):
     trading_bot_connector.set_bot_config(werte)
