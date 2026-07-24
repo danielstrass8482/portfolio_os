@@ -214,6 +214,7 @@ class PosTaxConfig(Base):
     freistellungsauftrag  = Column(Float, default=FREISTELLUNGSAUFTRAG_DEFAULT)
     freistellungsgenutzt  = Column(Float, default=0.0)
     verlusttopf_vorjahr   = Column(Float, default=0.0)
+    grenzsteuersatz       = Column(Float, default=0.42)  # für AfA-Berechnung bei Immobilien
 
     def __repr__(self):
         return f"<PosTaxConfig user_id={self.user_id}>"
@@ -411,8 +412,18 @@ def init_db():
     Base.metadata.create_all(engine)
     _migrate_real_estate_columns()
     _migrate_goal_columns()
+    _migrate_tax_config_columns()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_tax_config_columns():
+    """Idempotente Migration für pos_tax_config.grenzsteuersatz (siehe _migrate_real_estate_columns)."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE pos_tax_config ADD COLUMN IF NOT EXISTS grenzsteuersatz FLOAT DEFAULT 0.42"
+        ))
 
 
 def _migrate_goal_columns():

@@ -289,3 +289,32 @@ def generate_jahresuebersicht(user_id: int, jahr: int) -> dict:
 # Rückwärtskompatibler Alias für den in der Spezifikation genannten Funktionsnamen
 # (Nicht-ASCII-Funktionsnamen sind in Python zwar erlaubt, aber unüblich für Imports).
 generate_jahresübersicht = generate_jahresuebersicht
+
+
+def generate_jahresuebersicht_detail(user_id: int, jahr: int) -> dict:
+    """
+    Erweiterte Jahresübersicht für den Steuer-Tab: trennt realisierte
+    Gewinne/Verluste (aus Verkäufen) von Dividenden/Ausschüttungen, da beide
+    als PosTaxEvent gespeichert werden, aber unterschiedliche Zeilen in der
+    Anzeige sind. Quellensteuer auf ausländische Dividenden wird vom System
+    nicht separat erfasst (kein eigenes Feld) – wird daher mit 0€ ausgewiesen
+    statt geschätzt.
+    """
+    basis = generate_jahresuebersicht(user_id, jahr)
+    with get_session() as session:
+        events = session.query(PosTaxEvent).filter_by(user_id=user_id).all()
+        div_events = [
+            e for e in events
+            if e.datum and e.datum.year == jahr and e.transaction and e.transaction.typ == "dividende"
+        ]
+        dividenden = sum(e.gewinn_verlust for e in div_events)
+        steuer_dividenden = sum(e.steuer_betrag for e in div_events)
+
+    basis["dividenden_ausschuettungen"] = dividenden
+    basis["quellensteuer_gezahlt"] = 0.0
+    basis["steuer_auf_dividenden"] = steuer_dividenden
+    basis["abgeltungssteuer_gesamt"] = basis["steuer_gezahlt"]
+    basis["freistellung_verbleibend"] = max(
+        0.0, basis["freistellungsauftrag"] - basis["freistellung_genutzt_aktuell"]
+    )
+    return basis

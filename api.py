@@ -22,12 +22,16 @@ import rebalancing
 import trading_bot_connector
 import llm_analyst
 import kontoauszug_analyzer
-from config import validate_config, BASE_URL
+from config import validate_config, BASE_URL, FREISTELLUNGSAUFTRAG_DEFAULT
 from database import (
-    get_session, engine, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
+    get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
-    PosTargetWeight, get_or_create_user, save_buchungen, add_kategorisierungsregel,
+    PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
 )
+
+# Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
+# Services (dashboard.py/main.py) noch nicht neugestartet wurden.
+init_db()
 
 app = FastAPI(title="Portfolio-OS API")
 app.add_middleware(
@@ -213,6 +217,56 @@ def remove_position(position_id: int):
     return {"ok": True}
 
 
+@app.get("/api/positions/{position_id}/transactions")
+def position_transactions(position_id: int):
+    """Kauf-/Verkaufshistorie einer Position – für die Kauf-Pins im Chart (Positionen-Tab)."""
+    with get_session() as session:
+        txs = (
+            session.query(PosTransaction).filter_by(position_id=position_id)
+            .order_by(PosTransaction.datum.asc()).all()
+        )
+        return [
+            {"id": t.id, "typ": t.typ, "datum": str(t.datum), "quantity": t.quantity, "price": t.price}
+            for t in txs
+        ]
+
+
+@app.get("/api/chart/{ticker}")
+def get_chart(ticker: str, period: str = "2y"):
+    """
+    Kursverlauf für den Positions-Chart. Rechnet auf EUR um (GBp-Notierung
+    /100 + FX, USD-Notierung / FX) – degraded mode (leere Liste) statt Absturz
+    bei ungültigem Ticker oder yfinance-Ausfall.
+    """
+    try:
+        df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False)
+        prices = df["Close"]
+        if hasattr(prices, "columns"):  # manche yfinance-Versionen liefern hier ein DataFrame
+            prices = prices.iloc[:, 0]
+        prices = prices.dropna()
+        if prices.empty:
+            return {"dates": [], "prices": [], "currency": "EUR", "verfuegbar": False}
+
+        info = yf.Ticker(ticker).info
+        currency = info.get("currency") or "EUR"
+        if currency == "GBp":
+            fx = yf.Ticker("GBPEUR=X").info.get("regularMarketPrice") or 1.18
+            prices = prices / 100 * fx
+        elif currency == "USD":
+            fx = yf.Ticker("EURUSD=X").info.get("regularMarketPrice") or 1.08
+            prices = prices / fx
+
+        return {
+            "dates": prices.index.strftime("%Y-%m-%d").tolist(),
+            "prices": prices.round(2).tolist(),
+            "currency": "EUR",
+            "verfuegbar": True,
+        }
+    except Exception as e:
+        print(f"⚠️  Chart für {ticker} nicht verfügbar: {e} (degraded mode)")
+        return {"dates": [], "prices": [], "currency": "EUR", "verfuegbar": False}
+
+
 @app.get("/api/tax-preview")
 def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float] = None):
     return tax_engine.get_tax_preview(position_id, verkauf_preis, quantity)
@@ -229,6 +283,74 @@ def tax(user_id: int):
         "freistellung_rest": tax_engine.get_remaining_freistellung(user_id),
         "harvesting": tax_engine.find_tax_loss_harvesting(user_id),
         "jahresuebersicht": tax_engine.generate_jahresuebersicht(user_id, date.today().year),
+    }
+
+
+@app.get("/api/tax/jahresuebersicht")
+def tax_jahresuebersicht(user_id: int, jahr: int):
+    _user_or_404(user_id)
+    return tax_engine.generate_jahresuebersicht_detail(user_id, jahr)
+
+
+@app.get("/api/tax/config")
+def get_tax_config(user_id: int):
+    _user_or_404(user_id)
+    with get_session() as session:
+        cfg = session.query(PosTaxConfig).filter_by(user_id=user_id).first()
+        if not cfg:
+            return {
+                "freistellungsauftrag": FREISTELLUNGSAUFTRAG_DEFAULT, "freistellungsgenutzt": 0.0,
+                "kirchensteuer": False, "verlusttopf_vorjahr": 0.0, "grenzsteuersatz": 0.42,
+            }
+        return {
+            "freistellungsauftrag": cfg.freistellungsauftrag,
+            "freistellungsgenutzt": cfg.freistellungsgenutzt,
+            "kirchensteuer": cfg.kirchensteuer,
+            "verlusttopf_vorjahr": cfg.verlusttopf_vorjahr,
+            "grenzsteuersatz": cfg.grenzsteuersatz,
+        }
+
+
+@app.put("/api/tax/config")
+def update_tax_config(payload: dict):
+    user_id = payload["user_id"]
+    _user_or_404(user_id)
+    erlaubte_felder = {
+        "freistellungsauftrag", "freistellungsgenutzt", "kirchensteuer",
+        "verlusttopf_vorjahr", "grenzsteuersatz",
+    }
+    with get_session() as session:
+        cfg = session.query(PosTaxConfig).filter_by(user_id=user_id).first()
+        if not cfg:
+            cfg = PosTaxConfig(user_id=user_id)
+            session.add(cfg)
+        for key, value in payload.items():
+            if key in erlaubte_felder:
+                setattr(cfg, key, value)
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────
+# REBALANCING
+# ─────────────────────────────────────────────
+
+@app.get("/api/rebalancing/analysis")
+def rebalancing_analysis(user_id: int):
+    """
+    Mathematischer Ist/Soll-Abgleich (pos_target_weights vs. aktuelles Portfolio)
+    – siehe rebalancing.py Modulkommentar: reine Berechnung, keine Kauf-/
+    Verkaufsempfehlung, jede Order platziert der Nutzer selbst beim Broker.
+    """
+    _user_or_404(user_id)
+    with get_session() as session:
+        user = session.get(PosUser, user_id)
+        sparrate = user.monatliche_sparrate or 0.0
+
+    return {
+        "deviations": rebalancing.calculate_deviations(user_id),
+        "sparrate": sparrate,
+        "sparrate_empfehlung": rebalancing.get_sparrate_empfehlung(user_id, sparrate) if sparrate > 0 else [],
+        "vollrebalancing": rebalancing.get_full_rebalance_orders(user_id),
     }
 
 
