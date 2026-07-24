@@ -17,7 +17,10 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from config import DATABASE_URL, DEFAULT_ASSET_CLASSES, FREISTELLUNGSAUFTRAG_DEFAULT
 
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False)
+# pool_pre_ping: verwirft tote Connections (z.B. "SSL connection has been closed
+# unexpectedly" nach DB-seitigem Idle-Timeout) vor der Nutzung statt mit ihnen
+# fehlzuschlagen. pool_recycle: ersetzt Connections vorsorglich nach 280s.
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True, pool_recycle=280)
 # expire_on_commit=False: geladene Attribute bleiben nach commit()/close() im
 # Objekt gecacht statt sich zu "expiren" – verhindert DetachedInstanceError,
 # wenn ORM-Objekte (z.B. im Dashboard) außerhalb ihres "with get_session()"-Blocks
