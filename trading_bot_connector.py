@@ -13,6 +13,9 @@ deshalb nach EUR umgerechnet. Bei jedem Fehler (Tabelle fehlt, DB nicht
 erreichbar, kein Snapshot vorhanden): degraded mode, 0.0 statt Absturz.
 """
 
+import json
+from datetime import datetime
+
 import yfinance as yf
 from sqlalchemy import text
 
@@ -217,3 +220,114 @@ def set_bot_config(werte: dict) -> None:
                 ON CONFLICT (key) DO UPDATE
                     SET value = EXCLUDED.value, updated_at = NOW()
             """), {"k": key, "v": str(value)})
+
+
+# ─────────────────────────────────────────────
+# ENTRY-TIME-SLOTS (Feature 2/3/4/5)
+# ─────────────────────────────────────────────
+# Kein Cross-Service-Import möglich (separates Repo/Prozess, siehe Modul-
+# kommentar oben) – daher raw SQL gegen dieselbe Tabelle, die trading_bot/
+# database.py (EntryTimeSlot) über SQLAlchemy verwaltet.
+
+def get_entry_time_slots() -> list[dict]:
+    """Alle Zeitslots mit Performance-Daten (aktiv + inaktiv), sortiert nach Uhrzeit."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, stunde_et, minute_et, gewichtung, avg_pnl, trefferquote,
+                       anzahl_trades, quelle, aktiv, vom_nutzer_bestaetigt
+                FROM entry_time_slots
+                ORDER BY stunde_et, minute_et
+            """)).fetchall()
+        return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        print(f"⚠️  Entry-Time-Slots nicht lesbar: {e} (leer angenommen, degraded mode)")
+        return []
+
+
+def update_entry_time_slot(slot_id: int, gewichtung: float | None, aktiv: bool | None) -> None:
+    """Manuelle Nutzer-Anpassung eines einzelnen Slots (Gewichtung und/oder Aktiv-Status)."""
+    sets, params = ["quelle = 'manuell'", "vom_nutzer_bestaetigt = TRUE", "updated_at = NOW()"], {"id": slot_id}
+    if gewichtung is not None:
+        sets.append("gewichtung = :gewichtung")
+        params["gewichtung"] = gewichtung
+    if aktiv is not None:
+        sets.append("aktiv = :aktiv")
+        params["aktiv"] = aktiv
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE entry_time_slots SET {', '.join(sets)} WHERE id = :id"), params)
+
+
+def _parse_slot_time(slot_str: str) -> tuple[int, int]:
+    stunde, minute = slot_str.split(":")
+    return int(stunde), int(minute)
+
+
+def apply_entry_time_proposal(vorschlaege: list[dict]) -> None:
+    """
+    Wendet Backlook-Zeitpunkt-Vorschläge auf entry_time_slots an – Pendant zur
+    gleichnamigen ORM-Funktion in trading_bot/database.py (dort für den
+    automatischen Lernmodus-Apply, hier für die manuelle Bestätigung über das
+    Dashboard, siehe POST /api/entry-time-proposal/confirm).
+    """
+    with engine.begin() as conn:
+        for v in vorschlaege:
+            stunde, minute = _parse_slot_time(v["slot"])
+            aktion = v["aktion"]
+
+            if aktion == "deaktivieren":
+                conn.execute(text(
+                    "UPDATE entry_time_slots SET aktiv = FALSE, updated_at = NOW() "
+                    "WHERE stunde_et = :h AND minute_et = :m"
+                ), {"h": stunde, "m": minute})
+            elif aktion == "gewichtung_reduzieren":
+                conn.execute(text(
+                    "UPDATE entry_time_slots SET gewichtung = GREATEST(gewichtung * 0.5, 0.1), updated_at = NOW() "
+                    "WHERE stunde_et = :h AND minute_et = :m"
+                ), {"h": stunde, "m": minute})
+            elif aktion == "gewichtung_erhoehen":
+                conn.execute(text(
+                    "UPDATE entry_time_slots SET gewichtung = :g, updated_at = NOW() "
+                    "WHERE stunde_et = :h AND minute_et = :m"
+                ), {"g": v["neu"]["gewichtung"], "h": stunde, "m": minute})
+            elif aktion == "neuen_slot_hinzufuegen":
+                exists = conn.execute(text(
+                    "SELECT 1 FROM entry_time_slots WHERE stunde_et = :h AND minute_et = :m"
+                ), {"h": stunde, "m": minute}).fetchone()
+                if exists:
+                    conn.execute(text(
+                        "UPDATE entry_time_slots SET aktiv = TRUE, gewichtung = :g, updated_at = NOW() "
+                        "WHERE stunde_et = :h AND minute_et = :m"
+                    ), {"g": v["neu"]["gewichtung"], "h": stunde, "m": minute})
+                else:
+                    conn.execute(text(
+                        "INSERT INTO entry_time_slots (stunde_et, minute_et, gewichtung, quelle, aktiv) "
+                        "VALUES (:h, :m, :g, 'backlook', TRUE)"
+                    ), {"h": stunde, "m": minute, "g": v["neu"]["gewichtung"]})
+
+
+def get_pending_entry_proposal() -> dict | None:
+    """Aktueller Backlook-Zeitpunkt-Vorschlag aus bot_state (key 'pending_entry_proposal')."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT value FROM bot_state WHERE key = 'pending_entry_proposal'"
+            )).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(row[0])
+    except Exception as e:
+        print(f"⚠️  Entry-Time-Proposal nicht lesbar: {e}")
+        return None
+
+
+def clear_pending_entry_proposal(action: str, lernmodus: bool = False) -> None:
+    """Löscht den pending_entry_proposal-Eintrag und protokolliert die Nutzer-Entscheidung
+    (Bestätigung/Ablehnung inkl. Zeitstempel, siehe Feature 4)."""
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM bot_state WHERE key = 'pending_entry_proposal'"))
+        log = json.dumps({"action": action, "lernmodus": lernmodus, "at": datetime.utcnow().isoformat()})
+        conn.execute(text("""
+            INSERT INTO bot_state (key, value) VALUES ('entry_proposal_last_action', :v)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """), {"v": log})

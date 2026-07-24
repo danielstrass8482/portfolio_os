@@ -20,6 +20,7 @@ from config import (
 from database import init_db, get_session, PosUser, save_daily_snapshot
 import portfolio as portfolio_module
 import notifier
+import trading_bot_connector
 
 
 def _alle_user_ids() -> list:
@@ -105,17 +106,22 @@ def main():
     et_tz = pytz.timezone("America/New_York")
     scheduler = BlockingScheduler(timezone=tz)
 
+    # Gemeinsames Intervall mit dem Trading-Bot-SL/TP-Monitoring (siehe
+    # bot_config.MONITORING_INTERVAL_MIN, in Verwaltung.tsx unter "Update-Intervall"
+    # konfigurierbar) statt hardcoded 15 Minuten.
+    monitoring_interval = int(trading_bot_connector.get_bot_config_all().get("MONITORING_INTERVAL_MIN", 15))
+
     scheduler.add_job(daily_job, CronTrigger(hour=DAILY_UPDATE_HOUR, minute=0, timezone=tz), id="daily_job")
     scheduler.add_job(
         update_all_prices,
         CronTrigger(
             hour="9-16",
-            minute="*/15",
+            minute=f"*/{monitoring_interval}",
             day_of_week="mon-fri",
             timezone=et_tz,
         ),
         id="price_update",
-        name="Preise alle 15 Min aktualisieren",
+        name=f"Preise alle {monitoring_interval} Min aktualisieren",
         replace_existing=True,
     )
     scheduler.add_job(weekly_job, CronTrigger(day_of_week="mon", hour=WEEKLY_SUMMARY_HOUR, minute=0, timezone=tz), id="weekly_job")

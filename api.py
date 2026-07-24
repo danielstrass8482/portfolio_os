@@ -414,6 +414,63 @@ def update_bot_config_key(key: str, payload: dict):
     return trading_bot_connector.get_bot_config_all()
 
 
+@app.get("/api/settings/monitoring-interval")
+def get_monitoring_interval():
+    """
+    Gemeinsames Update-Intervall (Minuten) für Trading-Bot-SL/TP-Monitoring
+    UND Portfolio-Preisupdate – ein Wert, ein Key (bot_config.MONITORING_INTERVAL_MIN).
+    """
+    cfg = trading_bot_connector.get_bot_config_all()
+    return {"monitoring_interval_min": int(cfg.get("MONITORING_INTERVAL_MIN", 15))}
+
+
+@app.put("/api/settings/monitoring-interval")
+def set_monitoring_interval(payload: dict):
+    minuten = int(payload["monitoring_interval_min"])
+    trading_bot_connector.set_bot_config({"MONITORING_INTERVAL_MIN": minuten})
+    return {"monitoring_interval_min": minuten}
+
+
+# ─────────────────────────────────────────────
+# EINSTIEGSZEITPUNKTE (Entry-Time-Slots)
+# ─────────────────────────────────────────────
+
+@app.get("/api/entry-time-slots")
+def entry_time_slots():
+    return trading_bot_connector.get_entry_time_slots()
+
+
+@app.put("/api/entry-time-slots/{slot_id}")
+def update_entry_time_slot(slot_id: int, payload: dict):
+    trading_bot_connector.update_entry_time_slot(
+        slot_id, payload.get("gewichtung"), payload.get("aktiv")
+    )
+    return {"ok": True}
+
+
+@app.get("/api/entry-time-proposal")
+def entry_time_proposal():
+    return trading_bot_connector.get_pending_entry_proposal()
+
+
+@app.post("/api/entry-time-proposal/confirm")
+def confirm_entry_time_proposal(payload: dict):
+    proposal = trading_bot_connector.get_pending_entry_proposal()
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Kein ausstehender Vorschlag")
+    lernmodus = bool(payload.get("lernmodus", False))
+    trading_bot_connector.apply_entry_time_proposal(proposal["vorschlaege"])
+    trading_bot_connector.set_bot_config({"ENTRY_LEARNING_MODE": "true" if lernmodus else "false"})
+    trading_bot_connector.clear_pending_entry_proposal("confirmed", lernmodus)
+    return {"ok": True, "lernmodus": lernmodus}
+
+
+@app.post("/api/entry-time-proposal/reject")
+def reject_entry_time_proposal():
+    trading_bot_connector.clear_pending_entry_proposal("rejected")
+    return {"ok": True}
+
+
 # ─────────────────────────────────────────────
 # IMMOBILIE
 # ─────────────────────────────────────────────
