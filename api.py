@@ -8,6 +8,8 @@ Läuft parallel zum bestehenden Streamlit-Dashboard (Port 8502), das bis zur
 vollständigen React-Umstellung weiterläuft. Port 8503.
 """
 
+import os
+import tempfile
 from datetime import date, datetime
 from typing import Optional
 
@@ -708,6 +710,41 @@ def remove_transaction(transaction_id: int):
     return {"ok": True}
 
 
+@app.post("/api/depot/import-csv")
+async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...), file: UploadFile = File(...)):
+    """
+    Importiert eine Transaktionshistorie-CSV (Comdirect/Trade Republic/ING/DKB/
+    Sonstige) in ein Depot – siehe portfolio_module.import_csv() für die
+    Spaltenerkennung je Broker. Nutzt dieselbe Funktion wie der bestehende
+    CSV-Import im Streamlit-Dashboard (dashboard.py), nur über einen Datei-
+    Upload statt eines lokalen Pfads.
+    """
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        return portfolio_module.import_csv(portfolio_id, tmp_path, broker)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        os.unlink(tmp_path)
+
+
+@app.post("/api/positions/tagesgeld")
+def add_tagesgeld_position(payload: dict):
+    """
+    Legt eine Tagesgeld-Position an oder aktualisiert ihren Kontostand (siehe
+    Feature 4: kein Ticker nötig, quantity ist direkt der Betrag).
+    """
+    return portfolio_module.upsert_tagesgeld_position(
+        portfolio_id=payload["portfolio_id"],
+        konto_name=payload["konto_name"],
+        betrag=payload["betrag"],
+        zinssatz=payload.get("zinssatz"),
+    )
+
+
 @app.post("/api/target-weights")
 def set_target_weight(payload: dict):
     user_id = payload["user_id"]
@@ -772,11 +809,33 @@ def set_target_weights(payload: dict):
 
 
 async def _kontoauszug_import(user_id: int, files: list[UploadFile]) -> dict:
-    """Analysiert Kontoauszüge per KI und speichert die erkannten Buchungen
-    (Haushaltsbuch). Vorher wurde hier nur analysiert, nie gespeichert – die
-    Buchungen verschwanden nach dem Request wieder."""
-    file_bytes = [(f.filename, await f.read()) for f in files]
-    result = kontoauszug_analyzer.analyze_kontoauszuege(file_bytes)
+    """
+    Analysiert Kontoauszüge und speichert die erkannten Buchungen (Haushaltsbuch).
+    CSV-Dateien werden direkt geparst (kein KI-Call nötig, siehe
+    kontoauszug_analyzer.parse_csv_kontoauszug), PDFs laufen weiterhin über die
+    bestehende KI-Analyse (Text oder Vision, siehe analyze_kontoauszuege).
+    Vorher wurde hier nur analysiert, nie gespeichert – die Buchungen
+    verschwanden nach dem Request wieder.
+    """
+    csv_files, pdf_files = [], []
+    for f in files:
+        content = await f.read()
+        if (f.filename or "").lower().endswith(".csv"):
+            csv_files.append((f.filename, content))
+        else:
+            pdf_files.append((f.filename, content))
+
+    result = kontoauszug_analyzer.analyze_kontoauszuege(pdf_files)
+
+    csv_buchungen = []
+    for _dateiname, content in csv_files:
+        daten = kontoauszug_analyzer.parse_csv_kontoauszug(content)
+        csv_buchungen.extend(daten.get("buchungen") or [])
+
+    if csv_buchungen:
+        result["verfuegbar"] = True
+        result["buchungen"] = csv_buchungen + result.get("buchungen", [])
+
     if result.get("verfuegbar") and result.get("buchungen"):
         result["gespeichert"] = save_buchungen(user_id, result["buchungen"])
     return result

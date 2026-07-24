@@ -98,7 +98,9 @@ class PosPosition(Base):
     id             = Column(Integer, primary_key=True, autoincrement=True)
     portfolio_id   = Column(Integer, ForeignKey("pos_portfolios.id"), nullable=False)
     asset_class_id = Column(Integer, ForeignKey("pos_asset_classes.id"), nullable=True)
-    ticker         = Column(String(20), nullable=False)
+    # nullable=True seit Feature 4: Tagesgeld-Positionen haben keinen Ticker
+    # (siehe upsert_tagesgeld_position() in portfolio.py).
+    ticker         = Column(String(20), nullable=True)
     name           = Column(String(200), nullable=True)
     display_name   = Column(Text, nullable=True)
     quantity       = Column(Float, default=0.0)
@@ -413,6 +415,7 @@ def init_db():
     _migrate_real_estate_columns()
     _migrate_goal_columns()
     _migrate_tax_config_columns()
+    _migrate_position_columns()
     with get_session() as session:
         _seed_asset_classes(session)
 
@@ -424,6 +427,18 @@ def _migrate_tax_config_columns():
         conn.execute(text(
             "ALTER TABLE pos_tax_config ADD COLUMN IF NOT EXISTS grenzsteuersatz FLOAT DEFAULT 0.42"
         ))
+
+
+def _migrate_position_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – pos_positions.ticker war ursprünglich NOT NULL, ist aber seit
+    Feature 4 (Tagesgeld-Positionen ohne Ticker) nullable. Idempotent (Postgres
+    macht DROP NOT NULL beim zweiten Aufruf einfach nochmal, ohne Fehler).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pos_positions ALTER COLUMN ticker DROP NOT NULL"))
 
 
 def _migrate_goal_columns():

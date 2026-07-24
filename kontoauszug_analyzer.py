@@ -13,10 +13,12 @@ und direkt als Bild an Claude Vision geschickt (siehe analyze_with_vision).
 """
 
 import base64
+import csv
 import io
 import json
 import os
 import tempfile
+from datetime import datetime
 
 from pypdf import PdfReader
 
@@ -353,3 +355,159 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         "kreditanalyse": _kreditanalyse_berechnen(alle_kreditbuchungen),
         "immobilienkaeufe": immobilienkaeufe,
     }
+
+
+# ─────────────────────────────────────────────
+# CSV-KONTOAUSZÜGE (Fix 2 – Comdirect/DKB/ING direkt parsen, ohne Vision)
+# ─────────────────────────────────────────────
+# CSV-Exporte sind bereits strukturierter Text – ein Vision-/LLM-Call ist hier
+# unnötig (Kosten/Latenz) und würde bei großen Umsatzlisten unnötig Tokens
+# verbrauchen. Nur für ein wirklich unbekanntes Format (parse_generic_csv)
+# greifen wir auf dieselbe Claude-Textanalyse wie bei PDF-Text zurück.
+
+def _parse_datum_iso(raw: str) -> str | None:
+    """
+    Konvertiert ein deutsches Bank-Datumsformat (meist DD.MM.YYYY) nach ISO
+    (YYYY-MM-DD) – save_buchungen() in database.py parst zwingend über
+    date.fromisoformat() und würde jede Zeile mit "falschem" Format sonst
+    stillschweigend überspringen.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_betrag_de(raw: str) -> float:
+    """Deutsches Zahlenformat (1.234,56) -> float. Leer/unparsbar -> 0.0."""
+    raw = (raw or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(raw.replace(".", "").replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
+def _decode_csv_bytes(content: bytes) -> str | None:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            return content.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
+def parse_csv_kontoauszug(content: bytes) -> dict:
+    """
+    Erkennt das Bank-Format anhand typischer Spalten/Marker und parst die CSV
+    direkt (ohne LLM). Unbekannte Formate laufen über parse_generic_csv (KI-
+    gestützte Extraktion wie bei PDF-Text).
+    """
+    text = _decode_csv_bytes(content)
+    if text is None:
+        print("⚠️  CSV-Kontoauszug: Encoding nicht erkannt (weder UTF-8 noch Latin-1/CP1252)")
+        return {"buchungen": [], "format": "unlesbar"}
+
+    lines = text.splitlines()
+    if not lines:
+        return {"buchungen": [], "format": "leer"}
+
+    erste_zeile = lines[0]
+    if "buchungstag" in erste_zeile.lower():
+        return parse_comdirect_csv(text)
+    if "Gläubiger-ID" in text or "Mandatsreferenz" in text:
+        return parse_dkb_csv(text)
+    if "IBAN" in erste_zeile:
+        return parse_ing_csv(text)
+    return parse_generic_csv(text)
+
+
+def parse_comdirect_csv(text: str) -> dict:
+    """Comdirect-Umsatzübersicht: "Buchungstag";"Valuta";"Vorgang";"Buchungstext";"Umsatz in EUR"."""
+    reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    buchungen = []
+    for row in reader:
+        try:
+            datum = _parse_datum_iso(row.get("Buchungstag", ""))
+            if not datum:
+                continue
+            betrag = _parse_betrag_de(row.get("Umsatz in EUR", "0"))
+            buchungen.append({
+                "datum": datum,
+                "betrag": betrag,
+                "empfaenger": (row.get("Buchungstext") or "").strip()[:100],
+                "verwendungszweck": (row.get("Vorgang") or "").strip(),
+                "typ": "einnahme" if betrag > 0 else "ausgabe",
+            })
+        except Exception:
+            continue
+    return {"buchungen": buchungen, "format": "comdirect_csv"}
+
+
+def parse_dkb_csv(text: str) -> dict:
+    """DKB-Umsatzexport – Spaltennamen variieren je nach Konto-/Exportversion,
+    daher mehrere Kandidaten pro Feld."""
+    reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    buchungen = []
+    for row in reader:
+        try:
+            datum = _parse_datum_iso(row.get("Buchungsdatum") or row.get("Wertstellung") or "")
+            if not datum:
+                continue
+            betrag = _parse_betrag_de(row.get("Betrag (€)") or row.get("Betrag") or "0")
+            empfaenger = (
+                row.get("Zahlungsempfänger*in") or row.get("Zahlungsempfänger")
+                or row.get("Auftraggeber / Begünstigter") or ""
+            ).strip()[:100]
+            buchungen.append({
+                "datum": datum,
+                "betrag": betrag,
+                "empfaenger": empfaenger,
+                "verwendungszweck": (row.get("Verwendungszweck") or "").strip(),
+                "typ": "einnahme" if betrag > 0 else "ausgabe",
+            })
+        except Exception:
+            continue
+    return {"buchungen": buchungen, "format": "dkb_csv"}
+
+
+def parse_ing_csv(text: str) -> dict:
+    """ING-Umsatzexport – "Buchung";"Valuta";"Auftraggeber/Empfänger";"Buchungstext";"Verwendungszweck";"Saldo";"Betrag";"Währung"."""
+    reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    buchungen = []
+    for row in reader:
+        try:
+            datum = _parse_datum_iso(row.get("Buchung") or row.get("Valuta") or "")
+            if not datum:
+                continue
+            betrag = _parse_betrag_de(row.get("Betrag") or "0")
+            buchungen.append({
+                "datum": datum,
+                "betrag": betrag,
+                "empfaenger": (row.get("Auftraggeber/Empfänger") or "").strip()[:100],
+                "verwendungszweck": (row.get("Verwendungszweck") or row.get("Buchungstext") or "").strip(),
+                "typ": "einnahme" if betrag > 0 else "ausgabe",
+            })
+        except Exception:
+            continue
+    return {"buchungen": buchungen, "format": "ing_csv"}
+
+
+def parse_generic_csv(text: str) -> dict:
+    """Unbekanntes CSV-Format – dieselbe KI-Extraktion wie bei lesbarem PDF-Text
+    (siehe KONTOAUSZUG_SYSTEM_PROMPT), da eine CSV-Datei bereits reiner Text ist."""
+    antwort = _ask(
+        f"Kontoauszug (CSV):\n\n{text[:MAX_ZEICHEN_PRO_PDF]}",
+        system=KONTOAUSZUG_SYSTEM_PROMPT, max_tokens=4096,
+    )
+    if antwort is None:
+        return {"buchungen": [], "format": "generic_csv"}
+    daten = _parse_batch_antwort(antwort)
+    daten["format"] = "generic_csv"
+    return daten

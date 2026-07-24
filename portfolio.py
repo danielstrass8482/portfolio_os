@@ -397,6 +397,47 @@ def delete_position(position_id: int):
         session.delete(position)
 
 
+def upsert_tagesgeld_position(portfolio_id: int, konto_name: str, betrag: float, zinssatz: float = None) -> dict:
+    """
+    Legt eine Tagesgeld-Position an oder aktualisiert ihren Kontostand (siehe
+    Feature 4: Tagesgeld hat KEINEN Ticker – quantity ist direkt der Betrag,
+    current_price fix 1.0). Identifiziert eine bestehende Position über
+    (portfolio_id, name) statt Ticker: mehrere Tagesgeld-Positionen haben alle
+    ticker=NULL, und "ticker IN (NULL)" matcht in Postgres nie (siehe
+    _finde_bestehende_position) – ein Name-Abgleich ist hier eindeutig genug.
+    """
+    with get_session() as session:
+        portfolio = session.get(PosPortfolio, portfolio_id)
+        if portfolio is None:
+            raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
+
+        tagesgeld_class = session.query(PosAssetClass).filter_by(slug="tagesgeld").first()
+        if tagesgeld_class is None:
+            raise ValueError("Assetklasse 'Tagesgeld' nicht gefunden")
+
+        name = f"Tagesgeld {konto_name}".strip()
+        display_name = name if not zinssatz else f"{name} ({zinssatz:.2f}% Zins)".replace(".", ",")
+
+        position = session.query(PosPosition).filter_by(
+            portfolio_id=portfolio_id, ticker=None, name=name,
+        ).first()
+        if position is None:
+            position = PosPosition(
+                portfolio_id=portfolio_id, ticker=None, name=name, display_name=display_name,
+                asset_class_id=tagesgeld_class.id, quantity=betrag,
+                avg_buy_price=1.0, current_price=1.0, currency="EUR",
+            )
+            session.add(position)
+        else:
+            position.quantity = betrag
+            position.display_name = display_name
+            position.avg_buy_price = 1.0
+            position.current_price = 1.0
+        position.last_updated = datetime.utcnow()
+        session.flush()
+        return {"position_id": position.id}
+
+
 # ─────────────────────────────────────────────
 # PORTFOLIO-VERWALTUNG (CRUD)
 # ─────────────────────────────────────────────
@@ -676,6 +717,32 @@ BROKER_COLUMN_MAP = {
         "quantity": ["Anzahl", "Shares", "Stück"],
         "price": ["Preis", "Price", "Kurs"],
         "fees": ["Gebühr", "Fee", "Gebühren"],
+    },
+    "ing": {
+        "datum": ["Buchung", "Valuta", "Datum"],
+        "typ": ["Transaktionstyp", "Geschäftsart", "Typ"],
+        "ticker": ["ISIN", "WKN"],
+        "quantity": ["Stück", "Nominale", "Anzahl"],
+        "price": ["Kurs", "Preis"],
+        "fees": ["Gebühr", "Provision"],
+    },
+    "dkb": {
+        "datum": ["Buchungsdatum", "Datum"],
+        "typ": ["Geschäftsart", "Transaktionstyp", "Typ"],
+        "ticker": ["ISIN", "WKN"],
+        "quantity": ["Stück", "Nominale"],
+        "price": ["Kurs", "Ausführungskurs"],
+        "fees": ["Gebühr", "Provision"],
+    },
+    # Bewusst großzügige Spalten-Kandidatenliste (Vereinigung der übrigen Broker)
+    # für einen unbekannten/nicht gelisteten Broker – "best effort" statt Abbruch.
+    "sonstige": {
+        "datum": ["Datum", "Buchungstag", "Buchung", "Buchungsdatum", "Date"],
+        "typ": ["Geschäftsart", "Transaktionstyp", "Typ", "Type"],
+        "ticker": ["WKN/ISIN", "ISIN", "WKN"],
+        "quantity": ["Nominal/Stück", "Stück", "Nominale", "Anzahl", "Shares"],
+        "price": ["Kurs", "Ausführungskurs", "Preis", "Price"],
+        "fees": ["Provision", "Gebühren", "Gebühr", "Fee"],
     },
 }
 
