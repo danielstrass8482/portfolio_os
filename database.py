@@ -449,6 +449,36 @@ def get_session():
         session.close()
 
 
+@contextmanager
+def get_session_for_user(user_id: int):
+    """
+    Wie get_session(), setzt zusätzlich app.current_user_id für die Dauer der
+    Transaktion (SET LOCAL via set_config() – kein String-Interpolation, damit
+    keine SQL-Injection möglich ist). Voraussetzung für die Row-Level-Security-
+    Policies auf den pos_*-Tabellen (siehe Security Schritt 2).
+
+    WICHTIG: trading_bot_user ist Owner der pos_*-Tabellen, und Postgres wendet
+    RLS-Policies per Default NICHT auf den Tabellenbesitzer an (nur zusätzlich
+    mit FORCE ROW LEVEL SECURITY). Die Policies sind aktuell also Vorbereitung
+    für echtes Multi-Tenant, noch OHNE Wirkung – und diese Funktion wird von
+    den bestehenden API-Endpoints noch NICHT verwendet (die weiterhin
+    get_session() nutzen). Erst wenn ein zweiter echter Login-Nutzer dazukommt,
+    lohnt sich der Aufwand, alle relevanten Endpoints hierauf umzustellen UND
+    FORCE ROW LEVEL SECURITY zu setzen.
+    """
+    from sqlalchemy import text
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)})
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def init_db():
     """Erstellt alle pos_*-Tabellen (idempotent – safe to call multiple times)."""
     Base.metadata.create_all(engine)

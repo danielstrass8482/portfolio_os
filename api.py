@@ -14,10 +14,17 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import logging
+import traceback
+
 import yfinance as yf
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form, Request, status
+from fastapi import (
+    FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form, Request,
+    Response, Cookie, status,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -44,6 +51,35 @@ from database import (
 # Services (dashboard.py/main.py) noch nicht neugestartet wurden.
 init_db()
 
+
+# ─────────────────────────────────────────────
+# LOG SANITIZING – verhindert dass Secrets (Passwörter, Tokens, ...) über
+# logging.* in Logs landen. Greift NUR für Aufrufe über das logging-Modul
+# (z.B. uvicorn-interne Logs, logger.error() unten) – die zahlreichen print()-
+# Aufrufe im Rest der Codebase laufen an logging vorbei und bleiben davon
+# unberührt.
+# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+
+class SensitiveDataFilter(logging.Filter):
+    SENSITIVE_KEYS = [
+        "password", "token", "api_key", "secret",
+        "authorization", "cookie", "jwt",
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        for key in self.SENSITIVE_KEYS:
+            if key.lower() in msg.lower():
+                record.msg = "[REDACTED - sensitive data]"
+                record.args = ()  # sonst Format-Crash: alte %-Platzhalter passen nicht mehr zum neuen msg
+                return True
+        return True
+
+
+logging.getLogger().addFilter(SensitiveDataFilter())
+
 app = FastAPI(title="Portfolio-OS API")
 
 # CORS einschränken (nur eigene Domain + lokaler Dev-Betrieb).
@@ -57,6 +93,25 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# ─────────────────────────────────────────────
+# EXCEPTION HANDLING – Stack Traces landen nur im Log, nie in der Response.
+# Registrierte Handler für spezifischere Typen (HTTPException, RateLimitExceeded)
+# greifen weiterhin zuerst – dieser Catch-all fängt nur unerwartete Bugs ab,
+# die sonst als roher 500 + Traceback an den Client durchgereicht würden.
+# ─────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {traceback.format_exc()}")
+    return JSONResponse(status_code=500, content={"detail": "Interner Serverfehler"})
+
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    return JSONResponse(status_code=404, content={"detail": "Nicht gefunden"})
+
 
 # ─────────────────────────────────────────────
 # SSRF-SCHUTZ (Allowlist für vom Server aus angesteuerte externe Domains)
@@ -84,18 +139,36 @@ if not SECRET_KEY:
     raise RuntimeError("JWT_SECRET_KEY nicht gesetzt!")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
+COOKIE_MAX_AGE = ACCESS_TOKEN_EXPIRE_HOURS * 3600
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
+# Argon2id ist aktueller Goldstandard (sicherer als bcrypt) – bcrypt bleibt als
+# zweites Schema gelistet, NUR damit bereits bestehende bcrypt-Hashes (z.B.
+# Daniels aktuelles Passwort) noch verifiziert werden können. deprecated="auto"
+# markiert jeden Hash, der nicht mit dem ERSTEN Schema (argon2) erzeugt wurde,
+# als upgrade-fällig – verify_password() nutzt verify_and_update(), das beim
+# nächsten erfolgreichen Login automatisch und transparent auf Argon2id
+# umhasht, ganz ohne dass das Klartext-Passwort dafür manuell bekannt sein muss.
+pwd_context = CryptContext(
+    schemes=["argon2", "bcrypt"],
+    deprecated="auto",
+    argon2__memory_cost=65536,  # 64MB
+    argon2__time_cost=3,
+    argon2__parallelism=4,
+)
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+def verify_password(plain: str, hashed: str) -> tuple[bool, Optional[str]]:
+    """Gibt (gültig, neuer_hash) zurück – neuer_hash ist gesetzt wenn der
+    bestehende Hash nicht mit dem aktuellen Default-Schema (Argon2id) erzeugt
+    wurde und automatisch aufgefrischt werden soll (siehe pwd_context oben)."""
+    try:
+        return pwd_context.verify_and_update(plain, hashed)
+    except ValueError:
+        return False, None
 
 
 def create_access_token(data: dict) -> str:
@@ -105,12 +178,26 @@ def create_access_token(data: dict) -> str:
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(
+    request: Request,
+    token_cookie: Optional[str] = Cookie(default=None, alias="token"),
+):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Nicht autorisiert",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    # Cookie bevorzugen (siehe Security Schritt 2: HttpOnly statt localStorage),
+    # Bearer-Header als Fallback (z.B. für zukünftige Nicht-Browser-Clients).
+    token = token_cookie
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
+    if not token:
+        raise credentials_exception
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         raw_sub = payload.get("sub")
@@ -128,21 +215,40 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.post("/api/auth/login")
 @limiter.limit("5/minute")
-async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(request: Request, response: Response, form_data: OAuth2PasswordRequestForm = Depends()):
     with get_session() as session:
         user = session.query(PosUser).filter_by(email=form_data.username).first()
         if not user or not user.password_hash:
             raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch")
-        if not verify_password(form_data.password, user.password_hash):
+        valid, new_hash = verify_password(form_data.password, user.password_hash)
+        if not valid:
             raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch")
+        if new_hash:
+            user.password_hash = new_hash  # transparentes Auffrischen auf Argon2id
         user.last_login = datetime.utcnow()
         session.commit()
         token = create_access_token({"sub": str(user.id)})
+
+        # Token als HttpOnly Cookie setzen – JavaScript kann nicht zugreifen (XSS-Schutz).
+        response.set_cookie(
+            key="token",
+            value=token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=COOKIE_MAX_AGE,
+            path="/",
+        )
         return {
-            "access_token": token,
-            "token_type": "bearer",
+            "message": "Login erfolgreich",
             "user": {"id": user.id, "name": user.name, "email": user.email, "rolle": user.rolle},
         }
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie(key="token", path="/")
+    return {"message": "Logout erfolgreich"}
 
 
 @app.get("/api/auth/me")
@@ -154,9 +260,13 @@ async def get_me(current_user=Depends(get_current_user)):
 
 
 @app.post("/api/auth/refresh")
-async def refresh_token(current_user=Depends(get_current_user)):
+async def refresh_token(response: Response, current_user=Depends(get_current_user)):
     token = create_access_token({"sub": str(current_user.id)})
-    return {"access_token": token, "token_type": "bearer"}
+    response.set_cookie(
+        key="token", value=token, httponly=True, secure=True,
+        samesite="lax", max_age=COOKIE_MAX_AGE, path="/",
+    )
+    return {"message": "Token aufgefrischt"}
 
 
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
