@@ -521,7 +521,13 @@ def trading_bot_trades(limit: int = 100):
 
 
 @protected.get("/api/scan-log")
-def get_scan_log(limit: int = 100, ticker: str = None):
+def get_scan_log(limit: int = 2000, ticker: str = None):
+    """
+    Scan-Historie gruppiert nach Tag → Slot (verschachtelt), für den
+    aufklappbaren Scan-Historie-Unterreiter im Trading-Bot-Tab. Jeder Slot
+    trägt bereits die Aggregate (total/above_threshold/trades/avg_score),
+    damit die zugeklappte Ansicht ohne Client-seitige Berechnung auskommt.
+    """
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT
@@ -539,15 +545,39 @@ def get_scan_log(limit: int = 100, ticker: str = None):
 
         rows = [dict(r._mapping) for r in rows]
 
-    # Scan-Zeitpunkte gruppieren
-    scans = {}
+    # Tag → Slot (Scan-Zeitpunkt) → Ticker verschachteln.
+    days: dict = {}
     for row in rows:
-        key = row["scan_time"].strftime("%Y-%m-%d %H:%M") if row["scan_time"] else "?"
-        if key not in scans:
-            scans[key] = {"time": key, "slot": row["slot_et"], "tickers": []}
-        scans[key]["tickers"].append(row)
+        scan_time = row["scan_time"]
+        day_key = scan_time.strftime("%Y-%m-%d") if scan_time else "?"
+        slot_key = (scan_time.isoformat() if scan_time else "?", row["slot_et"])
 
-    return list(scans.values())
+        day = days.setdefault(day_key, {"date": day_key, "_slots": {}})
+        slot = day["_slots"].setdefault(slot_key, {
+            "slot": row["slot_et"],
+            "scan_time": scan_time.isoformat() if scan_time else None,
+            "total": 0, "above_threshold": 0, "trades": 0,
+            "_score_sum": 0, "tickers": [],
+        })
+        slot["total"] += 1
+        if row["approved"]:
+            slot["above_threshold"] += 1
+        if row["trade_executed"]:
+            slot["trades"] += 1
+        slot["_score_sum"] += row["score"] or 0
+        slot["tickers"].append(row)
+
+    result = []
+    for day_key in sorted(days.keys(), reverse=True):
+        day = days[day_key]
+        slots = list(day["_slots"].values())
+        for slot in slots:
+            slot["avg_score"] = round(slot["_score_sum"] / slot["total"], 1) if slot["total"] else 0
+            del slot["_score_sum"]
+        slots.sort(key=lambda s: s["scan_time"] or "", reverse=True)
+        result.append({"date": day_key, "slots": slots})
+
+    return result
 
 
 @protected.get("/api/scan-log/latest")
