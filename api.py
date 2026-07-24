@@ -672,6 +672,48 @@ def set_target_weight(payload: dict):
     return {"ok": True}
 
 
+# Feste Assetklassen-Auswahl für die Zielgewichtung-Sektion im Verwaltung-Tab
+# (bewusst eine Untermenge von pos_asset_classes – legacy/duplizierte Klassen
+# wie "Aktien"/"Konto-Cash"/"Sonstiges" tauchen dort nicht auf).
+TARGET_WEIGHT_ASSET_CLASSES = [2, 8, 9, 10, 11, 5, 4]  # ETF, Einzelaktie, Anleihe, Gold/Rohstoff, Tagesgeld, Immobilie, Krypto
+
+
+@app.get("/api/target-weights")
+def get_target_weights(user_id: int):
+    _user_or_404(user_id)
+    with get_session() as session:
+        bestehend = {
+            tw.asset_class_id: tw.target_pct
+            for tw in session.query(PosTargetWeight).filter_by(user_id=user_id).all()
+        }
+    return [
+        {"asset_class_id": acid, "target_pct": bestehend.get(acid, 0.0)}
+        for acid in TARGET_WEIGHT_ASSET_CLASSES
+    ]
+
+
+@app.put("/api/target-weights")
+def set_target_weights(payload: dict):
+    user_id = payload["user_id"]
+    weights = payload["weights"]
+    with get_session() as session:
+        for asset_class_id_raw, target_pct in weights.items():
+            asset_class_id = int(asset_class_id_raw)
+            min_pct = max(0.0, target_pct - 0.05)
+            max_pct = min(1.0, target_pct + 0.05)
+            existing = session.query(PosTargetWeight).filter_by(
+                user_id=user_id, asset_class_id=asset_class_id
+            ).first()
+            if existing:
+                existing.target_pct, existing.min_pct, existing.max_pct = target_pct, min_pct, max_pct
+            else:
+                session.add(PosTargetWeight(
+                    user_id=user_id, asset_class_id=asset_class_id,
+                    target_pct=target_pct, min_pct=min_pct, max_pct=max_pct,
+                ))
+    return {"ok": True}
+
+
 async def _kontoauszug_import(user_id: int, files: list[UploadFile]) -> dict:
     """Analysiert Kontoauszüge per KI und speichert die erkannten Buchungen
     (Haushaltsbuch). Vorher wurde hier nur analysiert, nie gespeichert – die
