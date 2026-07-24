@@ -12,6 +12,7 @@ import os
 import tempfile
 from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form, Request, status
@@ -520,6 +521,9 @@ def trading_bot_trades(limit: int = 100):
         return []
 
 
+ET_TZ = ZoneInfo("America/New_York")
+
+
 @protected.get("/api/scan-log")
 def get_scan_log(limit: int = 2000, ticker: str = None):
     """
@@ -527,6 +531,9 @@ def get_scan_log(limit: int = 2000, ticker: str = None):
     aufklappbaren Scan-Historie-Unterreiter im Trading-Bot-Tab. Jeder Slot
     trägt bereits die Aggregate (total/above_threshold/trades/avg_score),
     damit die zugeklappte Ansicht ohne Client-seitige Berechnung auskommt.
+    Tag-Gruppierung nach ET (Handelstag), nicht UTC – scan_time wird als UTC
+    gespeichert (siehe main.py: datetime.utcnow()), ein Scan um z.B. 23:30 ET
+    (03:30 UTC am Folgetag) würde sonst dem falschen Kalendertag zugeordnet.
     """
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -549,7 +556,8 @@ def get_scan_log(limit: int = 2000, ticker: str = None):
     days: dict = {}
     for row in rows:
         scan_time = row["scan_time"]
-        day_key = scan_time.strftime("%Y-%m-%d") if scan_time else "?"
+        scan_time_et = scan_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(ET_TZ) if scan_time else None
+        day_key = scan_time_et.strftime("%Y-%m-%d") if scan_time_et else "?"
         slot_key = (scan_time.isoformat() if scan_time else "?", row["slot_et"])
 
         day = days.setdefault(day_key, {"date": day_key, "_slots": {}})
