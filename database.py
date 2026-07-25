@@ -83,6 +83,17 @@ class PosUser(Base):
     password_hash = Column(Text, nullable=True)
     last_login    = Column(DateTime, nullable=True)
 
+    # Registrierung mit Admin-Freischaltung (siehe /api/auth/register in api.py)
+    status                 = Column(String(20), default="active")   # pending / active / rejected
+    registration_reason    = Column(Text, nullable=True)
+    approval_token         = Column(String(100), nullable=True)
+    approval_token_expires = Column(DateTime, nullable=True)
+
+    # Alpaca-Anbindung pro Nutzer (verschlüsselt, siehe encrypt_field/decrypt_field oben)
+    alpaca_api_key_encrypted    = Column(Text, nullable=True)
+    alpaca_secret_key_encrypted = Column(Text, nullable=True)
+    alpaca_mode                 = Column(String(10), default="paper")   # paper / live
+
     # Onboarding / Risikoprofil (siehe onboarding.py)
     onboarding_completed = Column(Boolean, default=False)
     alter_jahre           = Column(Integer, nullable=True)
@@ -492,11 +503,21 @@ def init_db():
 
 
 def _migrate_user_columns():
-    """Idempotente Migration für pos_users.password_hash/last_login (siehe _migrate_real_estate_columns)."""
+    """Idempotente Migration für pos_users.password_hash/last_login sowie die
+    Registrierungs-Approval- und Alpaca-Connect-Spalten (siehe _migrate_real_estate_columns).
+    DEFAULT 'active' greift dank ADD COLUMN ... DEFAULT auch rückwirkend für
+    bereits bestehende Zeilen (z.B. Daniels Account, id=1) – kein Extra-UPDATE nötig."""
     from sqlalchemy import text
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
         conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS registration_reason TEXT"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS approval_token TEXT"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS approval_token_expires TIMESTAMP"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_api_key_encrypted TEXT"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_secret_key_encrypted TEXT"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_mode TEXT DEFAULT 'paper'"))
 
 
 def _migrate_tax_config_columns():

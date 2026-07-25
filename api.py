@@ -9,6 +9,7 @@ vollständigen React-Umstellung weiterläuft. Port 8503.
 """
 
 import os
+import secrets
 import tempfile
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -39,12 +40,13 @@ import rebalancing
 import trading_bot_connector
 import llm_analyst
 import kontoauszug_analyzer
-from config import validate_config, BASE_URL, FREISTELLUNGSAUFTRAG_DEFAULT
+from notifier import send_email
+from config import validate_config, BASE_URL, ALERT_EMAIL, FREISTELLUNGSAUFTRAG_DEFAULT
 from database import (
     get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
-    decrypt_field,
+    encrypt_field, decrypt_field,
 )
 
 # Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
@@ -210,6 +212,10 @@ async def get_current_user(
         user = session.query(PosUser).filter_by(id=user_id).first()
         if not user:
             raise credentials_exception
+        if user.status == "pending":
+            raise HTTPException(403, "Dein Zugang wartet auf Freischaltung. Du wirst per E-Mail benachrichtigt.")
+        if user.status == "rejected":
+            raise HTTPException(403, "Dein Zugang wurde nicht freigeschaltet. Kontaktiere daniel.strass@gmx.de")
         return user
 
 
@@ -223,6 +229,10 @@ async def login(request: Request, response: Response, form_data: OAuth2PasswordR
         valid, new_hash = verify_password(form_data.password, user.password_hash)
         if not valid:
             raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch")
+        if user.status == "pending":
+            raise HTTPException(403, "Dein Zugang wartet auf Freischaltung. Du wirst per E-Mail benachrichtigt.")
+        if user.status == "rejected":
+            raise HTTPException(403, "Dein Zugang wurde nicht freigeschaltet. Kontaktiere daniel.strass@gmx.de")
         if new_hash:
             user.password_hash = new_hash  # transparentes Auffrischen auf Argon2id
         user.last_login = datetime.utcnow()
@@ -267,6 +277,132 @@ async def refresh_token(response: Response, current_user=Depends(get_current_use
         samesite="lax", max_age=COOKIE_MAX_AGE, path="/",
     )
     return {"message": "Token aufgefrischt"}
+
+
+# ─────────────────────────────────────────────
+# REGISTRIERUNG MIT ADMIN-APPROVAL (öffentlich, kein Login nötig – siehe
+# Feature 1/2: neue Nutzer landen mit status='pending' in der DB und können
+# sich erst nach Freischaltung per E-Mail-Link einloggen)
+# ─────────────────────────────────────────────
+
+def send_approval_email(name: str, email: str, reason: str, token: str, user_id: int):
+    approve_url = f"{BASE_URL}/api/auth/approve/{token}"
+    reject_url = f"{BASE_URL}/api/auth/reject/{token}"
+
+    subject = f"🔔 Neuer Registrierungsantrag: {name}"
+    body = f"""Neuer Registrierungsantrag für den AI Trading Bot:
+
+Name:    {name}
+E-Mail:  {email}
+Grund:   {reason or 'Kein Grund angegeben'}
+
+Bitte freigeben oder ablehnen (Link gültig 48h):
+
+✅ FREIGEBEN:
+{approve_url}
+
+❌ ABLEHNEN:
+{reject_url}
+
+---
+AI Trading Bot Admin"""
+    send_email(subject, body, to_email=ALERT_EMAIL)
+
+
+def send_welcome_email(name: str, email: str):
+    subject = "🎉 Dein Zugang wurde freigeschaltet!"
+    body = f"""Hallo {name},
+
+dein Zugang zum AI Trading Bot wurde freigeschaltet!
+
+Du kannst dich jetzt einloggen und deinen Alpaca Account verbinden:
+https://trading.diestraesschens.de
+
+Viel Erfolg!"""
+    send_email(subject, body, to_email=email)
+
+
+def send_rejection_email(name: str, email: str):
+    subject = "AI Trading Bot - Registrierungsantrag"
+    body = f"""Hallo {name},
+
+leider können wir deinen Zugang zum AI Trading Bot
+aktuell nicht freischalten.
+
+Bei Fragen: daniel.strass@gmx.de"""
+    send_email(subject, body, to_email=email)
+
+
+@app.post("/api/auth/register")
+@limiter.limit("3/minute")
+async def register(request: Request, body: dict):
+    name = body.get("name", "").strip()
+    email = body.get("email", "").strip().lower()
+    password = body.get("password", "")
+    reason = body.get("reason", "")
+
+    if not name or not email or not password:
+        raise HTTPException(400, "Name, E-Mail und Passwort erforderlich")
+    if len(password) < 8:
+        raise HTTPException(400, "Passwort mindestens 8 Zeichen")
+
+    with get_session() as session:
+        existing = session.query(PosUser).filter_by(email=email).first()
+        if existing:
+            raise HTTPException(400, "E-Mail bereits registriert")
+
+        token = secrets.token_urlsafe(32)
+        expires = datetime.utcnow() + timedelta(hours=48)
+        password_hash = pwd_context.hash(password)
+        user = PosUser(
+            name=name,
+            email=email,
+            password_hash=password_hash,
+            rolle="member",
+            status="pending",
+            registration_reason=reason,
+            approval_token=token,
+            approval_token_expires=expires,
+        )
+        session.add(user)
+        session.flush()
+        send_approval_email(name, email, reason, token, user.id)
+
+    return {"message": "Registrierung erfolgreich. Du wirst benachrichtigt sobald dein Zugang freigeschaltet ist."}
+
+
+@app.get("/api/auth/approve/{token}")
+async def approve_user(token: str):
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(approval_token=token).first()
+        if not user:
+            raise HTTPException(404, "Token nicht gefunden")
+        if user.approval_token_expires < datetime.utcnow():
+            raise HTTPException(400, "Token abgelaufen")
+        if user.status == "active":
+            return {"message": "Nutzer bereits aktiv"}
+
+        user.status = "active"
+        user.approval_token = None
+        name, email = user.name, user.email
+
+    send_welcome_email(name, email)
+    return {"message": f"✅ {name} wurde freigeschaltet!"}
+
+
+@app.get("/api/auth/reject/{token}")
+async def reject_user(token: str):
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(approval_token=token).first()
+        if not user:
+            raise HTTPException(404, "Token nicht gefunden")
+
+        user.status = "rejected"
+        user.approval_token = None
+        name, email = user.name, user.email
+
+    send_rejection_email(name, email)
+    return {"message": f"❌ {name} wurde abgelehnt."}
 
 
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
@@ -357,6 +493,122 @@ def update_user(user_id: int, payload: dict):
         if "rolle" in payload:
             user.rolle = payload["rolle"]
         return {"id": user.id}
+
+
+# ─────────────────────────────────────────────
+# ALPACA CONNECT (pro Nutzer, siehe Feature 4 – Keys landen verschlüsselt in
+# pos_users, analog zu PosRealEstate.adresse via encrypt_field/decrypt_field)
+# ─────────────────────────────────────────────
+
+@protected.post("/api/user/alpaca-connect")
+def connect_alpaca(body: dict, current_user=Depends(get_current_user)):
+    api_key = body.get("api_key", "").strip()
+    secret_key = body.get("secret_key", "").strip()
+    mode = body.get("mode", "paper")
+
+    if not api_key or not secret_key:
+        raise HTTPException(400, "API Key und Secret erforderlich")
+    if mode not in ("paper", "live"):
+        raise HTTPException(400, "Ungültiger Modus")
+
+    try:
+        import alpaca_trade_api as tradeapi
+        base_url = (
+            "https://api.alpaca.markets" if mode == "live"
+            else "https://paper-api.alpaca.markets"
+        )
+        api = tradeapi.REST(api_key, secret_key, base_url)
+        account = api.get_account()
+        buying_power = float(account.buying_power)
+        cash = float(account.cash)
+        account_status = account.status
+    except Exception as e:
+        raise HTTPException(400, f"Verbindung fehlgeschlagen: {str(e)}")
+
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(id=current_user.id).first()
+        user.alpaca_api_key_encrypted = encrypt_field(api_key)
+        user.alpaca_secret_key_encrypted = encrypt_field(secret_key)
+        user.alpaca_mode = mode
+
+    return {
+        "message": "Alpaca Account verbunden!",
+        "account": {"status": account_status, "buying_power": buying_power, "cash": cash, "mode": mode},
+    }
+
+
+@protected.get("/api/user/alpaca-status")
+def alpaca_status(current_user=Depends(get_current_user)):
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(id=current_user.id).first()
+        if not user.alpaca_api_key_encrypted:
+            return {"connected": False}
+
+        try:
+            import alpaca_trade_api as tradeapi
+            api_key = decrypt_field(user.alpaca_api_key_encrypted)
+            secret = decrypt_field(user.alpaca_secret_key_encrypted)
+            base_url = (
+                "https://api.alpaca.markets" if user.alpaca_mode == "live"
+                else "https://paper-api.alpaca.markets"
+            )
+            api = tradeapi.REST(api_key, secret, base_url)
+            account = api.get_account()
+            return {
+                "connected": True,
+                "mode": user.alpaca_mode,
+                "status": account.status,
+                "buying_power": float(account.buying_power),
+                "cash": float(account.cash),
+            }
+        except Exception:
+            return {"connected": False, "error": "Verbindung fehlgeschlagen"}
+
+
+# ─────────────────────────────────────────────
+# ADMIN – Nutzer-Anträge (siehe Feature 5, nur für rolle == "admin")
+# ─────────────────────────────────────────────
+
+@protected.get("/api/admin/pending-users")
+def get_pending_users(current_user=Depends(get_current_user)):
+    if current_user.rolle != "admin":
+        raise HTTPException(403, "Nur für Admins")
+    with get_session() as session:
+        users = session.query(PosUser).filter_by(status="pending").all()
+        return [{
+            "id": u.id, "name": u.name, "email": u.email,
+            "reason": u.registration_reason, "created_at": str(u.created_at),
+        } for u in users]
+
+
+@protected.post("/api/admin/approve/{user_id}")
+def admin_approve_user(user_id: int, current_user=Depends(get_current_user)):
+    if current_user.rolle != "admin":
+        raise HTTPException(403, "Nur für Admins")
+    with get_session() as session:
+        user = session.get(PosUser, user_id)
+        if not user:
+            raise HTTPException(404, f"Nutzer {user_id} nicht gefunden")
+        user.status = "active"
+        user.approval_token = None
+        name, email = user.name, user.email
+    send_welcome_email(name, email)
+    return {"message": f"✅ {name} wurde freigeschaltet!"}
+
+
+@protected.post("/api/admin/reject/{user_id}")
+def admin_reject_user(user_id: int, current_user=Depends(get_current_user)):
+    if current_user.rolle != "admin":
+        raise HTTPException(403, "Nur für Admins")
+    with get_session() as session:
+        user = session.get(PosUser, user_id)
+        if not user:
+            raise HTTPException(404, f"Nutzer {user_id} nicht gefunden")
+        user.status = "rejected"
+        user.approval_token = None
+        name, email = user.name, user.email
+    send_rejection_email(name, email)
+    return {"message": f"❌ {name} wurde abgelehnt."}
 
 
 # ─────────────────────────────────────────────
