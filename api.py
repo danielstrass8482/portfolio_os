@@ -737,6 +737,50 @@ def update_bot_config_key(key: str, payload: dict):
     return trading_bot_connector.get_bot_config_all()
 
 
+# Risikoprofil-Presets für das Trading-Bot-Onboarding (siehe portfolio_react
+# src/app/trading-bot/onboarding/page.tsx, Schritt 2). Werte identisch mit
+# den Guardrail-Defaults, die trading_bot/database.py DEFAULT_CONFIG als
+# hardcoded Fallback kennt.
+BOT_CONFIG_PRESETS = {
+    "konservativ": {
+        "MAX_CAPITAL_PER_TRADE": "30",
+        "MAX_OPEN_POSITIONS": "3",
+        "ATR_MULTIPLIER_SL": "1.0",
+        "ATR_MULTIPLIER_TP": "2.0",
+        "MAX_HOLDING_DAYS": "3",
+        "VOLATILE_SEGMENT_PCT": "0.0",
+    },
+    "ausgewogen": {
+        "MAX_CAPITAL_PER_TRADE": "50",
+        "MAX_OPEN_POSITIONS": "5",
+        "ATR_MULTIPLIER_SL": "1.5",
+        "ATR_MULTIPLIER_TP": "3.0",
+        "MAX_HOLDING_DAYS": "5",
+        "VOLATILE_SEGMENT_PCT": "0.33",
+    },
+    "aggressiv": {
+        "MAX_CAPITAL_PER_TRADE": "100",
+        "MAX_OPEN_POSITIONS": "8",
+        "ATR_MULTIPLIER_SL": "2.0",
+        "ATR_MULTIPLIER_TP": "4.0",
+        "MAX_HOLDING_DAYS": "7",
+        "VOLATILE_SEGMENT_PCT": "0.5",
+    },
+}
+
+
+@protected.post("/api/bot-config/preset")
+def apply_bot_config_preset(payload: dict):
+    preset = payload.get("preset")
+    if preset not in BOT_CONFIG_PRESETS:
+        raise HTTPException(400, "Unbekanntes Preset")
+
+    trading_bot_connector.set_bot_config(BOT_CONFIG_PRESETS[preset])
+
+    return {"message": f"Preset '{preset}' angewendet",
+            "settings": BOT_CONFIG_PRESETS[preset]}
+
+
 @protected.get("/api/settings/monitoring-interval")
 def get_monitoring_interval():
     """
