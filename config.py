@@ -28,7 +28,7 @@ LLM_MAX_TOKENS    = 1536
 # ─────────────────────────────────────────────
 # DASHBOARD / LINKS
 # ─────────────────────────────────────────────
-BASE_URL = os.getenv("BASE_URL", "https://portfolio.straesschen.de")
+BASE_URL = os.getenv("BASE_URL", "https://portfolio.diestraesschens.de")
 
 # ─────────────────────────────────────────────
 # ALERTS / SMTP
