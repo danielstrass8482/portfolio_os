@@ -654,22 +654,22 @@ def _step_import(user_id: int):
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.caption("Comdirect, Trade Republic")
-        if st.button("📄 CSV-Import", key="ob_import_csv_btn", use_container_width=True):
+        if st.button("📄 CSV-Import", key="ob_import_csv_btn", width="stretch"):
             st.session_state["ob_import_modus"] = "csv"
             st.rerun()
     with c2:
         st.caption("KI liest aus deiner App")
-        if st.button("📸 Screenshot", key="ob_import_screenshot_btn", use_container_width=True):
+        if st.button("📸 Screenshot", key="ob_import_screenshot_btn", width="stretch"):
             st.session_state["ob_import_modus"] = "screenshot"
             st.rerun()
     with c3:
         st.caption("Position für Position")
-        if st.button("✏️ Manuell", key="ob_import_manuell_btn", use_container_width=True):
+        if st.button("✏️ Manuell", key="ob_import_manuell_btn", width="stretch"):
             st.session_state["ob_import_modus"] = "manuell"
             st.rerun()
     with c4:
         st.caption("Erst mal nur Dashboard sehen")
-        if st.button("⏭️ Später", key="ob_import_spaeter_btn", use_container_width=True):
+        if st.button("⏭️ Später", key="ob_import_spaeter_btn", width="stretch"):
             st.session_state.onboarding_step = 8
             st.rerun()
 
@@ -803,7 +803,7 @@ def _step_fertig(user_id: int):
     if col_zurueck.button("← Zurück", key="ob_step8_zurueck"):
         st.session_state.onboarding_step = 7
         st.rerun()
-    if col_fertig.button("Zum Dashboard →", key="ob_fertig_btn", use_container_width=True, type="primary"):
+    if col_fertig.button("Zum Dashboard →", key="ob_fertig_btn", width="stretch", type="primary"):
         with get_session() as session:
             user = session.get(PosUser, user_id)
             user.onboarding_completed = True

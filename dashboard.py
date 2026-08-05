@@ -257,7 +257,7 @@ def _positions_chart(pos: dict):
         y_min = min(df["Close"].min(), avg_buy_price_eur) * 0.95
         y_max = max(df["Close"].max(), avg_buy_price_eur) * 1.05
         fig.update_yaxes(range=[y_min, y_max])
-    st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
+    st.plotly_chart(fig, width="stretch", config={"responsive": True})
 
     # Info-Zeile unter dem Chart
     pnl = pos.get("unrealized_pnl") or 0.0
@@ -615,7 +615,7 @@ with tab1:
             fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                                font_color="#f9fafb", legend=dict(orientation="h", y=-0.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             disclaimer_teile = []
             if summary.get("immobilien_eigenkapital"):
@@ -830,7 +830,7 @@ with tab2:
                     "G/V %": _vz_pct,
                 })
             )
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width="stretch", hide_index=True)
 
         # ---- Historischer Kursverlauf der gewählten Position ----------
         st.markdown("### 📈 Kursverlauf")
@@ -975,7 +975,7 @@ with tab3:
                 "Datum": h["erstellt_am"], "Status": h["status"],
                 "Begründung": (h["begruendung"] or "")[:120],
             } for h in historie])
-            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            st.dataframe(df_hist, width="stretch", hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -1021,7 +1021,7 @@ with tab4:
                 "Unrealisierter Verlust": _tabellen_safe(fmt_eur),
                 "Geschätzte Steuerersparnis": _tabellen_safe(fmt_eur),
             })
-            st.dataframe(styled_tlh, use_container_width=True, hide_index=True)
+            st.dataframe(styled_tlh, width="stretch", hide_index=True)
         else:
             st.caption("Keine Positionen im Minus.")
 
@@ -1344,7 +1344,7 @@ with tab5:
             })
             fig = px.line(verlauf, x="Datum", y="Wert", markers=True)
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             # ---- Kreditvertrag hochladen & KI auslesen (Feature 3) ---------
             with st.expander("📄 Kreditvertrag hochladen"):
@@ -1439,7 +1439,7 @@ with tab5:
                     kac2.metric("Letzte Buchung", ka_analyse["letzte_buchung"] or "–")
                     kac3.metric("Ø Rate", fmt_eur(ka_analyse["durchschnittliche_rate"], 0))
                     st.caption(f"Gesamt bezahlt: {fmt_eur(ka_analyse['gesamt_bezahlt'], 0)}")
-                    st.dataframe(pd.DataFrame(ka_erkannt["kreditbuchungen"]), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(ka_erkannt["kreditbuchungen"]), width="stretch", hide_index=True)
 
                     if st.button("✅ Werte in Immobilie übernehmen", key=f"ka_kredit_uebernehmen_{im['id']}"):
                         try:
@@ -1611,7 +1611,7 @@ with tab6:
                     color_discrete_sequence=["#60a5fa"],
                 )
                 fig_kat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
-                st.plotly_chart(fig_kat, use_container_width=True)
+                st.plotly_chart(fig_kat, width="stretch")
             else:
                 st.caption("Keine Ausgaben in diesem Monat.")
 
@@ -1668,7 +1668,7 @@ with tab6:
                     color_discrete_map={"einnahme": "#34d399", "ausgabe": "#f87171"},
                 )
                 fig_jahr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
-                st.plotly_chart(fig_jahr, use_container_width=True)
+                st.plotly_chart(fig_jahr, width="stretch")
 
 
 # ─────────────────────────────────────────────
@@ -1695,11 +1695,11 @@ with tab7:
     with c1:
         st.markdown("**Depots (Erwachsene)**")
         st.dataframe(pd.DataFrame(zeilen) if zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
     with c2:
         st.markdown("**Kinderdepots**")
         st.dataframe(pd.DataFrame(kinder_zeilen) if kinder_zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
 
     st.subheader("Vermögen je Nutzer")
     uebersicht_nutzer = []
@@ -1707,7 +1707,7 @@ with tab7:
         s = portfolio_module.get_portfolio_summary(n["id"])
         uebersicht_nutzer.append({"Nutzer": n["name"], "Vermögen": s["gesamtvermoegen"]})
     df_verm = pd.DataFrame(uebersicht_nutzer)
-    st.dataframe(df_verm.style.format({"Vermögen": _tabellen_safe(fmt_eur)}), use_container_width=True, hide_index=True)
+    st.dataframe(df_verm.style.format({"Vermögen": _tabellen_safe(fmt_eur)}), width="stretch", hide_index=True)
 
     st.subheader("Gemeinsame Ziele")
     with get_session() as session:
@@ -1780,7 +1780,7 @@ with tab9:
 
     # ---- Nutzer verwalten (Fix 5: Name + E-Mail bearbeitbar) -----------
     st.subheader("Nutzer verwalten")
-    st.dataframe(pd.DataFrame(nutzer)[["name", "email", "rolle"]], use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(nutzer)[["name", "email", "rolle"]], width="stretch", hide_index=True)
 
     col_nutzer_neu, col_nutzer_edit = st.columns(2)
     with col_nutzer_neu:
