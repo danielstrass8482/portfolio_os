@@ -12,7 +12,7 @@ Type=simple
 User=administrator
 WorkingDirectory=/home/administrator/portfolio_os
 EnvironmentFile=/home/administrator/portfolio_os/.env
-ExecStart=/home/administrator/portfolio_os/venv_dashboard/bin/streamlit run dashboard.py --server.port 8502 --server.address 0.0.0.0 --server.headless true
+ExecStart=/home/administrator/portfolio_os/venv_dashboard/bin/streamlit run dashboard.py --server.port 8502 --server.address 127.0.0.1 --server.headless true
 Restart=always
 RestartSec=10
 
