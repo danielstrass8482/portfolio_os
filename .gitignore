@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
+venv_api/
+venv_dashboard/
 .venv/

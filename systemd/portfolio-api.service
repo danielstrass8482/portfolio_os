@@ -1,0 +1,23 @@
+# Versioned copy of the live unit at /etc/systemd/system/portfolio-api.service.
+# On a fresh server: copy to /etc/systemd/system/, then `sudo systemctl daemon-reload
+# && sudo systemctl enable --now portfolio-api`. Requires venv_api/ set up per
+# README.md and .env present (not tracked, copy from .env.example + fill in).
+# --ws none: uvicorn's default --ws auto tries to import a websockets API that
+# doesn't exist in the version alpaca-trade-api pins in this venv (websockets<11);
+# api.py has no WebSocket routes, so the protocol is disabled outright rather than
+# fighting the version pin. See README.md "Warum zwei venvs?" for the incident.
+[Unit]
+Description=Portfolio OS API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/home/administrator/portfolio_os
+EnvironmentFile=/home/administrator/portfolio_os/.env
+ExecStart=/home/administrator/portfolio_os/venv_api/bin/uvicorn api:app --host 0.0.0.0 --port 8503 --ws none
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

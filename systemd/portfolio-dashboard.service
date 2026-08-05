@@ -1,0 +1,20 @@
+# Versioned copy of the live unit at /etc/systemd/system/portfolio-dashboard.service.
+# On a fresh server: copy to /etc/systemd/system/, then `sudo systemctl daemon-reload
+# && sudo systemctl enable --now portfolio-dashboard`. Requires venv_dashboard/ set up
+# per README.md and .env present (not tracked, copy from .env.example + fill in).
+[Unit]
+Description=Portfolio-OS Dashboard
+After=network.target postgresql.service
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+User=administrator
+WorkingDirectory=/home/administrator/portfolio_os
+EnvironmentFile=/home/administrator/portfolio_os/.env
+ExecStart=/home/administrator/portfolio_os/venv_dashboard/bin/streamlit run dashboard.py --server.port 8502 --server.address 0.0.0.0 --server.headless true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
