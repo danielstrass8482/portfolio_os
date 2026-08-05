@@ -466,7 +466,28 @@ def _erstes_ziel(user_id: int) -> Optional[dict]:
 # belassen – vor echtem Kunden-Onboarding (über die bestehenden Beta-Tester
 # hinaus) nochmal bewusst entscheiden, z.B. getrennte Berechtigungen
 # "Familien-Verwaltung" vs. "Support-Zugriff auf Kundendaten".
+#
+# ADMIN-SCOPE-TODO (2026-08-05, Audit Chunk 4): /api/family und
+# /api/overview?family=true waren bis eben ganz ohne Rollen-Check erreichbar
+# (jeder eingeloggte Nutzer sah Name+Depotwert+G/V+Positionsanzahl JEDES
+# registrierten Nutzers) – jetzt auf current_user.rolle=="admin" beschränkt
+# (siehe _require_admin unten), analog zum "Meine Daten"-Fix oben. OFFENE
+# FRAGE, bewusst nicht selbst entschieden: falls es künftig einen legitimen
+# Use-Case für Nicht-Admin-Zugriff auf family=true geben soll (z.B. "echte"
+# Familienmitglieder untereinander, die sich gegenseitig sehen dürfen sollen,
+# ohne dass jeder gleich Admin-Rechte auf ALLE pos_users bekommt) – das würde
+# eine eigene Gruppierung brauchen (aktuell gibt es in pos_users keinerlei
+# "Familie"-Feld, "family=true" aggregiert schlicht ALLE Nutzer). Bis dahin:
+# admin-only.
 # ─────────────────────────────────────────────
+
+
+def _require_admin(current_user, endpoint: str) -> None:
+    """Für Endpoints, die grundsätzlich über alle pos_users aggregieren
+    (/api/family, /api/overview?family=true) – siehe ADMIN-SCOPE-TODO oben."""
+    if current_user.rolle != "admin":
+        raise HTTPException(status_code=403, detail="Nur für Admins verfügbar")
+
 
 def _resolve_user_id(current_user, requested_user_id: Optional[int], endpoint: str, method: str = "GET") -> int:
     """Liefert die tatsächlich zu verwendende user_id für 'Meine Daten'-Endpoints
@@ -711,10 +732,12 @@ def admin_reject_user(user_id: int, current_user=Depends(get_current_user)):
 @protected.get("/api/overview")
 def overview(user_id: Optional[int] = None, family: bool = False, current_user=Depends(get_current_user)):
     """family=true aggregiert über alle Nutzer (Trading-Bot-Wert wird dabei nur
-    EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring). Sonst
-    IDOR-Fix (siehe Modulkommentar oben): user_id wird über _resolve_user_id
-    aufgelöst statt dem Query-Param blind zu vertrauen."""
+    EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring), daher
+    admin-only (ADMIN-SCOPE-TODO oben). Sonst IDOR-Fix (siehe Modulkommentar
+    oben): user_id wird über _resolve_user_id aufgelöst statt dem Query-Param
+    blind zu vertrauen."""
     if family:
+        _require_admin(current_user, "/api/overview?family=true")
         with get_session() as session:
             user_ids = [u.id for u in session.query(PosUser).all()]
         gesamt = {
@@ -1257,7 +1280,9 @@ def remove_real_estate(real_estate_id: int, current_user=Depends(get_current_use
 # ─────────────────────────────────────────────
 
 @protected.get("/api/family")
-def family():
+def family(current_user=Depends(get_current_user)):
+    """Aggregiert über ALLE pos_users, daher admin-only (ADMIN-SCOPE-TODO oben)."""
+    _require_admin(current_user, "/api/family")
     with get_session() as session:
         depots = [
             {"user_id": u.id, "name": u.name,
