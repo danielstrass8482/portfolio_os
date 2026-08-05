@@ -427,6 +427,33 @@ class PosBuchung(Base):
         return f"<PosBuchung {self.datum} {self.betrag} {self.empfaenger}>"
 
 
+class PosAdminAccessLog(Base):
+    """
+    Audit-Log für Admin-Zugriffe auf fremde pos_users-Daten (Cross-User-Zugriff
+    über den Family-Switcher/Admin-Bypass der IDOR-Ownership-Prüfung in api.py,
+    siehe trading_shared/docs/db-isolation-audit-05-08.md Teil C-Fix, 2026-08-05).
+    Dient NICHT der Zugriffsbeschränkung (Admin darf das weiterhin), sondern der
+    Nachvollziehbarkeit für später (Datenschutz/Kundenvertrauen/Anwalt).
+
+    ADMIN-SCOPE-TODO: "Admin" bedeutet aktuell voller Zugriff auf ALLE pos_users,
+    nicht nur Familienmitglieder. Für den jetzigen Beta-Testerkreis bewusst so
+    belassen — vor echtem Kunden-Onboarding (über die bestehenden Beta-Tester
+    hinaus) nochmal bewusst entscheiden, z.B. getrennte Berechtigungen
+    "Familien-Verwaltung" vs. "Support-Zugriff auf Kundendaten".
+    """
+    __tablename__ = "pos_admin_access_log"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    admin_user_id  = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    target_user_id = Column(Integer, ForeignKey("pos_users.id"), nullable=False)
+    endpoint       = Column(String(200), nullable=False)
+    method         = Column(String(10), nullable=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PosAdminAccessLog admin={self.admin_user_id} target={self.target_user_id} {self.method} {self.endpoint}>"
+
+
 class PosKategorisierungsregel(Base):
     """Regel 'wenn Empfänger X enthält, dann Kategorie Y' – aus dem Haushaltsbuch-Tab
     ('Immer so kategorisieren'), wird bei künftigen Kontoauszug-Uploads angewendet."""
@@ -578,6 +605,20 @@ def _seed_asset_classes(session: Session):
             session.add(PosAssetClass(name=name, slug=slug))
 
 
+def log_admin_access(admin_user_id: int, target_user_id: int, endpoint: str, method: str) -> None:
+    """Schreibt einen Audit-Log-Eintrag für echten Cross-User-Zugriff eines Admins
+    (siehe PosAdminAccessLog). Fehlertolerant: ein Logging-Fehler darf den
+    eigentlichen, bereits erlaubten Request nicht scheitern lassen."""
+    try:
+        with get_session() as session:
+            session.add(PosAdminAccessLog(
+                admin_user_id=admin_user_id, target_user_id=target_user_id,
+                endpoint=endpoint, method=method,
+            ))
+    except Exception:
+        pass
+
+
 def get_or_create_user(session: Session, name: str, email: str = None, rolle: str = "member") -> PosUser:
     """Holt einen Nutzer per Name oder legt ihn (samt Steuer-Config) neu an."""
     user = session.query(PosUser).filter_by(name=name).first()
@@ -600,11 +641,19 @@ def save_real_estate(user_id: int, real_estate_id: int = None, **felder) -> int:
     bestehende (real_estate_id gesetzt) – z.B. für die KI-Auswertung eines
     Kreditvertrags, die nur einzelne Felder einer bereits angelegten
     Immobilie nachträgt. Gibt die id der Immobilie zurück.
+
+    Ownership-Pflicht (IDOR-Fix, siehe db-isolation-audit-05-08.md Teil C):
+    beim Aktualisieren einer bestehenden Immobilie muss user_id zum bereits
+    gespeicherten Besitzer passen – der Aufrufer (api.py) muss dafür bereits
+    current_user.id (bzw. bei Admin-Bypass die vom Aufrufer verifizierte
+    Ziel-user_id) übergeben, nicht einen ungeprüften externen Wert.
     """
     with get_session() as session:
         if real_estate_id is not None:
             obj = session.get(PosRealEstate, real_estate_id)
             if obj is None:
+                raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
+            if obj.user_id != user_id:
                 raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
         else:
             obj = PosRealEstate(user_id=user_id)
@@ -637,13 +686,23 @@ def update_real_estate(real_estate_id: int, **kwargs):
         return obj
 
 
-def delete_real_estate(real_estate_id: int):
-    """Löscht eine Immobilie unwiderruflich."""
+def delete_real_estate(real_estate_id: int, owner_user_id: int = None) -> int:
+    """
+    Löscht eine Immobilie unwiderruflich. `owner_user_id=None` überspringt die
+    Ownership-Prüfung (Admin-Bypass, siehe api.py::_owner_check_id) – sonst muss
+    die Immobilie exakt diesem Nutzer gehören (IDOR-Fix, siehe
+    db-isolation-audit-05-08.md Teil C). Gibt die tatsächliche user_id des
+    Besitzers zurück (für das Admin-Zugriffs-Audit-Log in api.py).
+    """
     with get_session() as session:
         obj = session.query(PosRealEstate).filter_by(id=real_estate_id).first()
         if obj is None:
             raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
+        actual_owner_id = obj.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
+            raise ValueError(f"Immobilie {real_estate_id} nicht gefunden")
         session.delete(obj)
+        return actual_owner_id
 
 
 def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, asset_breakdown: dict = None):

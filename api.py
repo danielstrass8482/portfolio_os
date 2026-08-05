@@ -46,7 +46,7 @@ from database import (
     get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
-    encrypt_field, decrypt_field,
+    encrypt_field, decrypt_field, log_admin_access,
 )
 
 # Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
@@ -450,12 +450,90 @@ def _erstes_ziel(user_id: int) -> Optional[dict]:
         }
 
 
-def _user_or_404(user_id: int) -> PosUser:
+# ─────────────────────────────────────────────
+# IDOR-FIX (2026-08-05, siehe trading_shared/docs/db-isolation-audit-05-08.md
+# Teil C): "Meine Daten"-Endpoints dürfen NIE einem extern mitgegebenen user_id-
+# Parameter vertrauen (das war der Kernfehler – jeder eingeloggte Nutzer konnte
+# jeden anderen auslesen/verändern). Ausnahme: current_user.rolle == "admin"
+# darf weiterhin für andere user_id agieren (erhält den Family-Switcher im
+# Frontend, UserContext.tsx, für Profile ohne eigenen Login – analog zu
+# require_owner() in trading_api.py/trading_api_saxo.py, dort mit hartcodierter
+# owner-id statt einer Rolle). Jeder ECHTE Cross-User-Zugriff eines Admins wird
+# in pos_admin_access_log protokolliert (siehe log_admin_access, database.py).
+#
+# ADMIN-SCOPE-TODO: "Admin" bedeutet aktuell voller Zugriff auf ALLE pos_users,
+# nicht nur Familienmitglieder. Für den jetzigen Beta-Testerkreis bewusst so
+# belassen – vor echtem Kunden-Onboarding (über die bestehenden Beta-Tester
+# hinaus) nochmal bewusst entscheiden, z.B. getrennte Berechtigungen
+# "Familien-Verwaltung" vs. "Support-Zugriff auf Kundendaten".
+# ─────────────────────────────────────────────
+
+def _resolve_user_id(current_user, requested_user_id: Optional[int], endpoint: str, method: str = "GET") -> int:
+    """Liefert die tatsächlich zu verwendende user_id für 'Meine Daten'-Endpoints
+    (siehe Modulkommentar oben)."""
+    if current_user.rolle != "admin" or requested_user_id is None:
+        return current_user.id
+    if requested_user_id != current_user.id:
+        log_admin_access(current_user.id, requested_user_id, endpoint, method)
+    return requested_user_id
+
+
+def _owner_check_id(current_user) -> Optional[int]:
+    """Für die Ownership-prüfenden Hilfsfunktionen in portfolio.py/database.py
+    (update_position/delete_position/update_transaction/delete_transaction/
+    update_portfolio/delete_portfolio/delete_real_estate): None überspringt die
+    Prüfung dort (Admin-Bypass), sonst wird current_user.id streng durchgesetzt."""
+    return None if current_user.rolle == "admin" else current_user.id
+
+
+def _maybe_log_admin_access(current_user, actual_owner_id: int, endpoint: str, method: str) -> None:
+    """Protokolliert einen ECHTEN Cross-User-Zugriff, nachdem eine der obigen
+    Hilfsfunktionen mit Admin-Bypass (owner_user_id=None) gelaufen ist und die
+    tatsächliche Besitzer-user_id zurückgegeben hat."""
+    if current_user.rolle == "admin" and actual_owner_id != current_user.id:
+        log_admin_access(current_user.id, actual_owner_id, endpoint, method)
+
+
+def _position_owner_id(position_id: int) -> Optional[int]:
     with get_session() as session:
-        user = session.get(PosUser, user_id)
-        if not user:
-            raise HTTPException(status_code=404, detail=f"Nutzer {user_id} nicht gefunden")
-        return {"id": user.id, "name": user.name, "rolle": user.rolle}
+        pos = session.get(PosPosition, position_id)
+        return pos.portfolio.user_id if pos else None
+
+
+def _require_position_access(position_id: int, current_user, endpoint: str, method: str = "GET") -> None:
+    owner_id = _position_owner_id(position_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
+    if owner_id != current_user.id:
+        if current_user.rolle != "admin":
+            raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
+        log_admin_access(current_user.id, owner_id, endpoint, method)
+
+
+def _portfolio_owner_id(portfolio_id: int) -> Optional[int]:
+    with get_session() as session:
+        pf = session.get(PosPortfolio, portfolio_id)
+        return pf.user_id if pf else None
+
+
+def _require_portfolio_access(portfolio_id: int, current_user, endpoint: str, method: str = "GET") -> None:
+    owner_id = _portfolio_owner_id(portfolio_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
+    if owner_id != current_user.id:
+        if current_user.rolle != "admin":
+            raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
+        log_admin_access(current_user.id, owner_id, endpoint, method)
+
+
+def _require_buchung_access(buchung, current_user, endpoint: str, method: str = "GET") -> None:
+    """buchung bereits geladen (Objekt oder None)."""
+    if buchung is None:
+        raise HTTPException(status_code=404, detail="Buchung nicht gefunden")
+    if buchung.user_id != current_user.id:
+        if current_user.rolle != "admin":
+            raise HTTPException(status_code=404, detail="Buchung nicht gefunden")
+        log_admin_access(current_user.id, buchung.user_id, endpoint, method)
 
 
 # ─────────────────────────────────────────────
@@ -463,7 +541,7 @@ def _user_or_404(user_id: int) -> PosUser:
 # ─────────────────────────────────────────────
 
 @protected.get("/api/users")
-def list_users():
+def list_users(current_user=Depends(get_current_user)):
     with get_session() as session:
         return [
             {"id": u.id, "name": u.name, "email": u.email, "rolle": u.rolle}
@@ -472,16 +550,31 @@ def list_users():
 
 
 @protected.post("/api/users")
-def create_user(payload: dict):
+def create_user(payload: dict, current_user=Depends(get_current_user)):
+    # IDOR-Fix (siehe Modulkommentar oben): "rolle" darf über diesen Weg NIE auf
+    # "admin" gesetzt werden, egal wer aufruft – verhindert Privilegien-
+    # Eskalation beim Anlegen eines neuen (Familien-)Profils.
+    rolle = payload.get("rolle", "member")
+    if rolle == "admin":
+        rolle = "member"
     with get_session() as session:
-        user = get_or_create_user(
-            session, payload["name"], payload.get("email"), rolle=payload.get("rolle", "member"),
-        )
+        user = get_or_create_user(session, payload["name"], payload.get("email"), rolle=rolle)
         return {"id": user.id}
 
 
 @protected.put("/api/users/{user_id}")
-def update_user(user_id: int, payload: dict):
+def update_user(user_id: int, payload: dict, current_user=Depends(get_current_user)):
+    # IDOR-Fix + Privilegien-Eskalations-Fix (siehe Modulkommentar oben, und
+    # db-isolation-audit-05-08.md Teil C, "Am schwersten"-Abschnitt): vorher
+    # konnte sich JEDER eingeloggte Nutzer per PUT /api/users/{eigene_id} mit
+    # {"rolle": "admin"} selbst zum Admin machen.
+    is_admin = current_user.rolle == "admin"
+    if user_id != current_user.id and not is_admin:
+        raise HTTPException(status_code=403, detail="Nur eigenes Profil oder als Admin änderbar")
+    if "rolle" in payload and not is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen Rollen ändern")
+    if is_admin and user_id != current_user.id:
+        log_admin_access(current_user.id, user_id, "/api/users/{user_id}", "PUT")
     with get_session() as session:
         user = session.get(PosUser, user_id)
         if not user:
@@ -616,9 +709,11 @@ def admin_reject_user(user_id: int, current_user=Depends(get_current_user)):
 # ─────────────────────────────────────────────
 
 @protected.get("/api/overview")
-def overview(user_id: Optional[int] = None, family: bool = False):
+def overview(user_id: Optional[int] = None, family: bool = False, current_user=Depends(get_current_user)):
     """family=true aggregiert über alle Nutzer (Trading-Bot-Wert wird dabei nur
-    EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring)."""
+    EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring). Sonst
+    IDOR-Fix (siehe Modulkommentar oben): user_id wird über _resolve_user_id
+    aufgelöst statt dem Query-Param blind zu vertrauen."""
     if family:
         with get_session() as session:
             user_ids = [u.id for u in session.query(PosUser).all()]
@@ -640,9 +735,7 @@ def overview(user_id: Optional[int] = None, family: bool = False):
         summary = gesamt
         ziel = None
     else:
-        if user_id is None:
-            raise HTTPException(status_code=400, detail="user_id erforderlich wenn family=false")
-        _user_or_404(user_id)
+        user_id = _resolve_user_id(current_user, user_id, "/api/overview", "GET")
         summary = portfolio_module.get_total_wealth(user_id)
         ziel = _erstes_ziel(user_id)
 
@@ -670,8 +763,8 @@ def overview(user_id: Optional[int] = None, family: bool = False):
 # ─────────────────────────────────────────────
 
 @protected.get("/api/positions")
-def positions(user_id: int):
-    _user_or_404(user_id)
+def positions(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/positions", "GET")
     depot = portfolio_module.get_positions(user_id)
     bot_detail = trading_bot_connector.get_bot_positions_detail()
     return {"depot": depot, "bot": bot_detail}
@@ -684,28 +777,38 @@ def refresh_prices():
 
 
 @protected.put("/api/positions/{position_id}")
-def edit_position(position_id: int, payload: dict):
+def edit_position(position_id: int, payload: dict, current_user=Depends(get_current_user)):
     asset_class_id = payload.get("asset_class_id")
-    portfolio_module.update_position(
-        position_id,
-        display_name=payload.get("display_name"),
-        ticker=payload.get("ticker"),
-        asset_class_id=asset_class_id,
-        quantity=payload.get("quantity"),
-        avg_buy_price=payload.get("avg_buy_price"),
-    )
+    try:
+        owner_id = portfolio_module.update_position(
+            position_id,
+            display_name=payload.get("display_name"),
+            ticker=payload.get("ticker"),
+            asset_class_id=asset_class_id,
+            quantity=payload.get("quantity"),
+            avg_buy_price=payload.get("avg_buy_price"),
+            owner_user_id=_owner_check_id(current_user),
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/positions/{position_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/positions/{position_id}")
-def remove_position(position_id: int):
-    portfolio_module.delete_position(position_id)
+def remove_position(position_id: int, current_user=Depends(get_current_user)):
+    try:
+        owner_id = portfolio_module.delete_position(position_id, owner_user_id=_owner_check_id(current_user))
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/positions/{position_id}", "DELETE")
     return {"ok": True}
 
 
 @protected.get("/api/positions/{position_id}/transactions")
-def position_transactions(position_id: int):
+def position_transactions(position_id: int, current_user=Depends(get_current_user)):
     """Kauf-/Verkaufshistorie einer Position – für die Kauf-Pins im Chart (Positionen-Tab)."""
+    _require_position_access(position_id, current_user, "/api/positions/{position_id}/transactions", "GET")
     with get_session() as session:
         txs = (
             session.query(PosTransaction).filter_by(position_id=position_id)
@@ -754,7 +857,9 @@ def get_chart(ticker: str, period: str = "2y"):
 
 
 @protected.get("/api/tax-preview")
-def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float] = None):
+def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float] = None,
+                 current_user=Depends(get_current_user)):
+    _require_position_access(position_id, current_user, "/api/tax-preview", "GET")
     return tax_engine.get_tax_preview(position_id, verkauf_preis, quantity)
 
 
@@ -763,8 +868,8 @@ def tax_preview(position_id: int, verkauf_preis: float, quantity: Optional[float
 # ─────────────────────────────────────────────
 
 @protected.get("/api/tax")
-def tax(user_id: int):
-    _user_or_404(user_id)
+def tax(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/tax", "GET")
     return {
         "freistellung_rest": tax_engine.get_remaining_freistellung(user_id),
         "harvesting": tax_engine.find_tax_loss_harvesting(user_id),
@@ -773,14 +878,14 @@ def tax(user_id: int):
 
 
 @protected.get("/api/tax/jahresuebersicht")
-def tax_jahresuebersicht(user_id: int, jahr: int):
-    _user_or_404(user_id)
+def tax_jahresuebersicht(jahr: int, user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/tax/jahresuebersicht", "GET")
     return tax_engine.generate_jahresuebersicht_detail(user_id, jahr)
 
 
 @protected.get("/api/tax/config")
-def get_tax_config(user_id: int):
-    _user_or_404(user_id)
+def get_tax_config(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/tax/config", "GET")
     with get_session() as session:
         cfg = session.query(PosTaxConfig).filter_by(user_id=user_id).first()
         if not cfg:
@@ -798,9 +903,8 @@ def get_tax_config(user_id: int):
 
 
 @protected.put("/api/tax/config")
-def update_tax_config(payload: dict):
-    user_id = payload["user_id"]
-    _user_or_404(user_id)
+def update_tax_config(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/tax/config", "PUT")
     erlaubte_felder = {
         "freistellungsauftrag", "freistellungsgenutzt", "kirchensteuer",
         "verlusttopf_vorjahr", "grenzsteuersatz",
@@ -821,13 +925,13 @@ def update_tax_config(payload: dict):
 # ─────────────────────────────────────────────
 
 @protected.get("/api/rebalancing/analysis")
-def rebalancing_analysis(user_id: int):
+def rebalancing_analysis(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
     """
     Mathematischer Ist/Soll-Abgleich (pos_target_weights vs. aktuelles Portfolio)
     – siehe rebalancing.py Modulkommentar: reine Berechnung, keine Kauf-/
     Verkaufsempfehlung, jede Order platziert der Nutzer selbst beim Broker.
     """
-    _user_or_404(user_id)
+    user_id = _resolve_user_id(current_user, user_id, "/api/rebalancing/analysis", "GET")
     with get_session() as session:
         user = session.get(PosUser, user_id)
         sparrate = user.monatliche_sparrate or 0.0
@@ -1095,8 +1199,8 @@ def reject_entry_time_proposal():
 # ─────────────────────────────────────────────
 
 @protected.get("/api/real-estate")
-def real_estate(user_id: int):
-    _user_or_404(user_id)
+def real_estate(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/real-estate", "GET")
     with get_session() as session:
         immobilien = session.query(PosRealEstate).filter_by(user_id=user_id).all()
         result = []
@@ -1127,9 +1231,9 @@ _REAL_ESTATE_DATE_FIELDS = ("kaufdatum", "vermietung_start", "zinsbindung_bis")
 
 
 @protected.post("/api/real-estate")
-def create_real_estate(payload: dict):
+def create_real_estate(payload: dict, current_user=Depends(get_current_user)):
     from database import save_real_estate
-    user_id = payload.pop("user_id")
+    user_id = _resolve_user_id(current_user, payload.pop("user_id", None), "/api/real-estate", "POST")
     for feld in _REAL_ESTATE_DATE_FIELDS:
         if payload.get(feld):
             payload[feld] = datetime.strptime(payload[feld], "%Y-%m-%d").date()
@@ -1138,9 +1242,13 @@ def create_real_estate(payload: dict):
 
 
 @protected.delete("/api/real-estate/{real_estate_id}")
-def remove_real_estate(real_estate_id: int):
+def remove_real_estate(real_estate_id: int, current_user=Depends(get_current_user)):
     from database import delete_real_estate
-    delete_real_estate(real_estate_id)
+    try:
+        owner_id = delete_real_estate(real_estate_id, owner_user_id=_owner_check_id(current_user))
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Immobilie {real_estate_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/real-estate/{real_estate_id}", "DELETE")
     return {"ok": True}
 
 
@@ -1170,8 +1278,8 @@ def family():
 # ─────────────────────────────────────────────
 
 @protected.get("/api/haushaltsbuch")
-def haushaltsbuch(user_id: int):
-    _user_or_404(user_id)
+def haushaltsbuch(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/haushaltsbuch", "GET")
     with get_session() as session:
         buchungen = (
             session.query(PosBuchung).filter_by(user_id=user_id)
@@ -1188,11 +1296,10 @@ def haushaltsbuch(user_id: int):
 
 
 @protected.put("/api/haushaltsbuch/{buchung_id}")
-def update_buchung(buchung_id: int, payload: dict):
+def update_buchung(buchung_id: int, payload: dict, current_user=Depends(get_current_user)):
     with get_session() as session:
         buchung = session.get(PosBuchung, buchung_id)
-        if not buchung:
-            raise HTTPException(status_code=404, detail=f"Buchung {buchung_id} nicht gefunden")
+        _require_buchung_access(buchung, current_user, "/api/haushaltsbuch/{buchung_id}", "PUT")
         kategorie = payload["kategorie"]
         buchung.kategorie = kategorie
         user_id = buchung.user_id
@@ -1203,7 +1310,9 @@ def update_buchung(buchung_id: int, payload: dict):
 
 
 @protected.post("/api/haushaltsbuch/upload")
-async def haushaltsbuch_upload(user_id: int = Form(...), files: list[UploadFile] = File(...)):
+async def haushaltsbuch_upload(user_id: int = Form(...), files: list[UploadFile] = File(...),
+                                current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/haushaltsbuch/upload", "POST")
     return await _kontoauszug_import(user_id, files)
 
 
@@ -1213,9 +1322,11 @@ async def haushaltsbuch_upload(user_id: int = Form(...), files: list[UploadFile]
 # ─────────────────────────────────────────────
 
 @protected.get("/api/ki-analyse/klumpenrisiko")
-def klumpenrisiko(user_id: int, schwelle_pct: float = 20.0):
+def klumpenrisiko(user_id: Optional[int] = None, schwelle_pct: float = 20.0,
+                   current_user=Depends(get_current_user)):
     """Rein rechnerische Konzentrationsprüfung (keine LLM-Latenz) – größte
     Positionen als Anteil am Gesamtwert."""
+    user_id = _resolve_user_id(current_user, user_id, "/api/ki-analyse/klumpenrisiko", "GET")
     pos = [p for p in portfolio_module.get_positions(user_id) if p["market_value"]]
     gesamt = sum(p["market_value"] for p in pos)
     if not gesamt:
@@ -1228,18 +1339,21 @@ def klumpenrisiko(user_id: int, schwelle_pct: float = 20.0):
 
 
 @protected.post("/api/ki-analyse/portfolio")
-def ki_analyse_portfolio(payload: dict):
-    return llm_analyst.analyze_portfolio(payload["user_id"])
+def ki_analyse_portfolio(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/ki-analyse/portfolio", "POST")
+    return llm_analyst.analyze_portfolio(user_id)
 
 
 @protected.post("/api/ki-analyse/quarterly-report")
-def ki_quarterly_report(payload: dict):
-    return llm_analyst.generate_quarterly_report(payload["user_id"])
+def ki_quarterly_report(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/ki-analyse/quarterly-report", "POST")
+    return llm_analyst.generate_quarterly_report(user_id)
 
 
 @protected.post("/api/ki-analyse/ask")
-def ki_ask(payload: dict):
-    antwort = llm_analyst.answer_portfolio_question(payload["user_id"], payload["frage"])
+def ki_ask(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/ki-analyse/ask", "POST")
+    antwort = llm_analyst.answer_portfolio_question(user_id, payload["frage"])
     return {"antwort": antwort}
 
 
@@ -1250,8 +1364,9 @@ def ki_ask(payload: dict):
 # ─────────────────────────────────────────────
 
 @protected.get("/api/portfolios")
-def list_portfolios(user_id: int):
+def list_portfolios(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
     from database import PosPortfolio
+    user_id = _resolve_user_id(current_user, user_id, "/api/portfolios", "GET")
     with get_session() as session:
         return [
             {"id": p.id, "name": p.name, "typ": p.typ, "broker": p.broker}
@@ -1260,11 +1375,12 @@ def list_portfolios(user_id: int):
 
 
 @protected.post("/api/portfolios")
-def create_portfolio(payload: dict):
+def create_portfolio(payload: dict, current_user=Depends(get_current_user)):
     from database import PosPortfolio
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/portfolios", "POST")
     with get_session() as session:
         pf = PosPortfolio(
-            user_id=payload["user_id"], name=payload["name"], typ=payload["typ"],
+            user_id=user_id, name=payload["name"], typ=payload["typ"],
             broker=payload.get("broker"), is_kinderdepot=payload.get("is_kinderdepot", False),
         )
         session.add(pf)
@@ -1273,17 +1389,26 @@ def create_portfolio(payload: dict):
 
 
 @protected.put("/api/portfolios/{portfolio_id}")
-def edit_portfolio(portfolio_id: int, payload: dict):
-    portfolio_module.update_portfolio(
-        portfolio_id, name=payload.get("name"), typ=payload.get("typ"),
-        broker=payload.get("broker"), is_kinderdepot=payload.get("is_kinderdepot"),
-    )
+def edit_portfolio(portfolio_id: int, payload: dict, current_user=Depends(get_current_user)):
+    try:
+        owner_id = portfolio_module.update_portfolio(
+            portfolio_id, name=payload.get("name"), typ=payload.get("typ"),
+            broker=payload.get("broker"), is_kinderdepot=payload.get("is_kinderdepot"),
+            owner_user_id=_owner_check_id(current_user),
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/portfolios/{portfolio_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/portfolios/{portfolio_id}")
-def remove_portfolio(portfolio_id: int):
-    portfolio_module.delete_portfolio(portfolio_id)
+def remove_portfolio(portfolio_id: int, current_user=Depends(get_current_user)):
+    try:
+        owner_id = portfolio_module.delete_portfolio(portfolio_id, owner_user_id=_owner_check_id(current_user))
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/portfolios/{portfolio_id}", "DELETE")
     return {"ok": True}
 
 
@@ -1302,7 +1427,8 @@ def ticker_search(q: str):
 
 
 @protected.post("/api/transactions")
-def create_transaction(payload: dict):
+def create_transaction(payload: dict, current_user=Depends(get_current_user)):
+    _require_portfolio_access(payload["portfolio_id"], current_user, "/api/transactions", "POST")
     datum = datetime.strptime(payload["datum"], "%Y-%m-%d").date()
     return portfolio_module.add_transaction(
         portfolio_id=payload["portfolio_id"], typ=payload["typ"], ticker=payload["ticker"],
@@ -1312,23 +1438,33 @@ def create_transaction(payload: dict):
 
 
 @protected.put("/api/transactions/{transaction_id}")
-def edit_transaction(transaction_id: int, payload: dict):
+def edit_transaction(transaction_id: int, payload: dict, current_user=Depends(get_current_user)):
     datum = datetime.strptime(payload["datum"], "%Y-%m-%d").date() if payload.get("datum") else None
-    portfolio_module.update_transaction(
-        transaction_id, typ=payload.get("typ"), quantity=payload.get("quantity"),
-        price=payload.get("price"), datum=datum, fees=payload.get("fees"),
-    )
+    try:
+        owner_id = portfolio_module.update_transaction(
+            transaction_id, typ=payload.get("typ"), quantity=payload.get("quantity"),
+            price=payload.get("price"), datum=datum, fees=payload.get("fees"),
+            owner_user_id=_owner_check_id(current_user),
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Transaktion {transaction_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/transactions/{transaction_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/transactions/{transaction_id}")
-def remove_transaction(transaction_id: int):
-    portfolio_module.delete_transaction(transaction_id)
+def remove_transaction(transaction_id: int, current_user=Depends(get_current_user)):
+    try:
+        owner_id = portfolio_module.delete_transaction(transaction_id, owner_user_id=_owner_check_id(current_user))
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Transaktion {transaction_id} nicht gefunden")
+    _maybe_log_admin_access(current_user, owner_id, "/api/transactions/{transaction_id}", "DELETE")
     return {"ok": True}
 
 
 @protected.post("/api/depot/import-csv")
-async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...), file: UploadFile = File(...)):
+async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...), file: UploadFile = File(...),
+                            current_user=Depends(get_current_user)):
     """
     Importiert eine Transaktionshistorie-CSV (Comdirect/Trade Republic/ING/DKB/
     Sonstige) in ein Depot – siehe portfolio_module.import_csv() für die
@@ -1336,6 +1472,7 @@ async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...
     CSV-Import im Streamlit-Dashboard (dashboard.py), nur über einen Datei-
     Upload statt eines lokalen Pfads.
     """
+    _require_portfolio_access(portfolio_id, current_user, "/api/depot/import-csv", "POST")
     content = await file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
         tmp.write(content)
@@ -1349,11 +1486,12 @@ async def depot_import_csv(portfolio_id: int = Form(...), broker: str = Form(...
 
 
 @protected.post("/api/positions/tagesgeld")
-def add_tagesgeld_position(payload: dict):
+def add_tagesgeld_position(payload: dict, current_user=Depends(get_current_user)):
     """
     Legt eine Tagesgeld-Position an oder aktualisiert ihren Kontostand (siehe
     Feature 4: kein Ticker nötig, quantity ist direkt der Betrag).
     """
+    _require_portfolio_access(payload["portfolio_id"], current_user, "/api/positions/tagesgeld", "POST")
     return portfolio_module.upsert_tagesgeld_position(
         portfolio_id=payload["portfolio_id"],
         konto_name=payload["konto_name"],
@@ -1363,8 +1501,8 @@ def add_tagesgeld_position(payload: dict):
 
 
 @protected.post("/api/target-weights")
-def set_target_weight(payload: dict):
-    user_id = payload["user_id"]
+def set_target_weight(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/target-weights", "POST")
     asset_class_id = payload["asset_class_id"]
     target_pct = payload["target_pct"]
     min_pct = payload.get("min_pct", max(0.0, target_pct - 0.05))
@@ -1390,8 +1528,8 @@ TARGET_WEIGHT_ASSET_CLASSES = [2, 8, 9, 10, 11, 5, 4]  # ETF, Einzelaktie, Anlei
 
 
 @protected.get("/api/target-weights")
-def get_target_weights(user_id: int):
-    _user_or_404(user_id)
+def get_target_weights(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/target-weights", "GET")
     with get_session() as session:
         bestehend = {
             tw.asset_class_id: tw.target_pct
@@ -1404,8 +1542,8 @@ def get_target_weights(user_id: int):
 
 
 @protected.put("/api/target-weights")
-def set_target_weights(payload: dict):
-    user_id = payload["user_id"]
+def set_target_weights(payload: dict, current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, payload.get("user_id"), "/api/target-weights", "PUT")
     weights = payload["weights"]
     with get_session() as session:
         for asset_class_id_raw, target_pct in weights.items():
@@ -1459,16 +1597,19 @@ async def _kontoauszug_import(user_id: int, files: list[UploadFile]) -> dict:
 
 
 @protected.post("/api/kontoauszug-import")
-async def kontoauszug_import(user_id: int = Form(...), files: list[UploadFile] = File(...)):
+async def kontoauszug_import(user_id: int = Form(...), files: list[UploadFile] = File(...),
+                              current_user=Depends(get_current_user)):
+    user_id = _resolve_user_id(current_user, user_id, "/api/kontoauszug-import", "POST")
     return await _kontoauszug_import(user_id, files)
 
 
 @protected.post("/api/screenshot-import")
-async def screenshot_import(user_id: int = Form(...), file: UploadFile = File(...)):
+async def screenshot_import(user_id: int = Form(...), file: UploadFile = File(...),
+                             current_user=Depends(get_current_user)):
     """Liest einen Portfolio-Screenshot per Claude Vision aus (siehe llm_analyst.py)
     und gibt die erkannten Positionen zur Bestätigung durch den Nutzer zurück –
     speichert bewusst NICHT automatisch (wie /api/kontoauszug-import)."""
-    _user_or_404(user_id)
+    user_id = _resolve_user_id(current_user, user_id, "/api/screenshot-import", "POST")
     file_bytes = await file.read()
     positionen = llm_analyst.analyze_portfolio_screenshot(file_bytes, file.content_type or "image/jpeg")
     return {"positionen": positionen}

@@ -344,31 +344,52 @@ def _recompute_position(session, position_id: int):
     position.avg_buy_price = avg
 
 
-def delete_transaction(transaction_id: int):
-    """Löscht eine Transaktion und berechnet die zugehörige Position neu (siehe _recompute_position)."""
+def delete_transaction(transaction_id: int, owner_user_id: int = None) -> int:
+    """
+    Löscht eine Transaktion und berechnet die zugehörige Position neu (siehe
+    _recompute_position). `owner_user_id=None` überspringt die Ownership-Prüfung
+    (Admin-Bypass, siehe api.py::_owner_check_id) – sonst muss die Transaktion
+    (über ihr Portfolio) exakt diesem Nutzer gehören (IDOR-Fix, siehe
+    db-isolation-audit-05-08.md Teil C). Gibt die tatsächliche user_id des
+    Portfolio-Besitzers zurück (für das Admin-Zugriffs-Audit-Log in api.py).
+    """
     with get_session() as session:
         tx = session.get(PosTransaction, transaction_id)
         if tx is None:
+            raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
+        actual_owner_id = tx.portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
             raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
         position_id = tx.position_id
         session.delete(tx)
         session.flush()
         if position_id:
             _recompute_position(session, position_id)
+        return actual_owner_id
 
 
 def update_transaction(transaction_id: int, typ: str = None, quantity: float = None,
-                        price: float = None, datum=None, fees: float = None):
+                        price: float = None, datum=None, fees: float = None,
+                        owner_user_id: int = None) -> int:
     """
     Ändert eine bestehende Transaktion (nur übergebene Felder) und berechnet die
     zugehörige Position anschließend komplett aus allen Transaktionen neu (siehe
     _recompute_position), damit Bestand/Ø-Kaufpreis nach der Änderung wieder
     korrekt sind. Bereits gebuchte Steuer (tx.steuern) wird dabei NICHT neu
     berechnet – wie auch delete_transaction() die Steuer-Historie unangetastet lässt.
+
+    `owner_user_id=None` überspringt die Ownership-Prüfung (Admin-Bypass, siehe
+    api.py::_owner_check_id) – sonst muss die Transaktion (über ihr Portfolio)
+    exakt diesem Nutzer gehören (IDOR-Fix, siehe db-isolation-audit-05-08.md
+    Teil C). Gibt die tatsächliche user_id des Portfolio-Besitzers zurück (für
+    das Admin-Zugriffs-Audit-Log in api.py).
     """
     with get_session() as session:
         tx = session.get(PosTransaction, transaction_id)
         if tx is None:
+            raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
+        actual_owner_id = tx.portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
             raise ValueError(f"Transaktion {transaction_id} nicht gefunden")
         if typ is not None:
             typ = typ.lower().strip()
@@ -386,15 +407,27 @@ def update_transaction(transaction_id: int, typ: str = None, quantity: float = N
         session.flush()
         if tx.position_id:
             _recompute_position(session, tx.position_id)
+        return actual_owner_id
 
 
-def delete_position(position_id: int):
-    """Löscht eine Position samt aller zugehörigen Transaktionen (cascade, siehe database.py)."""
+def delete_position(position_id: int, owner_user_id: int = None) -> int:
+    """
+    Löscht eine Position samt aller zugehörigen Transaktionen (cascade, siehe
+    database.py). `owner_user_id=None` überspringt die Ownership-Prüfung
+    (Admin-Bypass, siehe api.py::_owner_check_id) – sonst muss die Position
+    (über ihr Portfolio) exakt diesem Nutzer gehören (IDOR-Fix, siehe
+    db-isolation-audit-05-08.md Teil C). Gibt die tatsächliche user_id des
+    Portfolio-Besitzers zurück (für das Admin-Zugriffs-Audit-Log in api.py).
+    """
     with get_session() as session:
         position = session.get(PosPosition, position_id)
         if position is None:
             raise ValueError(f"Position {position_id} nicht gefunden")
+        actual_owner_id = position.portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
+            raise ValueError(f"Position {position_id} nicht gefunden")
         session.delete(position)
+        return actual_owner_id
 
 
 def upsert_tagesgeld_position(portfolio_id: int, konto_name: str, betrag: float, zinssatz: float = None) -> dict:
@@ -443,11 +476,21 @@ def upsert_tagesgeld_position(portfolio_id: int, konto_name: str, betrag: float,
 # ─────────────────────────────────────────────
 
 def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broker: str = None,
-                      is_kinderdepot: bool = None):
-    """Ändert Name/Typ/Broker/Kinderdepot-Flag eines bestehenden Portfolios (nur übergebene Felder werden geändert)."""
+                      is_kinderdepot: bool = None, owner_user_id: int = None) -> int:
+    """
+    Ändert Name/Typ/Broker/Kinderdepot-Flag eines bestehenden Portfolios (nur
+    übergebene Felder werden geändert). `owner_user_id=None` überspringt die
+    Ownership-Prüfung (Admin-Bypass, siehe api.py::_owner_check_id) – sonst muss
+    das Portfolio exakt diesem Nutzer gehören (IDOR-Fix, siehe
+    db-isolation-audit-05-08.md Teil C). Gibt die tatsächliche user_id des
+    Besitzers zurück (für das Admin-Zugriffs-Audit-Log in api.py).
+    """
     with get_session() as session:
         portfolio = session.get(PosPortfolio, portfolio_id)
         if portfolio is None:
+            raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
+        actual_owner_id = portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
             raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
         if name is not None:
             portfolio.name = name
@@ -457,18 +500,29 @@ def update_portfolio(portfolio_id: int, name: str = None, typ: str = None, broke
             portfolio.broker = broker
         if is_kinderdepot is not None:
             portfolio.is_kinderdepot = is_kinderdepot
+        return actual_owner_id
 
 
 def update_position(position_id: int, display_name: str = None, ticker: str = None,
-                     asset_class_id: int = None, quantity: float = None, avg_buy_price: float = None):
+                     asset_class_id: int = None, quantity: float = None, avg_buy_price: float = None,
+                     owner_user_id: int = None) -> int:
     """
     Ändert Anzeigename/Ticker/Assetklasse/Bestand/Ø-Kaufpreis einer bestehenden Position
     (nur übergebene Felder werden geändert). `display_name=""` löscht den Anzeigenamen
     explizit wieder (get_positions() fällt dann auf den Ticker zurück, siehe dort).
+
+    `owner_user_id=None` überspringt die Ownership-Prüfung (Admin-Bypass, siehe
+    api.py::_owner_check_id) – sonst muss die Position (über ihr Portfolio) exakt
+    diesem Nutzer gehören (IDOR-Fix, siehe db-isolation-audit-05-08.md Teil C).
+    Gibt die tatsächliche user_id des Portfolio-Besitzers zurück (für das
+    Admin-Zugriffs-Audit-Log in api.py).
     """
     with get_session() as session:
         pos = session.get(PosPosition, position_id)
         if pos is None:
+            raise ValueError(f"Position {position_id} nicht gefunden")
+        actual_owner_id = pos.portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
             raise ValueError(f"Position {position_id} nicht gefunden")
         if display_name is not None:
             pos.display_name = display_name
@@ -480,17 +534,27 @@ def update_position(position_id: int, display_name: str = None, ticker: str = No
             pos.quantity = quantity
         if avg_buy_price is not None:
             pos.avg_buy_price = avg_buy_price
+        return actual_owner_id
 
 
-def delete_portfolio(portfolio_id: int):
+def delete_portfolio(portfolio_id: int, owner_user_id: int = None) -> int:
     """
     Löscht ein Portfolio – NUR wenn es keine Positionen mehr enthält, damit
     nicht versehentlich Bestandsdaten/Transaktionshistorie verschwinden.
     Positionen zuerst einzeln über delete_position() entfernen.
+
+    `owner_user_id=None` überspringt die Ownership-Prüfung (Admin-Bypass, siehe
+    api.py::_owner_check_id) – sonst muss das Portfolio exakt diesem Nutzer
+    gehören (IDOR-Fix, siehe db-isolation-audit-05-08.md Teil C). Gibt die
+    tatsächliche user_id des Besitzers zurück (für das Admin-Zugriffs-Audit-Log
+    in api.py).
     """
     with get_session() as session:
         portfolio = session.get(PosPortfolio, portfolio_id)
         if portfolio is None:
+            raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
+        actual_owner_id = portfolio.user_id
+        if owner_user_id is not None and actual_owner_id != owner_user_id:
             raise ValueError(f"Portfolio {portfolio_id} nicht gefunden")
         anzahl_positionen = (
             session.query(PosPosition).filter_by(portfolio_id=portfolio_id).count()
@@ -501,6 +565,7 @@ def delete_portfolio(portfolio_id: int):
                 f"diese zuerst löschen."
             )
         session.delete(portfolio)
+        return actual_owner_id
 
 
 # ─────────────────────────────────────────────
