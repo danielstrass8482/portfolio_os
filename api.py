@@ -21,7 +21,7 @@ import traceback
 import yfinance as yf
 from fastapi import (
     FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form, Request,
-    Response, Cookie, status,
+    Response, Cookie, status, BackgroundTasks,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -161,6 +161,48 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# Frontend-Domains, denen ein Passwort-Reset-Link ausgestellt werden darf
+# (siehe _resolve_reset_base_url) – anders als CORS_allow_origins oben (nur
+# portfolio_react) müssen hier auch trading_react/app.ai-tradingbot.de rein,
+# da beide Frontends denselben Auth-Layer nutzen und die /reset-password-
+# Seite jeweils im eigenen Frontend liegt. Der Request selbst kommt bei
+# trading_react/portfolio_react NIE cross-origin an (nginx proxied /api/auth/*
+# pfadbasiert same-origin durch), CORS greift hier also nicht – die Origin-
+# Allowlist dient ausschließlich dazu, den im Origin/Referer-Header
+# mitgeschickten Wert nicht ungeprüft in den E-Mail-Link zu übernehmen
+# (sonst könnte ein manipulierter Header auf eine Phishing-Domain zeigen).
+ALLOWED_RESET_ORIGINS = {
+    "https://portfolio.diestraesschens.de",
+    "https://trading.diestraesschens.de",
+    "https://app.ai-tradingbot.de",
+    "http://localhost:3000",
+    "http://localhost:3001",
+}
+
+RESET_TOKEN_EXPIRE_MINUTES = 45  # kürzer als die 48h der Registrierungs-Freischaltung (sicherheitskritischer)
+
+# Einmalig beim Modulimport erzeugter Dummy-Hash, gegen den forgot_password()
+# bei NICHT existierender E-Mail verifiziert (statt gar nichts zu tun) – Argon2
+# ist der klar dominante Zeitfaktor ggü. dem DB-Lookup, ein gleich teurer
+# Dummy-Vergleich verhindert, dass die Antwortzeit verrät, ob die E-Mail
+# registriert ist (siehe forgot_password-Docstring für den vollständigen
+# Timing-Safety-Ansatz inkl. BackgroundTasks für den Mailversand).
+_DUMMY_PASSWORD_HASH = pwd_context.hash(secrets.token_urlsafe(16))
+
+
+def _resolve_reset_base_url(request: Request) -> str:
+    """Wählt die Frontend-Basis-URL für den Reset-Link anhand des Origin-
+    (bevorzugt) bzw. Referer-Headers (Fallback, z.B. bei manchen Browsern/
+    Proxies ohne Origin auf einfachen POSTs) – nur gegen ALLOWED_RESET_ORIGINS
+    geprüfte Werte werden übernommen, alles andere fällt auf das global
+    konfigurierte BASE_URL zurück (portfolio_react)."""
+    raw = request.headers.get("origin") or request.headers.get("referer") or ""
+    raw = raw.rstrip("/")
+    for allowed in ALLOWED_RESET_ORIGINS:
+        if raw == allowed or raw.startswith(allowed + "/"):
+            return allowed
+    return BASE_URL
 
 
 def verify_password(plain: str, hashed: str) -> tuple[bool, Optional[str]]:
@@ -403,6 +445,115 @@ async def reject_user(token: str):
 
     send_rejection_email(name, email)
     return {"message": f"❌ {name} wurde abgelehnt."}
+
+
+# ─────────────────────────────────────────────
+# PASSWORT-RESET (öffentlich, kein Login nötig – analog zur Registrierungs-
+# Freischaltung oben, aber bewusst mit eigenen Token-/Ablauf-Spalten
+# (reset_token/reset_token_expires statt approval_token), da semantisch ein
+# anderer Zweck: eine laufende Registrierung darf einen parallelen Passwort-
+# Reset nicht invalidieren und umgekehrt, siehe PosUser-Docstring.
+# ─────────────────────────────────────────────
+
+GENERIC_FORGOT_PASSWORD_RESPONSE = {
+    "message": "Falls diese E-Mail registriert ist, wurde ein Link zum Zurücksetzen versendet."
+}
+
+
+def send_password_reset_email(name: str, email: str, token: str, base_url: str):
+    reset_url = f"{base_url}/reset-password?token={token}"
+    subject = "Passwort zurücksetzen"
+    body = f"""Hallo {name},
+
+für deinen Account wurde ein Zurücksetzen des Passworts angefordert.
+
+Falls du das warst, setze hier dein neues Passwort (Link gültig {RESET_TOKEN_EXPIRE_MINUTES} Minuten):
+{reset_url}
+
+Falls du das NICHT warst, kannst du diese E-Mail ignorieren – dein Passwort
+bleibt unverändert, der Link verfällt von selbst.
+
+---
+AI Trading Bot / Portfolio-OS"""
+    send_email(subject, body, to_email=email)
+
+
+@app.post("/api/auth/forgot-password")
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, body: dict, background_tasks: BackgroundTasks):
+    """
+    KEIN Enumeration-Leak: liefert für existierende UND nicht-existierende
+    E-Mail-Adressen denselben Status-Code + Body (GENERIC_FORGOT_PASSWORD_
+    RESPONSE) zurück. Timing-Safety hat zwei Bausteine:
+      1. Anders als /api/auth/login braucht dieser Endpoint für eine
+         EXISTIERENDE E-Mail von sich aus KEINEN Argon2-Vergleich (kein
+         Passwort wird hier geprüft) – ohne Gegenmaßnahme wäre der Nicht-
+         Existenz-Fall (reiner DB-Lookup) also sogar SCHNELLER als der
+         Erfolgsfall (DB-Lookup + UPDATE), ein ebenso ausnutzbares Timing-
+         Oracle wie andersherum. Der Dummy-Vergleich gegen einen fixen Hash
+         (_DUMMY_PASSWORD_HASH) läuft daher UNABHÄNGIG vom Ergebnis für
+         BEIDE Fälle (siehe unten, vor der if/else-Verzweigung) – Argon2 ist
+         der klar dominante Zeitfaktor, der verbleibende SELECT-vs-SELECT+
+         UPDATE-Unterschied fällt daneben nicht mehr messbar ins Gewicht.
+      2. Der Mailversand (SMTP-Roundtrip, potenziell hunderte ms bis Sekunden
+         bei Netzwerk-Hakeleien, siehe notifier.send_email-Fallback-Port-Logik)
+         läuft über BackgroundTasks NACH der Response, nicht davor – sonst
+         wäre der Erfolgsfall messbar langsamer als der Nicht-Existenz-Fall,
+         unabhängig vom Argon2-Ausgleich oben.
+    """
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return GENERIC_FORGOT_PASSWORD_RESPONSE
+
+    base_url = _resolve_reset_base_url(request)
+
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(email=email).first()
+        # Läuft bewusst UNABHÄNGIG davon, ob `user` existiert (siehe Docstring
+        # Punkt 1) - vor der Verzweigung, damit beide Zweige exakt denselben
+        # Argon2-Aufwand tragen.
+        pwd_context.verify(secrets.token_urlsafe(8), _DUMMY_PASSWORD_HASH)
+        if not user:
+            return GENERIC_FORGOT_PASSWORD_RESPONSE
+
+        # Überschreibt einen ggf. noch offenen älteren reset_token – ein davor
+        # ausgestellter Link wird dadurch automatisch ungültig (die Lookup-
+        # Query in reset_password() findet ihn nicht mehr), erfüllt "zweite
+        # Anfrage invalidiert die erste" ohne eigene Zusatzlogik.
+        token = secrets.token_urlsafe(32)
+        user.reset_token = token
+        user.reset_token_expires = datetime.utcnow() + timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES)
+        name, target_email = user.name, user.email
+        session.commit()
+
+    background_tasks.add_task(send_password_reset_email, name, target_email, token, base_url)
+    return GENERIC_FORGOT_PASSWORD_RESPONSE
+
+
+@app.post("/api/auth/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(request: Request, body: dict):
+    token = body.get("token", "")
+    new_password = body.get("password", "")
+    if not token or not new_password:
+        raise HTTPException(400, "Token und neues Passwort erforderlich")
+    if len(new_password) < 8:
+        raise HTTPException(400, "Passwort mindestens 8 Zeichen")
+
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(reset_token=token).first()
+        if not user or not user.reset_token_expires or user.reset_token_expires < datetime.utcnow():
+            raise HTTPException(400, "Link ungültig oder abgelaufen")
+
+        user.password_hash = pwd_context.hash(new_password)
+        # single-use: sofort ungültig machen, ein zweiter Versuch mit
+        # demselben Token findet danach keine Zeile mehr (reset_token=NULL
+        # matcht nie den nicht-leeren `token`-Parameter oben).
+        user.reset_token = None
+        user.reset_token_expires = None
+        session.commit()
+
+    return {"message": "Passwort erfolgreich geändert. Du kannst dich jetzt einloggen."}
 
 
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
