@@ -14,6 +14,7 @@ After=network.target postgresql.service
 Type=simple
 User=administrator
 WorkingDirectory=/home/administrator/portfolio_os
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/administrator/portfolio_os/.env
 ExecStart=/home/administrator/portfolio_os/venv_api/bin/uvicorn api:app --host 0.0.0.0 --port 8503 --ws none
 Restart=always
