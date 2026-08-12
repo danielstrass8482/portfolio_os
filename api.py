@@ -205,6 +205,17 @@ def _resolve_reset_base_url(request: Request) -> str:
     return BASE_URL
 
 
+MIN_PASSWORD_LENGTH = 8
+
+
+def _require_strong_password(password: str) -> None:
+    """Gemeinsame Mindestanforderung ans Passwort (Register/Reset/Change-
+    Password) – ein Ort statt drei Kopien derselben Zahl, siehe register()/
+    reset_password()/change_password()."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"Passwort mindestens {MIN_PASSWORD_LENGTH} Zeichen")
+
+
 def verify_password(plain: str, hashed: str) -> tuple[bool, Optional[str]]:
     """Gibt (gültig, neuer_hash) zurück – neuer_hash ist gesetzt wenn der
     bestehende Hash nicht mit dem aktuellen Default-Schema (Argon2id) erzeugt
@@ -385,8 +396,7 @@ async def register(request: Request, body: dict):
 
     if not name or not email or not password:
         raise HTTPException(400, "Name, E-Mail und Passwort erforderlich")
-    if len(password) < 8:
-        raise HTTPException(400, "Passwort mindestens 8 Zeichen")
+    _require_strong_password(password)
 
     with get_session() as session:
         existing = session.query(PosUser).filter_by(email=email).first()
@@ -537,8 +547,7 @@ async def reset_password(request: Request, body: dict):
     new_password = body.get("password", "")
     if not token or not new_password:
         raise HTTPException(400, "Token und neues Passwort erforderlich")
-    if len(new_password) < 8:
-        raise HTTPException(400, "Passwort mindestens 8 Zeichen")
+    _require_strong_password(new_password)
 
     with get_session() as session:
         user = session.query(PosUser).filter_by(reset_token=token).first()
@@ -554,6 +563,38 @@ async def reset_password(request: Request, body: dict):
         session.commit()
 
     return {"message": "Passwort erfolgreich geändert. Du kannst dich jetzt einloggen."}
+
+
+@app.post("/api/auth/change-password")
+@limiter.limit("5/minute")
+async def change_password(request: Request, body: dict, current_user=Depends(get_current_user)):
+    """
+    Passwort ändern für einen BEREITS eingeloggten Nutzer (gültiges JWT
+    vorausgesetzt, siehe get_current_user) – anders als forgot_password()/
+    reset_password() oben kein Anonymitäts-/Enumeration-Thema (der Nutzer
+    kennt seine eigene Existenz bereits), daher ein direktes 400 statt der
+    generischen Reset-Antwort, wenn current_password nicht passt.
+
+    current_user aus Depends(get_current_user) ist an eine bereits
+    geschlossene Session gebunden (siehe get_current_user-Docstring/
+    get_session()-Contextmanager) – Mutation daher wie bei connect_alpaca()
+    über einen frischen Re-Query per current_user.id, nicht direkt auf dem
+    Depends-Objekt.
+    """
+    current_password = body.get("current_password", "")
+    new_password = body.get("new_password", "")
+    if not current_password or not new_password:
+        raise HTTPException(400, "Aktuelles und neues Passwort erforderlich")
+    _require_strong_password(new_password)
+
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(id=current_user.id).first()
+        valid, _ = verify_password(current_password, user.password_hash)
+        if not valid:
+            raise HTTPException(400, "Aktuelles Passwort ist falsch")
+        user.password_hash = pwd_context.hash(new_password)
+
+    return {"message": "Passwort erfolgreich geändert."}
 
 
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
