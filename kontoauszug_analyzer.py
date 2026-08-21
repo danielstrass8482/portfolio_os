@@ -17,6 +17,7 @@ import csv
 import io
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 
@@ -75,10 +76,20 @@ eines PDFs als separate Bilder). Analysiere diese Kontoauszug-Seiten als Bilder.
 Extrahiere alle Buchungen mit Datum, Betrag, Empfänger und Verwendungszweck.
 Format: JSON wie oben beschrieben."""
 
-BATCH_SIZE = 5
-# Zeichen pro PDF, die in den Prompt übernommen werden – begrenzt den
-# Kontextverbrauch bei einem 5er-Batch auf ein handhabbares Tokenbudget
+# Wie viele Text-Chunks (siehe MAX_ZEICHEN_PRO_PDF/_chunk_text) pro LLM-Call
+# gebündelt werden. Niedrig gehalten (2 statt vormals 5), weil ein Chunk bei
+# einem dichten Kontoauszug ~15-20 Buchungen enthalten kann – 5 Chunks auf
+# einmal würden die JSON-Antwort über das Output-Tokenbudget hinaus aufblähen
+# (siehe max_tokens unten) und dadurch mitten im JSON abgeschnitten werden.
+BATCH_SIZE = 2
+# Maximale Chunk-Größe (Zeichen) je LLM-Call-Eingabe – begrenzt den
+# Kontextverbrauch pro Batch auf ein handhabbares Tokenbudget
 # (analog zu llm_analyst.analyze_kredit_vertrag, dort 15000 Zeichen je Dokument).
+# WICHTIG: Kein harter Text-Cutoff mehr (früher: t[:MAX_ZEICHEN_PRO_PDF], hat bei
+# langen Auszügen >85% der Buchungen stillschweigend verworfen) – lange PDFs
+# werden stattdessen in mehrere Chunks à max. MAX_ZEICHEN_PRO_PDF Zeichen
+# aufgeteilt (siehe _chunk_text), jeder Chunk läuft als eigener Batch-Eintrag
+# durch dieselbe Pipeline.
 MAX_ZEICHEN_PRO_PDF = 8000
 # Ab wie vielen extrahierten Zeichen ein PDF überhaupt als Text-Kandidat gilt.
 MIN_TEXT_ZEICHEN = 100
@@ -111,6 +122,78 @@ def _ist_lesbar(text: str) -> bool:
         return False
     buchstaben = sum(1 for c in kompakt if c.isalpha())
     return (buchstaben / len(kompakt)) >= 0.4
+
+
+# Erkennt die Kopfzeile einer Buchung in deutschen Kontoauszügen: irgendwo in
+# der Zeile ein Datum (TT.MM[.JJJJ]) UND ein Betrag im deutschen Zahlenformat
+# (mit Tausenderpunkt/Komma), unabhängig von Bank/Layout (Commerzbank, Sparkasse,
+# ...). Folgezeilen einer Buchung (Verwendungszweck, Mandatsref, Gläubiger-ID, …)
+# matchen das i.d.R. NICHT und bleiben so im selben Block wie ihre Kopfzeile.
+_BUCHUNGSZEILE_RE = re.compile(r"\d{1,2}\.\d{1,2}(\.\d{2,4})?.*\d{1,3}(\.\d{3})*,\d{2}-?\s*$")
+
+
+def _split_in_buchungsbloecke(text: str) -> list:
+    """
+    Zerlegt den Kontoauszug-Text in Blöcke, die jeweils an einer erkennbaren
+    Buchungszeile beginnen (siehe _BUCHUNGSZEILE_RE) und alle folgenden
+    Fortsetzungszeilen bis zur nächsten Buchungszeile enthalten. Wird von
+    _chunk_text genutzt, damit beim Aufteilen in Chunks nie mitten durch eine
+    Buchung geschnitten wird.
+    """
+    bloecke = []
+    aktueller = []
+    for zeile in text.split("\n"):
+        if _BUCHUNGSZEILE_RE.search(zeile.strip()) and aktueller:
+            bloecke.append("\n".join(aktueller))
+            aktueller = [zeile]
+        else:
+            aktueller.append(zeile)
+    if aktueller:
+        bloecke.append("\n".join(aktueller))
+    return bloecke
+
+
+def _chunk_text(text: str, max_len: int) -> list:
+    """
+    Teilt einen (potenziell langen) Kontoauszug-Text in Chunks von je
+    höchstens max_len Zeichen auf – als Ersatz für den früheren harten
+    Text-Cutoff. Chunk-Grenzen liegen an Buchungsblock-Grenzen
+    (_split_in_buchungsbloecke), sodass eine einzelne Buchung nie über zwei
+    Chunks verteilt wird (kein Zerschneiden, kein Duplikat-Risiko an der Naht).
+    Ein einzelner Block, der für sich schon max_len überschreitet (z.B. ein
+    Format ohne erkennbare Buchungszeilen), wird als Notfall an einfachen
+    Zeilenumbrüchen aufgeteilt, statt Inhalt zu verwerfen.
+    """
+    if len(text) <= max_len:
+        return [text] if text.strip() else []
+
+    chunks = []
+    aktuell = ""
+    for block in _split_in_buchungsbloecke(text):
+        kandidat = f"{aktuell}\n{block}" if aktuell else block
+        if len(kandidat) <= max_len:
+            aktuell = kandidat
+            continue
+        if aktuell:
+            chunks.append(aktuell)
+            aktuell = ""
+        if len(block) <= max_len:
+            aktuell = block
+            continue
+        # Notfall: einzelner Block zu groß -> an Zeilenumbrüchen aufteilen.
+        teil = ""
+        for zeile in block.split("\n"):
+            kandidat2 = f"{teil}\n{zeile}" if teil else zeile
+            if len(kandidat2) <= max_len:
+                teil = kandidat2
+            else:
+                if teil:
+                    chunks.append(teil)
+                teil = zeile
+        aktuell = teil
+    if aktuell:
+        chunks.append(aktuell)
+    return chunks
 
 
 def pdf_to_images(pdf_path: str) -> list:
@@ -174,7 +257,9 @@ def analyze_with_vision(image_bytes_list: list) -> dict:
         "text": "Extrahiere alle Buchungen dieser Kontoauszug-Seiten als JSON.",
     })
 
-    antwort = _ask(content, system=KONTOAUSZUG_VISION_SYSTEM_PROMPT, max_tokens=4096)
+    # max_tokens=8192 statt 4096: eine einzelne dichte Kontoauszug-Seite kann schon
+    # 15-20 Buchungen enthalten, deren JSON sonst mitten im String abgeschnitten wird.
+    antwort = _ask(content, system=KONTOAUSZUG_VISION_SYSTEM_PROMPT, max_tokens=8192)
     if antwort is None:
         return {}
     return _parse_batch_antwort(antwort)
@@ -275,8 +360,12 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
     Ablauf je PDF:
       1. pypdf-Text-Extraktion versuchen.
       2. Ist der Text lesbar (>= 100 Zeichen und genügend Buchstaben, siehe
-         _ist_lesbar), wandert das PDF in die Text-Verarbeitung (5er-Batches,
-         ein Claude-Call pro Batch – schont Tokens).
+         _ist_lesbar), wird er in Chunks à max. MAX_ZEICHEN_PRO_PDF Zeichen
+         aufgeteilt (_chunk_text, Grenzen an Buchungsblöcken statt mitten in
+         einer Buchung) und in Batches von je BATCH_SIZE Chunks verarbeitet
+         (ein Claude-Call pro Batch). Ein langes PDF kann so mehrere Batches
+         belegen statt wie früher nach den ersten 8000 Zeichen abgeschnitten
+         zu werden.
       3. Ist der Text unlesbar/zu kurz (z.B. Sparda-Bank Monospace-Salat), wird
          automatisch auf Vision umgeschaltet: PDF → PNG-Seiten (pdf2image/poppler)
          → Claude Vision (analyze_with_vision), ein Call pro PDF.
@@ -291,18 +380,21 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         return {"verfuegbar": False, "buchungen": [], "kreditbuchungen": [],
                 "kreditanalyse": _kreditanalyse_berechnen([]), "immobilienkaeufe": []}
 
-    # 1) Text-Extraktion und Entscheidung Text vs. Vision je PDF
-    text_pdfs = []      # (dateiname, extrahierter_text)
+    # 1) Text-Extraktion, Chunking und Entscheidung Text vs. Vision je PDF
+    text_chunks = []    # (label, chunk_text) - ein Eintrag pro Chunk, mehrere pro langem PDF
     vision_pdfs = []    # (dateiname, pdf_bytes)
     for dateiname, pdf_bytes in pdf_files:
         text = _extract_text(pdf_bytes)
         if _ist_lesbar(text):
-            text_pdfs.append((dateiname, text))
+            chunks = _chunk_text(text, MAX_ZEICHEN_PRO_PDF)
+            for i, chunk in enumerate(chunks, start=1):
+                label = dateiname if len(chunks) == 1 else f"{dateiname} (Teil {i}/{len(chunks)})"
+                text_chunks.append((label, chunk))
         else:
             print(f"ℹ️  '{dateiname}': Text unlesbar/zu kurz – Vision-Analyse")
             vision_pdfs.append((dateiname, pdf_bytes))
 
-    text_batches = [text_pdfs[i:i + BATCH_SIZE] for i in range(0, len(text_pdfs), BATCH_SIZE)]
+    text_batches = [text_chunks[i:i + BATCH_SIZE] for i in range(0, len(text_chunks), BATCH_SIZE)]
     anzahl_schritte = len(text_batches) + len(vision_pdfs)
 
     alle_buchungen = []
@@ -317,9 +409,13 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         if progress_callback:
             progress_callback(schritt, anzahl_schritte)
 
-        texte = [f"--- {dn} ---\n{t[:MAX_ZEICHEN_PRO_PDF]}" for dn, t in batch]
+        texte = [f"--- {dn} ---\n{t}" for dn, t in batch]
         user_content = "Kontoauszüge:\n\n" + "\n\n".join(texte)
-        antwort = _ask(user_content, system=KONTOAUSZUG_SYSTEM_PROMPT, max_tokens=4096)
+        # max_tokens=8192 statt 4096: bei dichten Kontoauszügen kann allein ein
+        # Chunk (siehe MAX_ZEICHEN_PRO_PDF) schon 15-20 Buchungen enthalten, ein
+        # 2er-Batch entsprechend 30-40 - deren JSON sonst mitten im String
+        # abgeschnitten wird (siehe kontoauszug-test 2026-08-21: "Unterminated string").
+        antwort = _ask(user_content, system=KONTOAUSZUG_SYSTEM_PROMPT, max_tokens=8192)
         if antwort is None:
             continue
         daten = _parse_batch_antwort(antwort)
