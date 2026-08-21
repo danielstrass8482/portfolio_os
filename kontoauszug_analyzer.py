@@ -53,11 +53,16 @@ Analysiere und extrahiere als JSON:
   "buchungen": [
     {"datum": "YYYY-MM-DD", "betrag": 0.0, "empfaenger": "...",
      "verwendungszweck": "...", "kategorie": "...",
-     "typ": "einnahme/ausgabe"}
+     "typ": "einnahme/ausgabe", "referenz": "End-to-End-Referenz oder null"}
   ]
 }
 Kategorien: Wohnen, Lebensmittel, Mobilität, Restaurant,
 Abonnements, Gesundheit, Versicherung, Sparen, Gehalt, Sonstiges
+
+"referenz": die "End-to-End-Ref." (oder falls nicht vorhanden: "Mandatsref")
+der Buchung, exakt wie im Dokument angegeben. Steht dort "NOTPROVIDED" oder
+gibt es keine erkennbare Referenz (z.B. bei Kartenzahlungen): null setzen -
+"NOTPROVIDED" ist ein Platzhalter der Bank und KEINE echte Referenz.
 
 Erkenne auch Darlehensauszahlungen und Kaufpreiszahlungen.
 Wenn du Überweisungen an Projektgesellschaften oder Bauträger
@@ -280,17 +285,36 @@ def _parse_batch_antwort(antwort: str) -> dict:
 
 
 def _dedupe(buchungen: list) -> list:
-    """Duplikat-Erkennung: gleiche datum+betrag+empfaenger = einmal speichern."""
+    """
+    Duplikat-Erkennung: gleiche datum+betrag+empfaenger = einmal speichern.
+
+    Erweiterung (siehe kontoauszug-test 2026-08-21): Ist eine End-to-End-
+    Referenz erkannt worden (Feld "referenz"), wird sie zusätzlich Teil des
+    Schlüssels. Sonst würden zwei ECHTE, unterschiedliche Buchungen mit
+    zufällig gleichem Datum+Betrag+Empfänger (z.B. zwei separate
+    Versicherungsraten am selben Tag) fälschlich als Duplikat verworfen -
+    live beobachtet bei CONTINENTALE 330,80€, PayPal 4,15€ und einem
+    10.000€-Tagesgeld-Transfer, je zweimal am selben Tag mit identischem
+    Betrag/Empfänger, aber unterschiedlicher Referenz.
+
+    Fehlt die Referenz (typisch bei Kartenzahlungen, die keine End-to-End-Ref
+    haben) oder ist sie nur der Commerzbank-Platzhalter "NOTPROVIDED" (bei
+    Daueraufträgen/SEPA ohne echte Referenz), fällt der Schlüssel auf
+    datum+betrag+empfaenger zurück - das bleibt dort der einzige Schutz gegen
+    echte Duplikate bei erneutem Upload desselben Auszugs.
+    """
     gesehen = set()
     ergebnis = []
     for b in buchungen:
         if not isinstance(b, dict):
             continue
-        key = (
+        basis = (
             b.get("datum"),
             round(float(b.get("betrag") or 0.0), 2),
             (b.get("empfaenger") or "").strip().lower(),
         )
+        referenz = (b.get("referenz") or "").strip().lower()
+        key = basis + (referenz,) if referenz and referenz != "notprovided" else basis
         if key in gesehen:
             continue
         gesehen.add(key)
@@ -316,13 +340,91 @@ def _dedupe_immobilienkaeufe(kaeufe: list) -> list:
     return ergebnis
 
 
-def _merge_batch(daten: dict, buchungen: list, kreditbuchungen: list, immobilienkaeufe: list):
-    """Ergebnis eines einzelnen Batches (Text oder Vision) in die Gesamtlisten mergen."""
-    buchungen.extend(daten.get("buchungen") or [])
+def _merge_batch(daten: dict, buchungen: list, kreditbuchungen: list, immobilienkaeufe: list,
+                  quelle_datei: str = None):
+    """
+    Ergebnis eines einzelnen Batches (Text oder Vision) in die Gesamtlisten mergen.
+    quelle_datei (falls gesetzt) wird als internes Feld "_quelle_datei" an jede
+    Buchung angehängt - wird von _saldo_check() gebraucht, um Buchungen ihrer
+    Quelldatei zuzuordnen, und vor der Rückgabe aus analyze_kontoauszuege()
+    wieder entfernt (kein Teil der öffentlichen Buchungs-Struktur).
+    """
+    neue_buchungen = daten.get("buchungen") or []
+    if quelle_datei:
+        for b in neue_buchungen:
+            if isinstance(b, dict):
+                b["_quelle_datei"] = quelle_datei
+    buchungen.extend(neue_buchungen)
     kreditbuchungen.extend(daten.get("kreditbuchungen") or [])
     imm = daten.get("immobilienkauf")
     if isinstance(imm, dict) and (imm.get("gesamtbetrag") or imm.get("einzelzahlungen")):
         immobilienkaeufe.append(imm)
+
+
+# Erkennt "Alter/Neuer Kontostand vom TT.MM.JJJJ <Betrag>" - bisher nur für
+# das Commerzbank-Format getestet. Deterministisch per Regex statt per LLM,
+# da Saldi exakte Zahlen sind und nicht der Unschärfe der LLM-Extraktion
+# unterliegen sollen (siehe _saldo_check).
+_KONTOSTAND_RE = re.compile(r"(Alter|Neuer) Kontostand vom \d{2}\.\d{2}\.\d{4}\s+([\d.]+,\d{2})(-?)")
+
+
+def _kontostaende(text: str) -> dict:
+    """
+    Extrahiert Alter/Neuer Kontostand aus dem vollen (ungekürzten) PDF-Text.
+    Liefert ein dict mit "alt"/"neu" - fehlt einer oder beide (Format nicht
+    erkannt), fehlt der entsprechende Schlüssel; der Aufrufer überspringt den
+    Konsistenz-Check für diese Datei dann einfach (degraded mode statt Fehler).
+    """
+    ergebnis = {}
+    for label, betrag_s, minus in _KONTOSTAND_RE.findall(text):
+        betrag = float(betrag_s.replace(".", "").replace(",", "."))
+        if minus == "-":
+            betrag = -betrag
+        ergebnis["alt" if label == "Alter" else "neu"] = betrag
+    return ergebnis
+
+
+def _saldo_check(buchungen: list, kontostaende_je_datei: dict) -> list:
+    """
+    Nachgelagerter Konsistenz-Check (siehe kontoauszug-test 2026-08-21): Alter
+    Kontostand + Einnahmen - Ausgaben muss (bis auf Rundung) dem Neuen
+    Kontostand entsprechen. Weicht es ab, wurden vermutlich Buchungen nicht
+    erkannt (z.B. eine LLM-Extraktionslücke bei mehreren optisch identischen
+    Zeilen über einen Seitenumbruch hinweg) - KEINE automatische Korrektur,
+    nur eine sichtbare Warnung im Rückgabewert, damit sowas künftig auffällt
+    statt stillschweigend zu fehlen.
+
+    Nur für Dateien möglich, für die _kontostaende() beide Werte gefunden hat
+    (kontostaende_je_datei) UND die über den Text-Batch-Pfad liefen (nur dort
+    ist "_quelle_datei" gesetzt, siehe _merge_batch) - für Vision-PDFs oder
+    unbekannte Kontostand-Formate wird der Check für diese Datei übersprungen.
+    """
+    je_datei = {}
+    for b in buchungen:
+        dateiname = b.get("_quelle_datei")
+        if dateiname:
+            je_datei.setdefault(dateiname, []).append(b)
+
+    warnungen = []
+    for dateiname, saldi in kontostaende_je_datei.items():
+        if "alt" not in saldi or "neu" not in saldi:
+            continue
+        posten = je_datei.get(dateiname, [])
+        einnahmen = sum(float(b.get("betrag") or 0.0) for b in posten if b.get("typ") == "einnahme")
+        ausgaben = sum(float(b.get("betrag") or 0.0) for b in posten if b.get("typ") == "ausgabe")
+        erwartet = round(saldi["alt"] + einnahmen - ausgaben, 2)
+        abweichung = round(erwartet - saldi["neu"], 2)
+        if abs(abweichung) > 0.01:
+            warnungen.append({
+                "dateiname": dateiname,
+                "alter_kontostand": saldi["alt"],
+                "neuer_kontostand_pdf": saldi["neu"],
+                "neuer_kontostand_berechnet": erwartet,
+                "abweichung": abweichung,
+                "hinweis": ("Kontoauszug-Summen weichen von den erkannten Buchungen ab - "
+                            "evtl. wurden Buchungen nicht erkannt."),
+            })
+    return warnungen
 
 
 def _kreditanalyse_berechnen(kreditbuchungen: list) -> dict:
@@ -370,31 +472,47 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
          automatisch auf Vision umgeschaltet: PDF → PNG-Seiten (pdf2image/poppler)
          → Claude Vision (analyze_with_vision), ein Call pro PDF.
 
-    Buchungen werden über alles hinweg anhand von datum+betrag+empfaenger
-    dedupliziert. Bei API-Ausfall (siehe llm_analyst._ask) oder fehlendem Key:
-    degraded mode, bereits erkannte Batches bleiben erhalten, "verfuegbar": False
-    zeigt dem Aufrufer an, dass KEIN Batch ausgewertet werden konnte.
+    Buchungen werden über alles hinweg anhand von datum+betrag+empfaenger(+referenz,
+    siehe _dedupe) dedupliziert. Bei API-Ausfall (siehe llm_analyst._ask) oder
+    fehlendem Key: degraded mode, bereits erkannte Batches bleiben erhalten,
+    "verfuegbar": False zeigt dem Aufrufer an, dass KEIN Batch ausgewertet
+    werden konnte.
+
+    Zusätzlich (siehe _saldo_check): wenn eine Datei einen erkennbaren Alter/
+    Neuer-Kontostand ausweist, wird die Summe der erkannten Buchungen dagegen
+    geprüft; Abweichungen landen im Rückgabefeld "saldo_warnungen" (leer,
+    wenn kein Kontostand gefunden wurde oder alles aufgeht).
     """
     if not ANTHROPIC_API_KEY:
         print("⚠️  ANTHROPIC_API_KEY fehlt – Kontoauszug-Analyse übersprungen (degraded mode)")
         return {"verfuegbar": False, "buchungen": [], "kreditbuchungen": [],
-                "kreditanalyse": _kreditanalyse_berechnen([]), "immobilienkaeufe": []}
+                "kreditanalyse": _kreditanalyse_berechnen([]), "immobilienkaeufe": [],
+                "saldo_warnungen": []}
 
-    # 1) Text-Extraktion, Chunking und Entscheidung Text vs. Vision je PDF
-    text_chunks = []    # (label, chunk_text) - ein Eintrag pro Chunk, mehrere pro langem PDF
+    # 1) Text-Extraktion, Kontostand-Erkennung, Chunking und Entscheidung
+    # Text vs. Vision je PDF. text_batches: Liste von (dateiname, batch),
+    # ein Batch NIE aus mehreren PDFs gemischt (_saldo_check muss Buchungen
+    # eindeutig ihrer Quelldatei zuordnen können).
+    text_batches = []
+    kontostaende_je_datei = {}  # dateiname -> {"alt": float, "neu": float}
     vision_pdfs = []    # (dateiname, pdf_bytes)
     for dateiname, pdf_bytes in pdf_files:
         text = _extract_text(pdf_bytes)
         if _ist_lesbar(text):
+            saldi = _kontostaende(text)
+            if saldi:
+                kontostaende_je_datei[dateiname] = saldi
             chunks = _chunk_text(text, MAX_ZEICHEN_PRO_PDF)
-            for i, chunk in enumerate(chunks, start=1):
-                label = dateiname if len(chunks) == 1 else f"{dateiname} (Teil {i}/{len(chunks)})"
-                text_chunks.append((label, chunk))
+            labeled = [
+                (dateiname if len(chunks) == 1 else f"{dateiname} (Teil {i}/{len(chunks)})", chunk)
+                for i, chunk in enumerate(chunks, start=1)
+            ]
+            for i in range(0, len(labeled), BATCH_SIZE):
+                text_batches.append((dateiname, labeled[i:i + BATCH_SIZE]))
         else:
             print(f"ℹ️  '{dateiname}': Text unlesbar/zu kurz – Vision-Analyse")
             vision_pdfs.append((dateiname, pdf_bytes))
 
-    text_batches = [text_chunks[i:i + BATCH_SIZE] for i in range(0, len(text_chunks), BATCH_SIZE)]
     anzahl_schritte = len(text_batches) + len(vision_pdfs)
 
     alle_buchungen = []
@@ -404,7 +522,7 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
     schritt = 0
 
     # 2) Text-Batches (klassischer Weg)
-    for batch in text_batches:
+    for dateiname, batch in text_batches:
         schritt += 1
         if progress_callback:
             progress_callback(schritt, anzahl_schritte)
@@ -422,7 +540,8 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         if not daten:
             continue
         mind_ein_batch_erfolgreich = True
-        _merge_batch(daten, alle_buchungen, alle_kreditbuchungen, immobilienkaeufe)
+        _merge_batch(daten, alle_buchungen, alle_kreditbuchungen, immobilienkaeufe,
+                     quelle_datei=dateiname)
 
     # 3) Vision-Fallback je unlesbarem PDF
     for dateiname, pdf_bytes in vision_pdfs:
@@ -438,11 +557,16 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         if not daten:
             continue
         mind_ein_batch_erfolgreich = True
-        _merge_batch(daten, alle_buchungen, alle_kreditbuchungen, immobilienkaeufe)
+        _merge_batch(daten, alle_buchungen, alle_kreditbuchungen, immobilienkaeufe,
+                     quelle_datei=dateiname)
 
     alle_buchungen = _dedupe(alle_buchungen)
     alle_kreditbuchungen = _dedupe(alle_kreditbuchungen)
     immobilienkaeufe = _dedupe_immobilienkaeufe(immobilienkaeufe)
+
+    saldo_warnungen = _saldo_check(alle_buchungen, kontostaende_je_datei)
+    for b in alle_buchungen:
+        b.pop("_quelle_datei", None)
 
     return {
         "verfuegbar": mind_ein_batch_erfolgreich,
@@ -450,6 +574,7 @@ def analyze_kontoauszuege(pdf_files: list, progress_callback=None) -> dict:
         "kreditbuchungen": alle_kreditbuchungen,
         "kreditanalyse": _kreditanalyse_berechnen(alle_kreditbuchungen),
         "immobilienkaeufe": immobilienkaeufe,
+        "saldo_warnungen": saldo_warnungen,
     }
 
 
