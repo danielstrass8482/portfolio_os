@@ -89,6 +89,19 @@ class PosUser(Base):
     approval_token         = Column(String(100), nullable=True)
     approval_token_expires = Column(DateTime, nullable=True)
 
+    # Produkt-Scope (2026-08-21): pos_users ist die gemeinsame Identitätstabelle
+    # für trading_bot UND portfolio_os (trading_bot hat keine eigene User-Tabelle,
+    # /api/auth/ + /api/user/ werden von der Trading-Bot-Domain per nginx auf
+    # dieses api.py durchgereicht). Bis eben hieß "in pos_users registriert" =
+    # "hat auch einen funktionierenden portfolio_os-Login", ohne dass das je
+    # bewusst entschieden wurde (siehe Diagnose zu pos_users id=9). Diese beiden
+    # Flags trennen das: welches Produkt darf dieser Nutzer tatsächlich nutzen.
+    # /api/auth/* und /api/user/* bleiben bewusst ungegated (siehe api.py
+    # protected_shared) – Login/Registrierung/Alpaca-Connect müssen für
+    # Trading-Bot-only-Nutzer weiter funktionieren.
+    trading_bot_access  = Column(Boolean, default=True)
+    portfolio_os_access = Column(Boolean, default=False)
+
     # Passwort-Reset (siehe /api/auth/forgot-password + /api/auth/reset-password
     # in api.py) – bewusst EIGENE Spalten statt approval_token mitzubenutzen:
     # semantisch anderer Zweck (Registrierungs-Freischaltung vs. Passwort-
@@ -557,6 +570,15 @@ def _migrate_user_columns():
         conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_api_key_encrypted TEXT"))
         conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_secret_key_encrypted TEXT"))
         conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS alpaca_mode TEXT DEFAULT 'paper'"))
+        # Produkt-Scope (2026-08-21, siehe PosUser-Modelkommentar oben). DEFAULT
+        # true/false greift wie bei den Spalten oben auch rückwirkend für
+        # bestehende Zeilen. Ausnahme Daniel (id=1): einziger bestehender Nutzer
+        # mit tatsächlicher portfolio_os-Nutzung (onboarding_completed=true +
+        # echte Positionen/Snapshots, siehe Diagnose 2026-08-21) -- explizites
+        # UPDATE, alle anderen bleiben beim DEFAULT false.
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS trading_bot_access BOOLEAN DEFAULT true"))
+        conn.execute(text("ALTER TABLE pos_users ADD COLUMN IF NOT EXISTS portfolio_os_access BOOLEAN DEFAULT false"))
+        conn.execute(text("UPDATE pos_users SET portfolio_os_access = true WHERE id = 1"))
 
 
 def _migrate_tax_config_columns():

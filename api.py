@@ -205,6 +205,32 @@ def _resolve_reset_base_url(request: Request) -> str:
     return BASE_URL
 
 
+# Produkt-Scope bei Registrierung (2026-08-21): pos_users ist die gemeinsame
+# Identitätstabelle für trading_bot UND portfolio_os (siehe PosUser-
+# Modelkommentar in database.py) – bis eben bekam JEDE Registrierung über
+# /api/auth/register automatisch vollen portfolio_os-Zugriff, unabhängig
+# davon über welches Frontend sie kam. PORTFOLIO_OS_ORIGINS grenzt die
+# tatsächliche portfolio_os-Domain gegen die Trading-Bot-Domains ab (gleiches
+# Origin/Referer-Muster wie ALLOWED_RESET_ORIGINS/_resolve_reset_base_url
+# oben). Aktuell hat NUR trading_react (trading.diestraesschens.de /
+# app.ai-tradingbot.de) ein Registrierungsformular, das /api/auth/register
+# aufruft (siehe trading_react/src/lib/auth.ts) – portfolio_react hat keine
+# eigene Registrierungs-Seite (Verwaltung/Onboarding setzt einen bestehenden
+# Login voraus). Diese Origin-Erkennung greift also aktuell praktisch nie in
+# den portfolio_os-Zweig, ist aber die korrekte Vorbereitung falls das je
+# einen eigenen Signup-Weg bekommt.
+PORTFOLIO_OS_ORIGINS = {"https://portfolio.diestraesschens.de", "http://localhost:3000"}
+
+
+def _is_portfolio_os_signup(request: Request) -> bool:
+    """True nur wenn Origin/Referer eindeutig auf PORTFOLIO_OS_ORIGINS zeigt;
+    fehlender/unbekannter Header fällt auf False zurück (sicherer Default –
+    portfolio_os_access wird nie versehentlich vergeben, siehe Modulkommentar
+    oben)."""
+    raw = (request.headers.get("origin") or request.headers.get("referer") or "").rstrip("/")
+    return any(raw == o or raw.startswith(o + "/") for o in PORTFOLIO_OS_ORIGINS)
+
+
 MIN_PASSWORD_LENGTH = 8
 
 
@@ -406,6 +432,7 @@ async def register(request: Request, body: dict):
         token = secrets.token_urlsafe(32)
         expires = datetime.utcnow() + timedelta(hours=48)
         password_hash = pwd_context.hash(password)
+        is_portfolio_os = _is_portfolio_os_signup(request)
         user = PosUser(
             name=name,
             email=email,
@@ -415,6 +442,8 @@ async def register(request: Request, body: dict):
             registration_reason=reason,
             approval_token=token,
             approval_token_expires=expires,
+            trading_bot_access=not is_portfolio_os,
+            portfolio_os_access=is_portfolio_os,
         )
         session.add(user)
         session.flush()
@@ -597,11 +626,33 @@ async def change_password(request: Request, body: dict, current_user=Depends(get
     return {"message": "Passwort erfolgreich geändert."}
 
 
+def require_portfolio_os_access(current_user=Depends(get_current_user)):
+    """
+    Zusätzlich zum gültigen JWT (get_current_user) muss der Nutzer
+    portfolio_os_access=true haben, sonst 403 statt nur leerer/gefilterter
+    Ergebnisse (siehe PosUser-Modelkommentar in database.py). Router-weite
+    Dependency auf `protected` – NICHT auf `protected_shared` (dort bewusst
+    weggelassen, siehe dortiger Kommentar).
+    """
+    if not current_user.portfolio_os_access:
+        raise HTTPException(403, "Kein Zugriff auf Portfolio-OS für diesen Account")
+    return current_user
+
+
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
-# Router-weite Dependency erzwingt ein gültiges JWT für JEDEN Endpoint darunter,
-# ohne dass jede einzelne Funktionssignatur angepasst werden muss. Nur
-# /api/auth/* (oben) und /api/health (unten) bleiben öffentlich auf `app`.
-protected = APIRouter(dependencies=[Depends(get_current_user)])
+# Router-weiten Dependencies erzwingen ein gültiges JWT UND portfolio_os_access
+# für JEDEN Endpoint darunter, ohne dass jede einzelne Funktionssignatur
+# angepasst werden muss. Nur /api/auth/* (oben), /api/user/* (protected_shared,
+# unten) und /api/health (unten) bleiben ohne portfolio_os_access-Prüfung.
+protected = APIRouter(dependencies=[Depends(get_current_user), Depends(require_portfolio_os_access)])
+
+# Für Endpoints, die für JEDEN eingeloggten Nutzer erreichbar bleiben müssen,
+# unabhängig von portfolio_os_access – aktuell nur die Alpaca-Connect/Status-
+# Endpoints (siehe unten), da trading_bot-only-Nutzer (z.B. Dana, siehe
+# Diagnose 2026-08-21) ihren Alpaca-Account weiterhin verbinden können müssen,
+# auch ohne portfolio_os_access. /api/auth/* liegt bewusst NICHT hier,
+# sondern direkt auf `app` (Login/Register brauchen noch gar keinen current_user).
+protected_shared = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 KATEGORIEN = [
@@ -806,7 +857,7 @@ def update_user(user_id: int, payload: dict, current_user=Depends(get_current_us
 # pos_users, analog zu PosRealEstate.adresse via encrypt_field/decrypt_field)
 # ─────────────────────────────────────────────
 
-@protected.post("/api/user/alpaca-connect")
+@protected_shared.post("/api/user/alpaca-connect")
 def connect_alpaca(body: dict, current_user=Depends(get_current_user)):
     api_key = body.get("api_key", "").strip()
     secret_key = body.get("secret_key", "").strip()
@@ -843,7 +894,7 @@ def connect_alpaca(body: dict, current_user=Depends(get_current_user)):
     }
 
 
-@protected.get("/api/user/alpaca-status")
+@protected_shared.get("/api/user/alpaca-status")
 def alpaca_status(current_user=Depends(get_current_user)):
     with get_session() as session:
         user = session.query(PosUser).filter_by(id=current_user.id).first()
@@ -1842,6 +1893,7 @@ def health():
 
 
 app.include_router(protected)
+app.include_router(protected_shared)
 
 
 if __name__ == "__main__":
