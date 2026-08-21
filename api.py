@@ -46,7 +46,7 @@ from database import (
     get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
-    encrypt_field, decrypt_field, log_admin_access,
+    encrypt_field, decrypt_field, log_admin_access, user_context,
 )
 
 # Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
@@ -639,12 +639,61 @@ def require_portfolio_os_access(current_user=Depends(get_current_user)):
     return current_user
 
 
+async def _apply_user_context(current_user=Depends(get_current_user)):
+    """
+    RLS-Umbau Chunk 1 (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md):
+    setzt database.user_context(current_user.id) für die Dauer genau dieses
+    einen Requests -- jeder get_session()-Aufruf innerhalb des Request-
+    Handlers (egal ob direkt in api.py oder in einer der ~48 aufgerufenen
+    Business-Logic-Funktionen aus portfolio.py/tax_engine.py/rebalancing.py/
+    database.py) übernimmt dadurch automatisch den korrekten user_id-Kontext,
+    OHNE dass diese Funktionen selbst angepasst werden müssen. FastAPI
+    schließt Yield-Dependencies wie einen with-Block: Code vor `yield` läuft
+    vor dem Endpoint, der finally-Block in user_context() (über
+    Depends-Exit-Stack) läuft garantiert danach, auch bei einer Exception im
+    Endpoint selbst.
+
+    BEWUSST `async def`, NICHT `def` (beim ersten Testlauf als `ValueError:
+    Token ... was created in a different Context` aufgefallen): FastAPI führt
+    synchrone Yield-Dependencies über contextmanager_in_threadpool aus, das
+    __enter__ (vor yield) und __exit__ (nach yield) über ZWEI SEPARATE
+    run_in_threadpool()-Aufrufe dispatcht -- jeder kopiert den Kontext für
+    sich (anyio contextvars.copy_context()), wodurch das beim Setzen
+    erzeugte contextvars.Token beim Zurücksetzen aus einer ANDEREN Context-
+    Kopie stammt und Python das zu Recht ablehnt. Als `async def` läuft die
+    gesamte Dependency (beide Seiten des yield) in einem Rutsch im
+    Request-Task des Event-Loops, ohne Threadpool-Sprung dazwischen -- der
+    nachfolgende Endpoint (meist synchrones `def`) sieht den gesetzten Wert
+    trotzdem korrekt, weil FastAPI dessen eigenen run_in_threadpool()-Aufruf
+    erst NACH dem Dependency-Durchlauf startet und dabei den zu diesem
+    Zeitpunkt bereits aktualisierten Kontext kopiert (s. Testbericht).
+
+    Setzt aktuell current_user.id, NICHT das Ergebnis von _resolve_user_id()
+    -- der Admin-Cross-View-Fall (Admin ruft /api/positions?user_id=<andere
+    ID> auf) bekommt dadurch in DIESEM Chunk noch NICHT automatisch den
+    korrekten Ziel-Kontext gesetzt. Das ist bewusst so (siehe Plan-Dokument,
+    eigener Sonderfall/Chunk) und aktuell folgenlos, da FORCE ROW LEVEL
+    SECURITY hier noch nicht aktiviert wird -- der Kontext wird zwar gesetzt,
+    wirkt aber (wie bei allen Tabellen in diesem Chunk) noch nicht
+    sicherheitsrelevant, weil Postgres RLS-Policies ohne FORCE für den
+    Tabellenbesitzer (trading_bot_user, mit dem die App verbindet) ohnehin
+    ignoriert.
+    """
+    with user_context(current_user.id):
+        yield current_user
+
+
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` – die
 # Router-weiten Dependencies erzwingen ein gültiges JWT UND portfolio_os_access
 # für JEDEN Endpoint darunter, ohne dass jede einzelne Funktionssignatur
 # angepasst werden muss. Nur /api/auth/* (oben), /api/user/* (protected_shared,
 # unten) und /api/health (unten) bleiben ohne portfolio_os_access-Prüfung.
-protected = APIRouter(dependencies=[Depends(get_current_user), Depends(require_portfolio_os_access)])
+# _apply_user_context als letzte Dependency, damit sie erst NACH
+# require_portfolio_os_access (403-Check) läuft -- FastAPI löst
+# Router-Dependencies in Listenreihenfolge auf.
+protected = APIRouter(dependencies=[
+    Depends(get_current_user), Depends(require_portfolio_os_access), Depends(_apply_user_context),
+])
 
 # Für Endpoints, die für JEDEN eingeloggten Nutzer erreichbar bleiben müssen,
 # unabhängig von portfolio_os_access – aktuell nur die Alpaca-Connect/Status-
@@ -652,7 +701,11 @@ protected = APIRouter(dependencies=[Depends(get_current_user), Depends(require_p
 # Diagnose 2026-08-21) ihren Alpaca-Account weiterhin verbinden können müssen,
 # auch ohne portfolio_os_access. /api/auth/* liegt bewusst NICHT hier,
 # sondern direkt auf `app` (Login/Register brauchen noch gar keinen current_user).
-protected_shared = APIRouter(dependencies=[Depends(get_current_user)])
+# _apply_user_context auch hier: die zwei Endpoints lesen/schreiben zwar nur
+# pos_users (außerhalb des RLS-Scopes dieser Runde), aber ein konsistent
+# gesetzter Kontext über ALLE eingeloggten Requests hinweg ist einfacher zu
+# verifizieren als eine Ausnahme extra zu begründen.
+protected_shared = APIRouter(dependencies=[Depends(get_current_user), Depends(_apply_user_context)])
 
 
 KATEGORIEN = [

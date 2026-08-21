@@ -6,13 +6,14 @@ das Präfix "pos_", damit es keine Konflikte mit den Trading-Bot-Tabellen gibt.
 
 from datetime import datetime, date
 from contextlib import contextmanager
+import contextvars
 import json
 import os
 
 from cryptography.fernet import Fernet
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean,
-    DateTime, Date, Text, ForeignKey, func, JSON
+    DateTime, Date, Text, ForeignKey, func, JSON, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 
@@ -495,11 +496,62 @@ class PosKategorisierungsregel(Base):
 # SESSION / INIT
 # ─────────────────────────────────────────────
 
+# RLS-Umbau Chunk 1 (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md):
+# _current_user_ctx trägt die user_id des aktuell "aktiven" Requests/Blocks.
+# get_session() liest sie automatisch aus und setzt app.current_user_id für
+# jede neu geöffnete Session -- dadurch profitieren die ~48 Business-Logic-
+# Funktionen in portfolio.py/tax_engine.py/rebalancing.py/database.py (die
+# schon heute get_session() nutzen und user_id als Parameter bekommen) OHNE
+# eigene Codeänderung, sobald irgendein Aufrufer weiter oben user_context()
+# gesetzt hat (siehe api.py: einmal pro Request über eine Dependency, nicht
+# in jedem einzelnen Endpoint einzeln). ContextVar statt globaler Variable,
+# weil sie pro asyncio-Task isoliert ist -- parallele Requests unter uvicorn
+# überschreiben sich dadurch nicht gegenseitig (siehe Testbericht).
+#
+# WICHTIG: In diesem Chunk hat das NOCH KEINE sicherheitsrelevante Wirkung.
+# app.current_user_id wird zwar jetzt korrekt gesetzt, aber Postgres wendet
+# RLS-Policies per Default nicht auf den Tabellenbesitzer (trading_bot_user)
+# an -- das ändert erst FORCE ROW LEVEL SECURITY, das bewusst NICHT Teil
+# dieses Chunks ist (siehe Plan-Dokument, Chunk 6/7).
+_current_user_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "portfolio_os_current_user_id", default=None
+)
+
+
+@contextmanager
+def user_context(user_id: int | None):
+    """
+    Setzt den RLS-Kontext für die Dauer dieses Blocks -- jede get_session()-
+    Session, die INNERHALB des Blocks geöffnet wird, übernimmt automatisch
+    user_id (siehe get_session()). Setzt den vorherigen Zustand beim
+    Verlassen des Blocks IMMER zurück, auch bei Exceptions (try/finally über
+    contextvars.Token) und auch bei Verschachtelung (ein innerer Block stellt
+    beim Verlassen exakt den äußeren Zustand wieder her, nicht None).
+
+    user_id=None setzt explizit KEINEN Kontext (z.B. für systemweite Jobs
+    ohne Einzelnutzerbezug) -- noch nicht Teil dieses Chunks, siehe Plan.
+    """
+    token = _current_user_ctx.set(user_id)
+    try:
+        yield
+    finally:
+        _current_user_ctx.reset(token)
+
+
 @contextmanager
 def get_session():
-    """Context Manager für sichere Datenbanksessions (Commit/Rollback automatisch)."""
+    """
+    Context Manager für sichere Datenbanksessions (Commit/Rollback automatisch).
+    Setzt zusätzlich app.current_user_id per SET LOCAL (via set_config() --
+    kein String-Interpolation, damit keine SQL-Injection möglich ist), FALLS
+    user_context() aktiv ist -- siehe Kommentar oben. Ohne aktiven Kontext
+    (Default) verhält sich diese Funktion exakt wie vorher.
+    """
     session = SessionLocal()
     try:
+        uid = _current_user_ctx.get()
+        if uid is not None:
+            session.execute(text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(uid)})
         yield session
         session.commit()
     except Exception:
@@ -512,31 +564,18 @@ def get_session():
 @contextmanager
 def get_session_for_user(user_id: int):
     """
-    Wie get_session(), setzt zusätzlich app.current_user_id für die Dauer der
-    Transaktion (SET LOCAL via set_config() – kein String-Interpolation, damit
-    keine SQL-Injection möglich ist). Voraussetzung für die Row-Level-Security-
-    Policies auf den pos_*-Tabellen (siehe Security Schritt 2).
-
-    WICHTIG: trading_bot_user ist Owner der pos_*-Tabellen, und Postgres wendet
-    RLS-Policies per Default NICHT auf den Tabellenbesitzer an (nur zusätzlich
-    mit FORCE ROW LEVEL SECURITY). Die Policies sind aktuell also Vorbereitung
-    für echtes Multi-Tenant, noch OHNE Wirkung – und diese Funktion wird von
-    den bestehenden API-Endpoints noch NICHT verwendet (die weiterhin
-    get_session() nutzen). Erst wenn ein zweiter echter Login-Nutzer dazukommt,
-    lohnt sich der Aufwand, alle relevanten Endpoints hierauf umzustellen UND
-    FORCE ROW LEVEL SECURITY zu setzen.
+    Convenience: get_session() innerhalb eines user_context(user_id)-Blocks,
+    für einmalige Aufrufe außerhalb eines Request-Kontexts (z.B. Scripte,
+    Tests, künftig main.py/notifier.py-Jobs -- siehe Plan-Dokument Sonderfall
+    b, noch nicht Teil dieses Chunks). Für FastAPI-Request-Handler NICHT
+    hierüber gehen, sondern user_context() einmal pro Request setzen (siehe
+    api.py) und normal get_session() nutzen -- sonst würde ein Request, der
+    mehrere get_session()-Blöcke öffnet, den Kontext zwischen den Blöcken
+    wieder verlieren.
     """
-    from sqlalchemy import text
-    session = SessionLocal()
-    try:
-        session.execute(text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)})
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    with user_context(user_id):
+        with get_session() as session:
+            yield session
 
 
 def init_db():
