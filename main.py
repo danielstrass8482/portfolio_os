@@ -17,7 +17,7 @@ from config import (
     validate_config, DAILY_UPDATE_HOUR, WEEKLY_SUMMARY_HOUR,
     MONTHLY_REPORT_HOUR, QUARTERLY_REPORT_HOUR, YEARLY_REPORT_HOUR,
 )
-from database import init_db, get_session, PosUser, save_daily_snapshot
+from database import init_db, get_session, PosUser, save_daily_snapshot, user_context
 import portfolio as portfolio_module
 import notifier
 import trading_bot_connector
@@ -51,10 +51,11 @@ def daily_job():
 
     for user_id in _alle_user_ids():
         try:
-            summary = portfolio_module.get_portfolio_summary(user_id)
-            with get_session() as session:
-                save_daily_snapshot(session, user_id, summary["gesamtvermoegen"], summary["asset_breakdown"])
-            notifier.send_daily_alert(user_id)
+            with user_context(user_id):
+                summary = portfolio_module.get_portfolio_summary(user_id)
+                with get_session() as session:
+                    save_daily_snapshot(session, user_id, summary["gesamtvermoegen"], summary["asset_breakdown"])
+                notifier.send_daily_alert(user_id)
         except Exception as e:
             print(f"⚠️  Daily Job für Nutzer {user_id} fehlgeschlagen: {e} (degraded mode, weiter mit nächstem Nutzer)")
 
@@ -64,7 +65,8 @@ def weekly_job():
     print(f"[{date.today()}] Weekly Job: Wochen-Summary...")
     for user_id in _alle_user_ids():
         try:
-            notifier.send_weekly_summary(user_id)
+            with user_context(user_id):
+                notifier.send_weekly_summary(user_id)
         except Exception as e:
             print(f"⚠️  Weekly Job für Nutzer {user_id} fehlgeschlagen: {e}")
 
@@ -74,7 +76,8 @@ def monthly_job():
     print(f"[{date.today()}] Monthly Job: Monats-Report...")
     for user_id in _alle_user_ids():
         try:
-            notifier.send_monthly_report(user_id)
+            with user_context(user_id):
+                notifier.send_monthly_report(user_id)
         except Exception as e:
             print(f"⚠️  Monthly Job für Nutzer {user_id} fehlgeschlagen: {e}")
 
@@ -84,9 +87,10 @@ def quarterly_job():
     print(f"[{date.today()}] Quarterly Job: Quartals-Report + Rebalancing-Vorschlag...")
     for user_id in _alle_user_ids():
         try:
-            # send_quarterly_report() erstellt intern bereits einen Rebalancing-Vorschlag
-            # (typ="quartal") und verschickt ihn zusammen mit dem KI-Bericht in einer Mail.
-            notifier.send_quarterly_report(user_id)
+            with user_context(user_id):
+                # send_quarterly_report() erstellt intern bereits einen Rebalancing-Vorschlag
+                # (typ="quartal") und verschickt ihn zusammen mit dem KI-Bericht in einer Mail.
+                notifier.send_quarterly_report(user_id)
         except Exception as e:
             print(f"⚠️  Quarterly Job für Nutzer {user_id} fehlgeschlagen: {e}")
 
@@ -96,7 +100,8 @@ def yearly_job():
     print(f"[{date.today()}] Yearly Job: Jahres-Report...")
     for user_id in _alle_user_ids():
         try:
-            notifier.send_yearly_report(user_id)
+            with user_context(user_id):
+                notifier.send_yearly_report(user_id)
         except Exception as e:
             print(f"⚠️  Yearly Job für Nutzer {user_id} fehlgeschlagen: {e}")
 

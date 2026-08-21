@@ -528,14 +528,53 @@ def user_context(user_id: int | None):
     contextvars.Token) und auch bei Verschachtelung (ein innerer Block stellt
     beim Verlassen exakt den äußeren Zustand wieder her, nicht None).
 
-    user_id=None setzt explizit KEINEN Kontext (z.B. für systemweite Jobs
-    ohne Einzelnutzerbezug) -- noch nicht Teil dieses Chunks, siehe Plan.
+    user_id=None setzt explizit KEINEN Kontext (z.B. für eine künftige
+    BYPASSRLS-Systemrolle für echte nutzerübergreifende Jobs -- aktuell
+    ungenutzt, siehe Plan-Dokument Sonderfall a: update_prices() löst das
+    stattdessen über Pro-Nutzer-Iteration, kein neuer DB-User nötig).
     """
     token = _current_user_ctx.set(user_id)
     try:
         yield
     finally:
         _current_user_ctx.reset(token)
+
+
+def override_user_context(user_id: int) -> None:
+    """
+    Überschreibt den aktuell aktiven RLS-Kontext für den REST des laufenden
+    Requests/Blocks, OHNE einen eigenen with-Block zu öffnen (im Unterschied
+    zu user_context()). Für den Admin-Cross-View-Fall gedacht
+    (_resolve_user_id() in api.py, RLS-Umbau Chunk 2, siehe Plan-Dokument
+    Sonderfall c): ein Admin, der bewusst Daten eines anderen Nutzers abruft,
+    braucht ab diesem Punkt bis Requestende den Ziel-Kontext -- die Funktion,
+    die das entscheidet, kehrt aber zurück, BEVOR der Rest des Endpoints
+    läuft, kann also keinen with-Block offenhalten.
+
+    NUR sicher innerhalb eines bereits aktiven user_context()-Blocks
+    aufzurufen (in api.py über die gesamte Request-Dauer bereits durch
+    _apply_user_context sichergestellt, siehe Chunk 1): dessen eigener
+    finally-Block (contextvars.Token.reset) stellt beim Verlassen des
+    äußeren Blocks zuverlässig den Zustand VOR diesem äußeren Block wieder
+    her (im Request-Fall: None) -- unabhängig davon, was
+    override_user_context() zwischendurch gesetzt hat. Token.reset()
+    restauriert den beim zugehörigen .set() festgehaltenen ALTEN Wert, nicht
+    den zum Reset-Zeitpunkt aktuellen -- ein dazwischenliegendes rohes
+    .set() wird dadurch beim äußeren Reset sauber überschrieben, kein Leck
+    in nachfolgende Requests (siehe Testbericht).
+
+    KEIN allgemeiner RLS-Bypass: der Kontext zeigt danach auf eine konkrete
+    user_id (nie None/leer), nur eben auf die des Ziel-Nutzers statt des
+    Admins -- und ausschließlich für die Dauer des einen Requests.
+    """
+    if _current_user_ctx.get() is None:
+        print(
+            "⚠️  override_user_context() ohne aktiven äußeren Kontext aufgerufen -- "
+            "wird beim Verlassen des aktuellen Scopes NICHT automatisch zurückgesetzt "
+            "(siehe Docstring). Vermutlich außerhalb eines von _apply_user_context "
+            "umschlossenen Requests aufgerufen."
+        )
+    _current_user_ctx.set(user_id)
 
 
 @contextmanager

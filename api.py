@@ -46,7 +46,7 @@ from database import (
     get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
-    encrypt_field, decrypt_field, log_admin_access, user_context,
+    encrypt_field, decrypt_field, log_admin_access, user_context, override_user_context,
 )
 
 # Idempotent – legt neu hinzugekommene Spalten/Tabellen an, falls die anderen
@@ -786,12 +786,26 @@ def _require_admin(current_user, endpoint: str) -> None:
 
 
 def _resolve_user_id(current_user, requested_user_id: Optional[int], endpoint: str, method: str = "GET") -> int:
-    """Liefert die tatsächlich zu verwendende user_id für 'Meine Daten'-Endpoints
-    (siehe Modulkommentar oben)."""
+    """
+    Liefert die tatsächlich zu verwendende user_id für 'Meine Daten'-Endpoints
+    (siehe Modulkommentar oben).
+
+    RLS-Umbau Chunk 2 (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md,
+    Sonderfall c): bei einem echten Admin-Cross-View (Admin ruft explizit die
+    user_id eines ANDEREN Nutzers ab) wird der RLS-Kontext für den Rest
+    dieses Requests auf das Ziel umgeschaltet (override_user_context) --
+    direkt an der Stelle, wo der Zugriff ohnehin schon protokolliert wird
+    (log_admin_access -> pos_admin_access_log). Kein genereller Bypass:
+    betrifft nur diesen einen Request, wird beim Verlassen des äußeren
+    user_context()-Blocks (_apply_user_context, Chunk 1) garantiert wieder
+    zurückgesetzt. Beobachtung, NICHT Teil dieses Chunks: pos_admin_access_log
+    selbst hat noch keine RLS-Policy (siehe Plan-Dokument Chunk 5).
+    """
     if current_user.rolle != "admin" or requested_user_id is None:
         return current_user.id
     if requested_user_id != current_user.id:
         log_admin_access(current_user.id, requested_user_id, endpoint, method)
+        override_user_context(requested_user_id)
     return requested_user_id
 
 

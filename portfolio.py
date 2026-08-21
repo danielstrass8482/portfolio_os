@@ -13,6 +13,7 @@ from config import TICKER_MAPPING
 from database import (
     get_session, PosPortfolio, PosPosition, PosTransaction,
     PosAssetClass, PosTargetWeight, PosDailySnapshot, PosRealEstate,
+    user_context,
 )
 import tax_engine
 import trading_bot_connector
@@ -643,25 +644,50 @@ def update_prices() -> int:
     ein (siehe get_price_in_eur()). Läuft fehlertolerant: einzelne nicht
     auflösbare oder fehlerhafte Ticker überspringen den Rest nicht, werden
     aber geloggt. Gibt die Anzahl erfolgreich aktualisierter Positionen zurück.
+
+    RLS-Umbau Chunk 2 (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md,
+    Sonderfall a): läuft nutzerübergreifend über ALLE Portfolios -- passt
+    nicht ins normale "ein Request/Job = ein user_context()"-Muster. Pro-
+    Nutzer-Iteration statt eigener BYPASSRLS-DB-Rolle gewählt (siehe Plan-
+    Dokument: kein neuer DB-User/Connection-Pool nötig, solange nur wenige
+    Nutzer aktiv Portfolio-OS nutzen -- aktuell hat nur Daniel überhaupt
+    Positionen, siehe Testbericht zur Performance-Einschätzung). Erst eine
+    lesende Session ohne Kontext (Lesen ist in diesem Chunk noch nicht
+    eingeschränkt), dann pro betroffenem Nutzer ein einzelner
+    user_context()-Block für die Schreib-Session.
     """
-    updated = 0
     with get_session() as session:
-        positions = session.query(PosPosition).all()
-        for pos in positions:
-            if not pos.ticker:
-                continue
-            try:
-                preis = get_price_in_eur(pos.ticker)
-            except Exception as e:
-                print(f"⚠️  Fehler beim Kursabruf für Ticker '{pos.ticker}': {e} (übersprungen)")
-                continue
-            if preis is None:
-                print(f"⚠️  Kein aktueller Kurs für Ticker '{pos.ticker}' gefunden (übersprungen)")
-                continue
-            pos.current_price = preis
-            pos.currency = "EUR"
-            pos.last_updated = datetime.utcnow()
-            updated += 1
+        rows = (
+            session.query(PosPosition.id, PosPosition.ticker, PosPortfolio.user_id)
+            .join(PosPortfolio, PosPosition.portfolio_id == PosPortfolio.id)
+            .all()
+        )
+    positionen_je_nutzer: dict[int, list[tuple[int, str]]] = {}
+    for position_id, ticker, user_id in rows:
+        positionen_je_nutzer.setdefault(user_id, []).append((position_id, ticker))
+
+    updated = 0
+    for user_id, positionen in positionen_je_nutzer.items():
+        with user_context(user_id):
+            with get_session() as session:
+                for position_id, ticker in positionen:
+                    if not ticker:
+                        continue
+                    try:
+                        preis = get_price_in_eur(ticker)
+                    except Exception as e:
+                        print(f"⚠️  Fehler beim Kursabruf für Ticker '{ticker}': {e} (übersprungen)")
+                        continue
+                    if preis is None:
+                        print(f"⚠️  Kein aktueller Kurs für Ticker '{ticker}' gefunden (übersprungen)")
+                        continue
+                    pos = session.get(PosPosition, position_id)
+                    if pos is None:
+                        continue
+                    pos.current_price = preis
+                    pos.currency = "EUR"
+                    pos.last_updated = datetime.utcnow()
+                    updated += 1
 
     return updated
 
