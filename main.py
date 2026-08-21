@@ -23,12 +23,24 @@ import notifier
 import trading_bot_connector
 
 
+# TEMPORÄR (2026-08-21, DRINGEND): Notify-Timer pausiert für alle Nutzer außer
+# Daniel (id=1). Grund: ungeklärt, warum pos_users id=9 (Dana, eigentlich nur
+# für trading_bot/Alpaca vorgesehen) einen portfolio_os-Zugang hat – bis das
+# aufgeklärt ist, darf an ihre Adresse (dana.will@gmx.net) keine automatische
+# Mail rausgehen. id=10 (Daniels eigener Testaccount) ist aus Konsistenzgründen
+# ebenfalls mit ausgeschlossen, bis explizit wieder freigegeben.
+# TODO: entfernen bzw. um weitere IDs erweitern, sobald Daniel das freigibt.
+ALLOWED_NOTIFY_USER_IDS = {1}
+
+
 def _alle_user_ids() -> list:
-    """Nur aktive Nutzer (status='active') – pending/rejected erhalten keine
-    Reports (vorher fehlte dieser Filter komplett, s. Smart-Notifications-
+    """Nur aktive Nutzer (status='active') UND in ALLOWED_NOTIFY_USER_IDS
+    (siehe TODO oben) – pending/rejected erhalten ohnehin keine Reports
+    (vorher fehlte dieser Status-Filter komplett, s. Smart-Notifications-
     Aktivierung 2026-08-21)."""
     with get_session() as session:
-        return [u.id for u in session.query(PosUser).filter_by(status="active").all()]
+        ids = [u.id for u in session.query(PosUser).filter_by(status="active").all()]
+    return [uid for uid in ids if uid in ALLOWED_NOTIFY_USER_IDS]
 
 
 def daily_job():
