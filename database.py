@@ -444,6 +444,11 @@ class PosBuchung(Base):
     kategorie         = Column(Text, nullable=True)
     typ               = Column(Text, nullable=True)   # einnahme / ausgabe
     quelle            = Column(Text, default="kontoauszug")
+    # End-to-End-Referenz aus dem Kontoauszug, falls erkannt (siehe
+    # kontoauszug_analyzer._dedupe/save_buchungen) – Teil des Dedup-Schlüssels,
+    # damit zwei echte Buchungen mit zufällig gleichem Datum+Betrag+Empfänger
+    # (z.B. zwei Versicherungsraten am selben Tag) nicht als Duplikat gelten.
+    referenz          = Column(Text, nullable=True)
     created_at        = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -625,8 +630,19 @@ def init_db():
     _migrate_tax_config_columns()
     _migrate_position_columns()
     _migrate_user_columns()
+    _migrate_buchungen_columns()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_buchungen_columns():
+    """Idempotente Migration für pos_buchungen.referenz (siehe _migrate_real_estate_columns
+    und PosBuchung-Modellkommentar). NULL bei allen bereits bestehenden Zeilen -
+    save_buchungen() fällt für die dann automatisch auf den alten Dedup-Schlüssel
+    ohne Referenz zurück, exakt wie bei fehlender Referenz aus einem neuen Import."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pos_buchungen ADD COLUMN IF NOT EXISTS referenz TEXT"))
 
 
 def _migrate_user_columns():
@@ -832,11 +848,26 @@ def save_daily_snapshot(session: Session, user_id: int, gesamtvermoegen: float, 
         session.add(snap)
 
 
+def _buchung_dedup_key(datum, betrag: float, empfaenger: str, referenz: str = None):
+    """
+    Dedup-Schlüssel für Kontoauszug-Buchungen - MUSS identisch zur Logik in
+    kontoauszug_analyzer._dedupe() bleiben (dort die ausführliche Begründung:
+    ohne Referenz würden zwei ECHTE, unterschiedliche Buchungen mit zufällig
+    gleichem Datum+Betrag+Empfänger, z.B. zwei Versicherungsraten am selben
+    Tag, fälschlich als Duplikat gelten). Referenz wird nur einbezogen, wenn
+    vorhanden und nicht der Commerzbank-Platzhalter "NOTPROVIDED" - sonst
+    Fallback auf den alten Schlüssel ohne Referenz.
+    """
+    basis = (datum, round(betrag, 2), (empfaenger or "").strip().lower())
+    ref = (referenz or "").strip().lower()
+    return basis + (ref,) if ref and ref != "notprovided" else basis
+
+
 def save_buchungen(user_id: int, buchungen: list) -> int:
     """
     Speichert per KI erkannte Kontoauszug-Buchungen (siehe kontoauszug_analyzer.py)
-    für einen Nutzer. Dedupliziert gegen bereits gespeicherte Buchungen (gleiche
-    datum+betrag+empfaenger) und wendet vorhandene Kategorisierungsregeln
+    für einen Nutzer. Dedupliziert gegen bereits gespeicherte Buchungen anhand
+    von _buchung_dedup_key() und wendet vorhandene Kategorisierungsregeln
     (pos_kategorisierungsregeln, "Immer so kategorisieren" im Haushaltsbuch-Tab)
     auf den Empfänger an, bevor gespeichert wird. Gibt die Anzahl NEU
     gespeicherter Buchungen zurück (Duplikate werden übersprungen, kein Fehler).
@@ -844,7 +875,7 @@ def save_buchungen(user_id: int, buchungen: list) -> int:
     with get_session() as session:
         regeln = session.query(PosKategorisierungsregel).filter_by(user_id=user_id).all()
         vorhandene = {
-            (b.datum, round(b.betrag, 2), (b.empfaenger or "").strip().lower())
+            _buchung_dedup_key(b.datum, b.betrag, b.empfaenger, b.referenz)
             for b in session.query(PosBuchung).filter_by(user_id=user_id).all()
         }
         neu = 0
@@ -856,7 +887,8 @@ def save_buchungen(user_id: int, buchungen: list) -> int:
                 continue
             betrag = float(b.get("betrag") or 0.0)
             empfaenger = (b.get("empfaenger") or "").strip()
-            key = (datum, round(betrag, 2), empfaenger.lower())
+            referenz = (b.get("referenz") or "").strip() or None
+            key = _buchung_dedup_key(datum, betrag, empfaenger, referenz)
             if key in vorhandene:
                 continue
             vorhandene.add(key)
@@ -873,6 +905,7 @@ def save_buchungen(user_id: int, buchungen: list) -> int:
                 verwendungszweck=sanitize_csv_field((b.get("verwendungszweck") or "").strip()) or None,
                 kategorie=kategorie,
                 typ=b.get("typ"), quelle=b.get("quelle") or "kontoauszug",
+                referenz=sanitize_csv_field(referenz) if referenz else None,
             ))
             neu += 1
         return neu
