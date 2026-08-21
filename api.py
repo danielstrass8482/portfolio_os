@@ -813,16 +813,51 @@ def _owner_check_id(current_user) -> Optional[int]:
     """Für die Ownership-prüfenden Hilfsfunktionen in portfolio.py/database.py
     (update_position/delete_position/update_transaction/delete_transaction/
     update_portfolio/delete_portfolio/delete_real_estate): None überspringt die
-    Prüfung dort (Admin-Bypass), sonst wird current_user.id streng durchgesetzt."""
+    Prüfung dort (Admin-Bypass), sonst wird current_user.id streng durchgesetzt.
+    Bleibt als zusätzliche Verteidigungslinie unverändert bestehen -- der
+    RLS-Kontext für einen echten Admin-Cross-Access wird seit dem Chunk-2-
+    Nachzug (siehe _switch_context_for_admin_write) VOR dem Aufruf dieser
+    Funktionen bereits umgeschaltet."""
     return None if current_user.rolle == "admin" else current_user.id
 
 
-def _maybe_log_admin_access(current_user, actual_owner_id: int, endpoint: str, method: str) -> None:
-    """Protokolliert einen ECHTEN Cross-User-Zugriff, nachdem eine der obigen
-    Hilfsfunktionen mit Admin-Bypass (owner_user_id=None) gelaufen ist und die
-    tatsächliche Besitzer-user_id zurückgegeben hat."""
-    if current_user.rolle == "admin" and actual_owner_id != current_user.id:
-        log_admin_access(current_user.id, actual_owner_id, endpoint, method)
+def _switch_context_for_admin_write(owner_id: Optional[int], current_user, endpoint: str, method: str) -> None:
+    """
+    RLS-Umbau, Chunk-2-Nachzug (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md,
+    Sonderfall c -- dort explizit auch für _owner_check_id() und die
+    _require_*_access()-Geschwister gefordert, aber im ursprünglichen Chunk-2-
+    Commit 982842c bewusst zurückgestellt): bestimmt VOR dem eigentlichen
+    Schreibzugriff (update_*/delete_* in portfolio.py/database.py), ob ein
+    echter Admin-Cross-Access vorliegt, protokolliert ihn und schaltet den
+    RLS-Kontext für den Rest des Requests auf den TATSÄCHLICHEN Owner um
+    (override_user_context, exakt wie _resolve_user_id()).
+
+    WICHTIG, muss VOR dem Aufruf der Schreibfunktion passieren: die
+    update_*/delete_*-Funktionen öffnen Lookup+Schreibzugriff in EINER
+    gemeinsamen get_session() -- der Kontext wird beim Öffnen dieser Session
+    gelesen. Würde man erst NACH dem Schreibzugriff umschalten (wie die alte
+    _maybe_log_admin_access()-Reihenfolge es tat), liefe der Schreibzugriff
+    selbst noch unter dem Admin-eigenen Kontext, was unter FORCE ROW LEVEL
+    SECURITY (Chunk 7) den an sich erlaubten Admin-Zugriff blockieren würde
+    (Owner-Bypass ist ja genau das, was FORCE abschaltet).
+
+    Restrisiko, NICHT Teil dieses Nachzugs (siehe Bericht): der vorgelagerte
+    Owner-Lookup (_position_owner_id() etc., von den Aufrufern VOR dieser
+    Funktion ausgeführt, um owner_id zu bestimmen) läuft selbst noch unter dem
+    alten Admin-Kontext. Das funktioniert heute (FORCE noch nicht aktiv), wäre
+    aber unter FORCE RLS mit den bisher geplanten Policies (Chunk 5, kein
+    Admin-Sonderfall) selbst RLS-gefiltert -- der Admin sähe die fremde Zeile
+    beim Lookup gar nicht erst. Diese tiefere Frage (Bypass-Rolle oder
+    Admin-inklusive SELECT-Policy für den Lookup-Schritt) ist im Plan-Dokument
+    nicht adressiert und explizit Chunk 7 / einer eigenen Policy-Entscheidung
+    vorbehalten, nicht diesem Nachzug.
+
+    owner_id=None (Ressource nicht gefunden) oder current_user kein Admin oder
+    Ziel entspricht dem Admin selbst: No-op.
+    """
+    if owner_id is not None and current_user.rolle == "admin" and owner_id != current_user.id:
+        log_admin_access(current_user.id, owner_id, endpoint, method)
+        override_user_context(owner_id)
 
 
 def _position_owner_id(position_id: int) -> Optional[int]:
@@ -839,6 +874,7 @@ def _require_position_access(position_id: int, current_user, endpoint: str, meth
         if current_user.rolle != "admin":
             raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
         log_admin_access(current_user.id, owner_id, endpoint, method)
+        override_user_context(owner_id)
 
 
 def _portfolio_owner_id(portfolio_id: int) -> Optional[int]:
@@ -855,6 +891,19 @@ def _require_portfolio_access(portfolio_id: int, current_user, endpoint: str, me
         if current_user.rolle != "admin":
             raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
         log_admin_access(current_user.id, owner_id, endpoint, method)
+        override_user_context(owner_id)
+
+
+def _transaction_owner_id(transaction_id: int) -> Optional[int]:
+    with get_session() as session:
+        tx = session.get(PosTransaction, transaction_id)
+        return tx.portfolio.user_id if tx else None
+
+
+def _real_estate_owner_id(real_estate_id: int) -> Optional[int]:
+    with get_session() as session:
+        obj = session.get(PosRealEstate, real_estate_id)
+        return obj.user_id if obj else None
 
 
 def _require_buchung_access(buchung, current_user, endpoint: str, method: str = "GET") -> None:
@@ -1112,8 +1161,12 @@ def refresh_prices():
 @protected.put("/api/positions/{position_id}")
 def edit_position(position_id: int, payload: dict, current_user=Depends(get_current_user)):
     asset_class_id = payload.get("asset_class_id")
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _position_owner_id(position_id), current_user, "/api/positions/{position_id}", "PUT"
+        )
     try:
-        owner_id = portfolio_module.update_position(
+        portfolio_module.update_position(
             position_id,
             display_name=payload.get("display_name"),
             ticker=payload.get("ticker"),
@@ -1124,17 +1177,19 @@ def edit_position(position_id: int, payload: dict, current_user=Depends(get_curr
         )
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/positions/{position_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/positions/{position_id}")
 def remove_position(position_id: int, current_user=Depends(get_current_user)):
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _position_owner_id(position_id), current_user, "/api/positions/{position_id}", "DELETE"
+        )
     try:
-        owner_id = portfolio_module.delete_position(position_id, owner_user_id=_owner_check_id(current_user))
+        portfolio_module.delete_position(position_id, owner_user_id=_owner_check_id(current_user))
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Position {position_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/positions/{position_id}", "DELETE")
     return {"ok": True}
 
 
@@ -1577,11 +1632,14 @@ def create_real_estate(payload: dict, current_user=Depends(get_current_user)):
 @protected.delete("/api/real-estate/{real_estate_id}")
 def remove_real_estate(real_estate_id: int, current_user=Depends(get_current_user)):
     from database import delete_real_estate
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _real_estate_owner_id(real_estate_id), current_user, "/api/real-estate/{real_estate_id}", "DELETE"
+        )
     try:
-        owner_id = delete_real_estate(real_estate_id, owner_user_id=_owner_check_id(current_user))
+        delete_real_estate(real_estate_id, owner_user_id=_owner_check_id(current_user))
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Immobilie {real_estate_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/real-estate/{real_estate_id}", "DELETE")
     return {"ok": True}
 
 
@@ -1725,25 +1783,31 @@ def create_portfolio(payload: dict, current_user=Depends(get_current_user)):
 
 @protected.put("/api/portfolios/{portfolio_id}")
 def edit_portfolio(portfolio_id: int, payload: dict, current_user=Depends(get_current_user)):
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _portfolio_owner_id(portfolio_id), current_user, "/api/portfolios/{portfolio_id}", "PUT"
+        )
     try:
-        owner_id = portfolio_module.update_portfolio(
+        portfolio_module.update_portfolio(
             portfolio_id, name=payload.get("name"), typ=payload.get("typ"),
             broker=payload.get("broker"), is_kinderdepot=payload.get("is_kinderdepot"),
             owner_user_id=_owner_check_id(current_user),
         )
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/portfolios/{portfolio_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/portfolios/{portfolio_id}")
 def remove_portfolio(portfolio_id: int, current_user=Depends(get_current_user)):
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _portfolio_owner_id(portfolio_id), current_user, "/api/portfolios/{portfolio_id}", "DELETE"
+        )
     try:
-        owner_id = portfolio_module.delete_portfolio(portfolio_id, owner_user_id=_owner_check_id(current_user))
+        portfolio_module.delete_portfolio(portfolio_id, owner_user_id=_owner_check_id(current_user))
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/portfolios/{portfolio_id}", "DELETE")
     return {"ok": True}
 
 
@@ -1775,25 +1839,31 @@ def create_transaction(payload: dict, current_user=Depends(get_current_user)):
 @protected.put("/api/transactions/{transaction_id}")
 def edit_transaction(transaction_id: int, payload: dict, current_user=Depends(get_current_user)):
     datum = datetime.strptime(payload["datum"], "%Y-%m-%d").date() if payload.get("datum") else None
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _transaction_owner_id(transaction_id), current_user, "/api/transactions/{transaction_id}", "PUT"
+        )
     try:
-        owner_id = portfolio_module.update_transaction(
+        portfolio_module.update_transaction(
             transaction_id, typ=payload.get("typ"), quantity=payload.get("quantity"),
             price=payload.get("price"), datum=datum, fees=payload.get("fees"),
             owner_user_id=_owner_check_id(current_user),
         )
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Transaktion {transaction_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/transactions/{transaction_id}", "PUT")
     return {"ok": True}
 
 
 @protected.delete("/api/transactions/{transaction_id}")
 def remove_transaction(transaction_id: int, current_user=Depends(get_current_user)):
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _transaction_owner_id(transaction_id), current_user, "/api/transactions/{transaction_id}", "DELETE"
+        )
     try:
-        owner_id = portfolio_module.delete_transaction(transaction_id, owner_user_id=_owner_check_id(current_user))
+        portfolio_module.delete_transaction(transaction_id, owner_user_id=_owner_check_id(current_user))
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Transaktion {transaction_id} nicht gefunden")
-    _maybe_log_admin_access(current_user, owner_id, "/api/transactions/{transaction_id}", "DELETE")
     return {"ok": True}
 
 
