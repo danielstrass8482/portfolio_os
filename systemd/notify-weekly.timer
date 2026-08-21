@@ -1,0 +1,10 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-weekly.timer.
+[Unit]
+Description=Montags 07:00 Europe/Berlin: Portfolio OS Wochen-Summary
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

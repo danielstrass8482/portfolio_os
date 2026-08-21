@@ -1,0 +1,17 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-daily.service.
+# Getriggert von notify-daily.timer (08:00 Europe/Berlin, siehe main.py
+# DAILY_UPDATE_HOUR). Type=oneshot: läuft einmal pro Trigger und beendet sich,
+# anders als portfolio-api.service (Type=simple, dauerhaft laufend). Eigene
+# venv_notify/ (siehe requirements-notify.txt) statt venv_api/venv_dashboard,
+# damit main.py/apscheduler-Import keine der beiden bestehenden venvs anfasst.
+[Unit]
+Description=Portfolio OS – Tages-Alert (Schwellwert-Check)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=administrator
+WorkingDirectory=/home/administrator/portfolio_os
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/administrator/portfolio_os/.env
+ExecStart=/home/administrator/portfolio_os/venv_notify/bin/python run_scheduled_job.py daily

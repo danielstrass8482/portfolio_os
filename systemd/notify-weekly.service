@@ -1,0 +1,15 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-weekly.service.
+# Getriggert von notify-weekly.timer (Montags 07:00 Europe/Berlin, siehe
+# main.py WEEKLY_SUMMARY_HOUR). Siehe notify-daily.service für Details zu
+# Type=oneshot/venv_notify.
+[Unit]
+Description=Portfolio OS – Wochen-Summary
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=administrator
+WorkingDirectory=/home/administrator/portfolio_os
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/administrator/portfolio_os/.env
+ExecStart=/home/administrator/portfolio_os/venv_notify/bin/python run_scheduled_job.py weekly

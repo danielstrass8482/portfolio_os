@@ -1,0 +1,10 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-yearly.timer.
+[Unit]
+Description=1. Januar 07:00 Europe/Berlin: Portfolio OS Jahres-Report
+
+[Timer]
+OnCalendar=*-01-01 07:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

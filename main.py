@@ -24,8 +24,11 @@ import trading_bot_connector
 
 
 def _alle_user_ids() -> list:
+    """Nur aktive Nutzer (status='active') – pending/rejected erhalten keine
+    Reports (vorher fehlte dieser Filter komplett, s. Smart-Notifications-
+    Aktivierung 2026-08-21)."""
     with get_session() as session:
-        return [u.id for u in session.query(PosUser).all()]
+        return [u.id for u in session.query(PosUser).filter_by(status="active").all()]
 
 
 def daily_job():

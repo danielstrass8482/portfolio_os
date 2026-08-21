@@ -65,6 +65,25 @@ def send_email(subject: str, body: str, to_email: str = None):
         print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
+def _get_user_email(user_id: int) -> str | None:
+    """
+    Liefert die hinterlegte E-Mail-Adresse eines Nutzers, oder None falls
+    keine hinterlegt ist. Bewusst KEIN Fallback auf ALERT_EMAIL hier: die
+    Report-Funktionen unten riefen send_email() bisher ohne to_email auf,
+    wodurch JEDE Nutzer-Mail (Tages-/Wochen-/Monats-/Quartals-/Jahres-Report)
+    an die eine globale ALERT_EMAIL-Adresse statt an den jeweiligen Nutzer
+    ging – bei mehreren Nutzern landeten so fremde Finanzdaten im selben
+    Postfach. Ein Fallback auf ALERT_EMAIL hier würde denselben Fehler nur
+    abgeschwächt reproduzieren; ein Nutzer ohne hinterlegte E-Mail bekommt
+    seinen Report daher bewusst gar nicht (Aufrufer überspringt + loggt).
+    """
+    from database import get_session, PosUser
+
+    with get_session() as session:
+        user = session.query(PosUser).filter_by(id=user_id).first()
+        return user.email if user and user.email else None
+
+
 # ─────────────────────────────────────────────
 # TAGES-ALERT
 # ─────────────────────────────────────────────
@@ -72,6 +91,11 @@ def send_email(subject: str, body: str, to_email: str = None):
 def send_daily_alert(user_id: int):
     """Sofort-Mail, wenn ein Schwellwert (ALERT oder SELL) überschritten wurde."""
     import rebalancing
+
+    empfaenger = _get_user_email(user_id)
+    if not empfaenger:
+        print(f"⚠️  send_daily_alert: Nutzer {user_id} hat keine E-Mail hinterlegt – Report übersprungen")
+        return
 
     try:
         check = rebalancing.check_thresholds(user_id)
@@ -90,7 +114,7 @@ def send_daily_alert(user_id: int):
             f"(Abweichung {d['abweichung_pct']*100:+.1f} Punkte, Status: {d['status']})"
         )
     zeilen.append(f"\nDashboard: {BASE_URL}")
-    send_email(f"Portfolio-Alert – {len(relevante)} Abweichung(en)", "\n".join(zeilen))
+    send_email(f"Portfolio-Alert – {len(relevante)} Abweichung(en)", "\n".join(zeilen), to_email=empfaenger)
 
 
 # ─────────────────────────────────────────────
@@ -101,6 +125,11 @@ def send_weekly_summary(user_id: int):
     """Montags: Performance der letzten Woche + offene Rebalancing-Vorschläge."""
     import portfolio as portfolio_module
     import rebalancing
+
+    empfaenger = _get_user_email(user_id)
+    if not empfaenger:
+        print(f"⚠️  send_weekly_summary: Nutzer {user_id} hat keine E-Mail hinterlegt – Report übersprungen")
+        return
 
     try:
         summary = portfolio_module.get_portfolio_summary(user_id)
@@ -117,7 +146,7 @@ Performance (7 Tage): {performance['pnl_pct']:+.2f}% ({performance['pnl_abs']:+.
 Offene Rebalancing-Vorschläge: {len(offene)}
 
 Dashboard: {BASE_URL}"""
-    send_email("Portfolio Wochen-Summary", body)
+    send_email("Portfolio Wochen-Summary", body, to_email=empfaenger)
 
 
 # ─────────────────────────────────────────────
@@ -129,6 +158,11 @@ def send_monthly_report(user_id: int, sparrate_betrag: float = None):
     import portfolio as portfolio_module
     import rebalancing
     from database import get_session, PosFamilyGoal
+
+    empfaenger = _get_user_email(user_id)
+    if not empfaenger:
+        print(f"⚠️  send_monthly_report: Nutzer {user_id} hat keine E-Mail hinterlegt – Report übersprungen")
+        return
 
     try:
         summary = portfolio_module.get_portfolio_summary(user_id)
@@ -160,7 +194,7 @@ Zielfortschritt:
 {chr(10).join(ziel_zeilen) if ziel_zeilen else '(keine Familienziele hinterlegt)'}
 
 Dashboard: {BASE_URL}"""
-    send_email("Portfolio Monats-Report", body)
+    send_email("Portfolio Monats-Report", body, to_email=empfaenger)
 
 
 # ─────────────────────────────────────────────
@@ -171,6 +205,11 @@ def send_quarterly_report(user_id: int):
     """Quartalsweise: vollständiger Bericht inkl. Rebalancing-Vorschlag und KI-Analyse."""
     import llm_analyst
     import rebalancing
+
+    empfaenger = _get_user_email(user_id)
+    if not empfaenger:
+        print(f"⚠️  send_quarterly_report: Nutzer {user_id} hat keine E-Mail hinterlegt – Report übersprungen")
+        return
 
     try:
         report = llm_analyst.generate_quarterly_report(user_id)
@@ -187,7 +226,7 @@ def send_quarterly_report(user_id: int):
 {proposal['begruendung']}
 
 Bestätigen/Ablehnen im Dashboard: {BASE_URL}/?proposal={proposal['id']}"""
-    send_email("Portfolio Quartals-Report", body)
+    send_email("Portfolio Quartals-Report", body, to_email=empfaenger)
 
 
 # ─────────────────────────────────────────────
@@ -197,6 +236,11 @@ Bestätigen/Ablehnen im Dashboard: {BASE_URL}/?proposal={proposal['id']}"""
 def send_yearly_report(user_id: int, jahr: int = None):
     """1. Januar: Steuerübersicht des abgelaufenen Jahres."""
     import tax_engine
+
+    empfaenger = _get_user_email(user_id)
+    if not empfaenger:
+        print(f"⚠️  send_yearly_report: Nutzer {user_id} hat keine E-Mail hinterlegt – Report übersprungen")
+        return
 
     jahr = jahr or (date.today().year - 1)
     try:
@@ -217,7 +261,7 @@ Verlusttopf (aktueller Stand): {uebersicht['verlusttopf_aktuell']:.2f} EUR
 
 Hinweis: Näherungswerte für die eigene Planung, keine Steuerberatung.
 Details im Dashboard (Tab Steuer): {BASE_URL}"""
-    send_email(f"Portfolio Jahresübersicht {jahr}", body)
+    send_email(f"Portfolio Jahresübersicht {jahr}", body, to_email=empfaenger)
 
 
 # ─────────────────────────────────────────────
@@ -226,6 +270,11 @@ Details im Dashboard (Tab Steuer): {BASE_URL}"""
 
 def send_rebalancing_proposal(proposal: dict):
     """Sendet einen einzelnen Rebalancing-Vorschlag mit Bestätigungs-Link."""
+    empfaenger = _get_user_email(proposal["user_id"])
+    if not empfaenger:
+        print(f"⚠️  send_rebalancing_proposal: Nutzer {proposal['user_id']} hat keine E-Mail hinterlegt – übersprungen")
+        return
+
     confirm_link = f"{BASE_URL}/?confirm_proposal={proposal['id']}"
     body = f"""Neuer Rebalancing-Vorschlag #{proposal['id']} ({proposal.get('typ', 'unbekannt')})
 
@@ -235,4 +284,4 @@ def send_rebalancing_proposal(proposal: dict):
 
 Bestätigen oder ablehnen: {confirm_link}
 (Es wird NICHTS automatisch ausgeführt – die Entscheidung liegt bei dir.)"""
-    send_email(f"Rebalancing-Vorschlag #{proposal['id']}", body)
+    send_email(f"Rebalancing-Vorschlag #{proposal['id']}", body, to_email=empfaenger)

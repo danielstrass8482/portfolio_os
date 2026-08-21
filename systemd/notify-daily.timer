@@ -1,0 +1,10 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-daily.timer.
+[Unit]
+Description=Täglich 08:00 Europe/Berlin: Portfolio OS Tages-Alert
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

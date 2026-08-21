@@ -1,0 +1,10 @@
+# Versioned copy of the live unit at /etc/systemd/system/notify-quarterly.timer.
+[Unit]
+Description=Quartalsweise (Jan/Apr/Jul/Okt, 1., 07:00 Europe/Berlin): Portfolio OS Quartals-Report
+
+[Timer]
+OnCalendar=*-01,04,07,10-01 07:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target
