@@ -631,8 +631,134 @@ def init_db():
     _migrate_position_columns()
     _migrate_user_columns()
     _migrate_buchungen_columns()
+    _migrate_owner_lookup_functions()
     with get_session() as session:
         _seed_asset_classes(session)
+
+
+def _migrate_owner_lookup_functions():
+    """
+    RLS-Umbau, Vorbereitung Chunk 5 (siehe docs/rls-force-umbau-plan-21-08.md,
+    Sonderfall c / Restrisiko aus dem Chunk-2-Nachzug-Commit): die 4 Admin-
+    Bypass-Owner-Lookups in api.py (_position_owner_id/_portfolio_owner_id/
+    _transaction_owner_id/_real_estate_owner_id) laufen HEUTE noch als normale
+    Query unter get_session() -- unter FORCE ROW LEVEL SECURITY (mit den bisher
+    geplanten reinen Owner-Policies, kein Admin-Sonderfall) würde genau DIESER
+    Lookup selbst schon RLS-gefiltert: der Admin-Kontext ist beim Lookup noch
+    nicht auf den Ziel-Owner umgeschaltet (das passiert ja erst NACHDEM die
+    owner_id bekannt ist), die fremde Zeile wäre für den Admin unsichtbar.
+
+    Diese 4 SQL-Funktionen sind der schmale Ausweg (Option B, siehe Bericht):
+    SECURITY DEFINER + STABLE, geben AUSSCHLIESSLICH die owner_id (integer)
+    zurück -- keine weiteren Felder, keine generische Policy-Bypass-Funktion.
+    Bewusst 4 einzelne Funktionen statt 1 generischer Dispatcher
+    (resource_type-Parameter): jede bleibt eine auditierbare 1-Zeilen-Query,
+    kein String-Whitelisting nötig, 1:1-Mapping auf die 4 bestehenden Python-
+    Helfer.
+
+    WICHTIG, hier NICHT automatisierbar: SECURITY DEFINER allein bypassed
+    unter FORCE ROW LEVEL SECURITY GAR NICHTS -- Postgres wendet Policies auf
+    die EFFEKTIVE Rolle an, mit der die Funktion läuft (= ihre Owner-Rolle),
+    nicht auf den Aufrufer. Nur eine Rolle mit dem Attribut BYPASSRLS (oder
+    Superuser) ist von RLS/FORCE ausgenommen; FORCE entzieht explizit auch dem
+    Tabellenbesitzer die sonst übliche automatische Ausnahme. Diese Funktionen
+    müssen also einer dedizierten BYPASSRLS-Rolle GEHÖREN, um tatsächlich
+    etwas zu bewirken -- eine Rolle mit BYPASSRLS anzulegen braucht Postgres-
+    Superuser-Rechte, die die App-Rolle (trading_bot_user) nicht hat. Dieser
+    Teil ist daher bewusst NICHT hier: einmaliger manueller Schritt für einen
+    Superuser, siehe docs/rls-owner-lookup-bypass-role-setup.sql. Diese
+    Funktion hier legt nur die Funktionskörper an/aktualisiert sie (immer
+    sicher, überall ausführbar) -- die Ownership-Umschaltung auf die
+    BYPASSRLS-Rolle passiert separat, danach erst ist FORCE RLS (Chunk 7) für
+    diese 4 Lookup-Pfade tatsächlich unbedenklich.
+
+    Sicherheitsaudit zur GRANT-EXECUTE-Frage (2026-09-07, siehe Bericht):
+    EXECUTE wird an trading_bot_user vergeben (die einzige App-DB-Rolle --
+    Nutzer-Trennung läuft hier komplett über app.current_user_id, nicht über
+    separate Postgres-Login-Rollen). Das ist unbedenklich, weil es in diesem
+    Repo KEINEN Codepfad gibt, über den eine normale User-Session freie SQL-
+    Strings, Tabellen-/Spalten-/Funktionsnamen oder eine Query aus dem Request-
+    Body an die DB durchreichen könnte (geprüft: api.py, dashboard.py,
+    onboarding.py, portfolio.py, tax_engine.py, rebalancing.py,
+    trading_bot_connector.py -- jede conn.execute(text(...))-Stelle nutzt eine
+    fest im Code stehende SQL-Zeichenkette, Nutzereingaben fließen ausschließlich
+    als gebundene Parameterwerte ein, nie als SQL/Bezeichner-Text; kein Raw-SQL-
+    Endpoint, kein generischer Query-Builder, keine Debug-Route). Die einzigen
+    Aufrufer dieser 4 Funktionen sind und bleiben die 4 gleichnamigen Python-
+    Helfer in api.py. Der GRANT ist also technisch weiter als nötig (jede
+    Postgres-Session unter trading_bot_user KÖNNTE die Funktionen direkt
+    aufrufen), aber praktisch nicht ausnutzbar, weil kein Request-Pfad beliebige
+    SQL an die DB reicht. Falls sich das beim nächsten RLS-Chunk ändert (z.B.
+    ein künftiges Admin-SQL-Debug-Tool), muss diese Annahme NEU geprüft werden
+    -- dann wäre ein per-Funktion-GRANT an eine noch engere Zwischenrolle statt
+    an trading_bot_user direkt fällig.
+    """
+    from sqlalchemy import text
+    statements = [
+        """
+        CREATE OR REPLACE FUNCTION pos_position_owner_id(p_position_id integer)
+        RETURNS integer
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT pf.user_id
+            FROM pos_positions p
+            JOIN pos_portfolios pf ON pf.id = p.portfolio_id
+            WHERE p.id = p_position_id;
+        $$;
+        """,
+        """
+        CREATE OR REPLACE FUNCTION pos_portfolio_owner_id(p_portfolio_id integer)
+        RETURNS integer
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT user_id FROM pos_portfolios WHERE id = p_portfolio_id;
+        $$;
+        """,
+        """
+        CREATE OR REPLACE FUNCTION pos_transaction_owner_id(p_transaction_id integer)
+        RETURNS integer
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT pf.user_id
+            FROM pos_transactions t
+            JOIN pos_portfolios pf ON pf.id = t.portfolio_id
+            WHERE t.id = p_transaction_id;
+        $$;
+        """,
+        """
+        CREATE OR REPLACE FUNCTION pos_real_estate_owner_id(p_real_estate_id integer)
+        RETURNS integer
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT user_id FROM pos_real_estate WHERE id = p_real_estate_id;
+        $$;
+        """,
+        # PUBLIC hat für neu angelegte Funktionen per Postgres-Default EXECUTE --
+        # sofort entziehen und explizit nur an die eine App-Rolle vergeben (s.o.).
+        "REVOKE EXECUTE ON FUNCTION pos_position_owner_id(integer) FROM PUBLIC",
+        "REVOKE EXECUTE ON FUNCTION pos_portfolio_owner_id(integer) FROM PUBLIC",
+        "REVOKE EXECUTE ON FUNCTION pos_transaction_owner_id(integer) FROM PUBLIC",
+        "REVOKE EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) FROM PUBLIC",
+        "GRANT EXECUTE ON FUNCTION pos_position_owner_id(integer) TO CURRENT_USER",
+        "GRANT EXECUTE ON FUNCTION pos_portfolio_owner_id(integer) TO CURRENT_USER",
+        "GRANT EXECUTE ON FUNCTION pos_transaction_owner_id(integer) TO CURRENT_USER",
+        "GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO CURRENT_USER",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))
 
 
 def _migrate_buchungen_columns():

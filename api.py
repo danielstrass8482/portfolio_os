@@ -861,9 +861,21 @@ def _switch_context_for_admin_write(owner_id: Optional[int], current_user, endpo
 
 
 def _position_owner_id(position_id: int) -> Optional[int]:
+    """
+    RLS-Umbau, Vorbereitung Chunk 5 (2026-09-07, siehe docs/rls-force-umbau-plan-21-08.md,
+    Sonderfall c / Restrisiko aus dem Chunk-2-Nachzug-Commit): läuft über die
+    SECURITY DEFINER Funktion pos_position_owner_id() (siehe database.py::
+    _migrate_owner_lookup_functions) statt über ein normales session.get() --
+    der RLS-Kontext an dieser Stelle zeigt noch auf den Admin selbst (die
+    Umschaltung auf den Ziel-Owner passiert erst NACHDEM diese Funktion
+    zurückgekehrt ist), ein normaler Lookup würde unter FORCE ROW LEVEL
+    SECURITY mit einer reinen Owner-Policy die fremde Zeile also gar nicht
+    erst sehen.
+    """
     with get_session() as session:
-        pos = session.get(PosPosition, position_id)
-        return pos.portfolio.user_id if pos else None
+        return session.execute(
+            text("SELECT pos_position_owner_id(:id)"), {"id": position_id}
+        ).scalar()
 
 
 def _require_position_access(position_id: int, current_user, endpoint: str, method: str = "GET") -> None:
@@ -878,9 +890,11 @@ def _require_position_access(position_id: int, current_user, endpoint: str, meth
 
 
 def _portfolio_owner_id(portfolio_id: int) -> Optional[int]:
+    """RLS-Umbau, Vorbereitung Chunk 5 -- siehe Docstring von _position_owner_id()."""
     with get_session() as session:
-        pf = session.get(PosPortfolio, portfolio_id)
-        return pf.user_id if pf else None
+        return session.execute(
+            text("SELECT pos_portfolio_owner_id(:id)"), {"id": portfolio_id}
+        ).scalar()
 
 
 def _require_portfolio_access(portfolio_id: int, current_user, endpoint: str, method: str = "GET") -> None:
@@ -895,15 +909,19 @@ def _require_portfolio_access(portfolio_id: int, current_user, endpoint: str, me
 
 
 def _transaction_owner_id(transaction_id: int) -> Optional[int]:
+    """RLS-Umbau, Vorbereitung Chunk 5 -- siehe Docstring von _position_owner_id()."""
     with get_session() as session:
-        tx = session.get(PosTransaction, transaction_id)
-        return tx.portfolio.user_id if tx else None
+        return session.execute(
+            text("SELECT pos_transaction_owner_id(:id)"), {"id": transaction_id}
+        ).scalar()
 
 
 def _real_estate_owner_id(real_estate_id: int) -> Optional[int]:
+    """RLS-Umbau, Vorbereitung Chunk 5 -- siehe Docstring von _position_owner_id()."""
     with get_session() as session:
-        obj = session.get(PosRealEstate, real_estate_id)
-        return obj.user_id if obj else None
+        return session.execute(
+            text("SELECT pos_real_estate_owner_id(:id)"), {"id": real_estate_id}
+        ).scalar()
 
 
 def _require_buchung_access(buchung, current_user, endpoint: str, method: str = "GET") -> None:
