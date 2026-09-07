@@ -22,12 +22,28 @@
 -- Auf Produktion NICHT automatisch ausgeführt -- bewusst manuell, siehe
 -- Bericht zu dieser Aufgabe (kein Live-DB-Schreibzugriff ohne Rückfrage).
 
--- Ersetze <APP_DB_ROLE> durch die tatsächliche Rolle aus DATABASE_URL
--- (Produktion: trading_bot_user, siehe .env / database.py-Kommentar).
+-- App-DB-Rolle (Produktion: trading_bot_user, siehe .env / database.py-
+-- Kommentar) fest eingetragen -- die Datei ist damit ohne manuelles
+-- Suchen/Ersetzen direkt lauffähig. Bei einer künftigen Rollen-Umbenennung
+-- (oder falls dieses Skript für eine andere Umgebung mit anderer App-Rolle
+-- wiederverwendet wird) müssten alle trading_bot_user-Vorkommen unten
+-- entsprechend angepasst werden.
 
-CREATE ROLE pos_owner_lookup_bypass NOLOGIN BYPASSRLS;
+-- Idempotenz (2026-09-08 ergänzt): CREATE ROLE kennt kein IF NOT EXISTS,
+-- schlägt bei wiederholter Ausführung sonst mit "role already exists" fehl
+-- (Standard-Postgres-Workaround: DO-Block mit pg_roles-Check). Die restlichen
+-- Statements unten (GRANT Rollenmitgliedschaft, ALTER FUNCTION OWNER TO,
+-- GRANT SELECT/EXECUTE) sind bereits von Natur aus idempotent -- erneutes
+-- Setzen desselben Owners/derselben Grants wirft in Postgres keinen Fehler.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pos_owner_lookup_bypass') THEN
+        CREATE ROLE pos_owner_lookup_bypass NOLOGIN BYPASSRLS;
+    END IF;
+END
+$$;
 
-GRANT pos_owner_lookup_bypass TO <APP_DB_ROLE>;
+GRANT pos_owner_lookup_bypass TO trading_bot_user;
 
 ALTER FUNCTION pos_position_owner_id(integer)    OWNER TO pos_owner_lookup_bypass;
 ALTER FUNCTION pos_portfolio_owner_id(integer)   OWNER TO pos_owner_lookup_bypass;
@@ -43,16 +59,16 @@ ALTER FUNCTION pos_real_estate_owner_id(integer) OWNER TO pos_owner_lookup_bypas
 GRANT SELECT ON pos_portfolios, pos_positions, pos_transactions, pos_real_estate
     TO pos_owner_lookup_bypass;
 
--- Nach der Ownership-Umschaltung erbt <APP_DB_ROLE> EXECUTE nicht mehr
+-- Nach der Ownership-Umschaltung erbt trading_bot_user EXECUTE nicht mehr
 -- implizit über den alten Owner-Status -- erneut explizit vergeben (die
 -- REVOKE...FROM PUBLIC-Zeilen in _migrate_owner_lookup_functions bleiben
 -- unabhängig davon in Kraft).
-GRANT EXECUTE ON FUNCTION pos_position_owner_id(integer)    TO <APP_DB_ROLE>;
-GRANT EXECUTE ON FUNCTION pos_portfolio_owner_id(integer)   TO <APP_DB_ROLE>;
-GRANT EXECUTE ON FUNCTION pos_transaction_owner_id(integer) TO <APP_DB_ROLE>;
-GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO <APP_DB_ROLE>;
+GRANT EXECUTE ON FUNCTION pos_position_owner_id(integer)    TO trading_bot_user;
+GRANT EXECUTE ON FUNCTION pos_portfolio_owner_id(integer)   TO trading_bot_user;
+GRANT EXECUTE ON FUNCTION pos_transaction_owner_id(integer) TO trading_bot_user;
+GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO trading_bot_user;
 
--- Verifikation (als <APP_DB_ROLE> oder via \df+ als Superuser):
+-- Verifikation (als trading_bot_user oder via \df+ als Superuser):
 --   SELECT proname, proowner::regrole, prosecdef
 --   FROM pg_proc WHERE proname LIKE 'pos_%_owner_id';
 -- proowner muss pos_owner_lookup_bypass zeigen, prosecdef = true.
