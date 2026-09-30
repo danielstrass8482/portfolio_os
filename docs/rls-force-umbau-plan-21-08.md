@@ -6,11 +6,13 @@ Entscheidung vor der eigentlichen Umsetzung. Umfang laut Vorgabe: 14 Tabellen
 `pos_admin_access_log`); `pos_users`/`pos_asset_classes`/`pos_family_goals`
 bleiben außen vor.
 
-## Status (2026-09-07)
+## Status (2026-09-30)
 
 Chunk 1 (Commit `c16b405`), Chunk 2 inkl. Nachzug (Commits `982842c`,
-`8e1d89c`) sind umgesetzt. **Vorbereitung für Chunk 5** (SECURITY DEFINER
-Owner-Lookup, Option B) ist umgesetzt: das im Chunk-2-Nachzug dokumentierte
+`8e1d89c`) sind umgesetzt und seit 2026-09-30 auf Produktion deployed (VPS auf
+`4b3bfef`). **Vorbereitung für Chunk 5** (SECURITY DEFINER Owner-Lookup,
+Option B) ist **vollständig abgeschlossen** – Design, Funktionen und Rolle,
+auch auf Produktion: das im Chunk-2-Nachzug dokumentierte
 Restrisiko (Sonderfall c, s.u. – die 4 Admin-Bypass-Owner-Lookups liefen
 noch über ein normales `session.get()` unter dem Admin-eigenen RLS-Kontext,
 wären also unter FORCE RLS mit reinen Owner-Policies selbst RLS-gefiltert
@@ -24,13 +26,27 @@ gewesen) ist geschlossen:
 - Die 4 Python-Helfer in `api.py` (`_position_owner_id`/`_portfolio_owner_id`/
   `_transaction_owner_id`/`_real_estate_owner_id`) rufen jetzt diese
   Funktionen statt eines normalen `session.get()` auf.
-- **Einmaliger manueller Schritt vor Chunk 7 noch offen** (braucht Postgres-
-  Superuser, bewusst NICHT automatisiert): `docs/rls-owner-lookup-bypass-
-  role-setup.sql` legt die dedizierte `BYPASSRLS`-Rolle
-  `pos_owner_lookup_bypass` an und schaltet die 4 Funktionen auf deren
-  Ownership um — erst danach bypassen sie tatsächlich FORCE RLS (SECURITY
-  DEFINER allein reicht nicht, siehe Kommentar in `_migrate_owner_lookup_functions`).
-  **Auf Produktion noch NICHT ausgeführt.**
+- **Einmaliger manueller Superuser-Schritt erledigt** (2026-09-30, auf
+  Produktion ausgeführt, unveränderte Repo-Datei aus `4b3bfef`, vorher
+  pg_dump-Backup): `docs/rls-owner-lookup-bypass-role-setup.sql` hat die
+  dedizierte `BYPASSRLS`-Rolle `pos_owner_lookup_bypass` angelegt und die 4
+  Funktionen auf deren Ownership umgeschaltet — erst damit bypassen sie
+  tatsächlich FORCE RLS (SECURITY DEFINER allein reicht nicht, siehe Kommentar
+  in `_migrate_owner_lookup_functions`). Danach auf Produktion verifiziert:
+  Rolle `NOLOGIN` + `BYPASSRLS` (kein Superuser); alle 4 Funktionen gehören
+  ihr (SECURITY DEFINER); `SELECT` auf `pos_portfolios`/`pos_positions`/
+  `pos_transactions`/`pos_real_estate` für die Rolle gesetzt; `EXECUTE` nur
+  für `trading_bot_user` (plus implizit der Owner selbst), PUBLIC hat keins;
+  Aufruf als `trading_bot_user` liefert den korrekten Owner bzw. NULL.
+  FORCE ROW LEVEL SECURITY dadurch unverändert inaktiv (8 Tabellen mit RLS,
+  0 mit FORCE, 7 Policies — identisch zum Stand vor dem Skript).
+- Offene Abwägung für Chunk 5/7 (nicht umgesetzt): die Mitgliedschaft
+  `pos_owner_lookup_bypass -> trading_bot_user` wurde mit den Postgres-
+  Defaults vergeben (`INHERIT TRUE`, `SET TRUE`). `INHERIT` ist nötig, damit
+  `init_db()` die Funktionen per `CREATE OR REPLACE` weiter aktualisieren
+  kann; `SET TRUE` erlaubt der App-Rolle aber zusätzlich `SET ROLE
+  pos_owner_lookup_bypass` und damit einen vollen RLS-Bypass. Vor FORCE RLS
+  prüfen, ob `GRANT ... WITH SET FALSE` (PG16+) reicht.
 - Verifiziert gegen eine lokale Wegwerf-Postgres-Instanz mit ECHTEM FORCE ROW
   LEVEL SECURITY + Owner-Policies auf `pos_positions`/`pos_portfolios`/
   `pos_transactions`/`pos_real_estate` (simuliert den künftigen Chunk-5/7-
@@ -42,10 +58,12 @@ gewesen) ist geschlossen:
   keine Regression.
 
 Chunk 3 (`main.py`/`notifier.py`, `update_prices()` via Pro-Nutzer-Iteration)
-ist ebenfalls bereits umgesetzt (Commit `982842c`). Chunk 4 (`dashboard.py`/
-`onboarding.py`) bleibt blockiert auf die offene Frage aus Abschnitt 7. Chunk
-5 selbst (die eigentlichen `CREATE POLICY`-Statements aus Abschnitt 4/5/6)
-sowie Chunk 6/7 sind noch NICHT umgesetzt.
+ist ebenfalls bereits umgesetzt (Commit `982842c`).
+
+**Nächster offener Schritt:** Chunk 4 (`dashboard.py`/`onboarding.py`, weiterhin
+blockiert auf die offene Frage aus Abschnitt 7) bzw. Chunk 5 selbst (die
+eigentlichen `CREATE POLICY`-Statements aus Abschnitt 4/5/6). Chunk 6/7 sind
+noch NICHT umgesetzt.
 
 ## 0. Kernproblem zur Erinnerung
 
