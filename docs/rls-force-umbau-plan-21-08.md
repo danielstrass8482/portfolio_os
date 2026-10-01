@@ -6,7 +6,7 @@ Entscheidung vor der eigentlichen Umsetzung. Umfang laut Vorgabe: 14 Tabellen
 `pos_admin_access_log`); `pos_users`/`pos_asset_classes`/`pos_family_goals`
 bleiben außen vor.
 
-## Status (2026-09-30)
+## Status (2026-10-01)
 
 Chunk 1 (Commit `c16b405`), Chunk 2 inkl. Nachzug (Commits `982842c`,
 `8e1d89c`) sind umgesetzt und seit 2026-09-30 auf Produktion deployed (VPS auf
@@ -40,19 +40,41 @@ gewesen) ist geschlossen:
   Aufruf als `trading_bot_user` liefert den korrekten Owner bzw. NULL.
   FORCE ROW LEVEL SECURITY dadurch unverändert inaktiv (8 Tabellen mit RLS,
   0 mit FORCE, 7 Policies — identisch zum Stand vor dem Skript).
-- Offene Abwägung für Chunk 5/7 (nicht umgesetzt): die Mitgliedschaft
-  `pos_owner_lookup_bypass -> trading_bot_user` wurde mit den Postgres-
-  Defaults vergeben (`INHERIT TRUE`, `SET TRUE`). `INHERIT` ist nötig, damit
-  `init_db()` die Funktionen per `CREATE OR REPLACE` weiter aktualisieren
-  kann; `SET TRUE` erlaubt der App-Rolle aber zusätzlich `SET ROLE
-  pos_owner_lookup_bypass` und damit einen vollen RLS-Bypass. Vor FORCE RLS
-  prüfen, ob `GRANT ... WITH SET FALSE` (PG16+) reicht.
+- **Mitgliedschaft auf `SET FALSE` korrigiert** (2026-10-01, Produktion,
+  Commit `8b50990`): `pos_owner_lookup_bypass -> trading_bot_user` lief
+  zunächst mit den Postgres-Defaults (`INHERIT TRUE`, `SET TRUE`), womit die
+  App-Rolle per `SET ROLE` einen vollen RLS-Bypass hätte annehmen können. Jetzt
+  `INHERIT TRUE, SET FALSE` (per `GRANT ... WITH SET FALSE` in place geändert,
+  1 Zeile); verifiziert: `SET ROLE` als `trading_bot_user` -> "permission
+  denied", Owner-Lookups funktionieren weiter. Folge: neue Funktionen kann die
+  App-Rolle nicht selbst an die Bypass-Rolle übergeben ("must be able to SET
+  ROLE") -- dafür das Setup-Skript erneut als Superuser laufen lassen.
+- **5. Owner-Lookup `pos_buchung_owner_id()` für `PUT
+  /api/haushaltsbuch/{buchung_id}`** (2026-10-01, Code gepusht, NICHT deployed):
+  `_require_buchung_access()` war beim Chunk-2-Nachzug (`8e1d89c`) bewusst
+  ausgeklammert und hatte zwei Lücken -- Lookup per `session.get()` unter dem
+  Admin-Kontext UND keine Kontext-Umschaltung vor dem Schreiben (unter FORCE
+  RLS: Admin bekäme 404, ein Admin-UPDATE träfe 0 Zeilen). Jetzt exakt das
+  Muster der übrigen Schreib-Endpoints: `_buchung_owner_id()` ->
+  `_switch_context_for_admin_write()` -> Schreib-Session; Nicht-Admins
+  weiterhin eigener Ownership-Check (404 bei fremder Buchung).
+  `_require_buchung_access()` entfernt (keine weiteren Aufrufer).
+  `add_kategorisierungsregel()` läuft dadurch automatisch im Owner-Kontext
+  (ContextVar pro Request) -- relevant für die geplante Policy auf
+  `pos_kategorisierungsregeln` (Abschnitt 6). Unverändert ggü. vorher:
+  Buchungs-Update und Regel-Anlage laufen in zwei getrennten Sessions/
+  Transaktionen. **Offen auf Produktion:** Deploy (legt die Funktion per
+  `init_db()` an) und danach erneut `docs/rls-owner-lookup-bypass-role-setup.sql`
+  als Superuser (Ownership + `GRANT SELECT ON pos_buchungen` + `EXECUTE`).
 - Verifiziert gegen eine lokale Wegwerf-Postgres-Instanz mit ECHTEM FORCE ROW
   LEVEL SECURITY + Owner-Policies auf `pos_positions`/`pos_portfolios`/
-  `pos_transactions`/`pos_real_estate` (simuliert den künftigen Chunk-5/7-
-  Zustand, siehe `test_rls_owner_lookup_functions.py`, 49/49) — inkl.
-  2-Konten-Cross-Access mit expliziten, getrennten Accounts über alle 12
-  betroffenen Endpoints, PUBLIC-Execute-Sperre, NULL-Fall. Bestehende Suiten
+  `pos_transactions`/`pos_real_estate`/`pos_buchungen`/
+  `pos_kategorisierungsregeln` (simuliert den künftigen Chunk-5/7-Zustand,
+  siehe `test_rls_owner_lookup_functions.py`, 68/68, Stand 2026-10-01) — inkl.
+  2-Konten-Cross-Access mit expliziten, getrennten Accounts über alle 13
+  betroffenen Endpoints, PUBLIC-Execute-Sperre, NULL-Fall, Regression des
+  alten Buchungs-Codepfads (404 / UPDATE 0 Zeilen -> jetzt 200 / 1 Zeile).
+  Setup-Skript dabei unverändert aus dem Repo zweimal gelaufen (idempotent). Bestehende Suiten
   weiterhin grün (`test_rls_context.py` 20/20, `test_rls_admin_bypass_helpers.py`
   48/48, `test_rls_special_cases.py` 17/17, `test_product_scope.py` 10/10) —
   keine Regression.

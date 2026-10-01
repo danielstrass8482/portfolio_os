@@ -924,14 +924,14 @@ def _real_estate_owner_id(real_estate_id: int) -> Optional[int]:
         ).scalar()
 
 
-def _require_buchung_access(buchung, current_user, endpoint: str, method: str = "GET") -> None:
-    """buchung bereits geladen (Objekt oder None)."""
-    if buchung is None:
-        raise HTTPException(status_code=404, detail="Buchung nicht gefunden")
-    if buchung.user_id != current_user.id:
-        if current_user.rolle != "admin":
-            raise HTTPException(status_code=404, detail="Buchung nicht gefunden")
-        log_admin_access(current_user.id, buchung.user_id, endpoint, method)
+def _buchung_owner_id(buchung_id: int) -> Optional[int]:
+    """RLS-Umbau, Vorbereitung Chunk 5 -- siehe Docstring von _position_owner_id().
+    Ersetzt seit 2026-10-01 das alte _require_buchung_access() (session.get()
+    unter dem Admin-eigenen Kontext, ohne Kontext-Umschaltung vor dem Schreiben)."""
+    with get_session() as session:
+        return session.execute(
+            text("SELECT pos_buchung_owner_id(:id)"), {"id": buchung_id}
+        ).scalar()
 
 
 # ─────────────────────────────────────────────
@@ -1708,9 +1708,19 @@ def haushaltsbuch(user_id: Optional[int] = None, current_user=Depends(get_curren
 
 @protected.put("/api/haushaltsbuch/{buchung_id}")
 def update_buchung(buchung_id: int, payload: dict, current_user=Depends(get_current_user)):
+    # Admin: Owner per SECURITY DEFINER Funktion auflösen und den RLS-Kontext
+    # VOR dem Öffnen der Schreib-Session auf ihn umschalten (wie bei den
+    # Positions-/Portfolio-/Transaktions-/Immobilien-Endpoints). Gilt per
+    # ContextVar für den ganzen Request, also auch für add_kategorisierungsregel()
+    # unten.
+    if current_user.rolle == "admin":
+        _switch_context_for_admin_write(
+            _buchung_owner_id(buchung_id), current_user, "/api/haushaltsbuch/{buchung_id}", "PUT"
+        )
     with get_session() as session:
         buchung = session.get(PosBuchung, buchung_id)
-        _require_buchung_access(buchung, current_user, "/api/haushaltsbuch/{buchung_id}", "PUT")
+        if buchung is None or (current_user.rolle != "admin" and buchung.user_id != current_user.id):
+            raise HTTPException(status_code=404, detail="Buchung nicht gefunden")
         kategorie = payload["kategorie"]
         buchung.kategorie = kategorie
         user_id = buchung.user_id

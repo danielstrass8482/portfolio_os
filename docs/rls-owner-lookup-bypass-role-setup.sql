@@ -9,14 +9,21 @@
 --
 -- Voraussetzung: die App wurde mindestens einmal gestartet (init_db() hat
 -- pos_position_owner_id()/pos_portfolio_owner_id()/pos_transaction_owner_id()/
--- pos_real_estate_owner_id() bereits angelegt) -- ALTER FUNCTION unten
--- schlägt sonst fehl, weil die Funktionen noch nicht existieren.
+-- pos_real_estate_owner_id()/pos_buchung_owner_id() bereits angelegt) --
+-- ALTER FUNCTION unten schlägt sonst fehl, weil die Funktionen noch nicht
+-- existieren.
+--
+-- Nachtrag 2026-10-01: 5. Funktion pos_buchung_owner_id() (PUT
+-- /api/haushaltsbuch/{buchung_id}). Wegen SET FALSE (s.u.) kann die App-Rolle
+-- eine NEU angelegte Funktion nicht selbst an pos_owner_lookup_bypass
+-- übergeben ("must be able to SET ROLE") -- dafür das ganze Skript erneut als
+-- Superuser laufen lassen, es ist idempotent.
 --
 -- Wirkung: erst NACH diesem Schritt bypassen die 4 Owner-Lookup-Funktionen
 -- tatsächlich FORCE ROW LEVEL SECURITY (SECURITY DEFINER allein reicht dafür
 -- nicht, siehe Kommentar in database.py::_migrate_owner_lookup_functions).
 -- Ohne diesen Schritt vor Chunk 7 (FORCE ROW LEVEL SECURITY scharf schalten)
--- würden alle 12 betroffenen Admin-Cross-View-Endpoints für Admins 404
+-- würden alle 13 betroffenen Admin-Cross-View-Endpoints für Admins 404
 -- werfen, sobald sie eine fremde Ressource referenzieren.
 --
 -- Auf Produktion NICHT automatisch ausgeführt -- bewusst manuell, siehe
@@ -59,14 +66,16 @@ ALTER FUNCTION pos_position_owner_id(integer)    OWNER TO pos_owner_lookup_bypas
 ALTER FUNCTION pos_portfolio_owner_id(integer)   OWNER TO pos_owner_lookup_bypass;
 ALTER FUNCTION pos_transaction_owner_id(integer) OWNER TO pos_owner_lookup_bypass;
 ALTER FUNCTION pos_real_estate_owner_id(integer) OWNER TO pos_owner_lookup_bypass;
+ALTER FUNCTION pos_buchung_owner_id(integer)     OWNER TO pos_owner_lookup_bypass;
 
 -- WICHTIG, per lokalem Test entdeckt (2026-09-07): BYPASSRLS überspringt NUR
 -- die Row-Security-Ebene, nicht die normale objektbezogene GRANT-Prüfung.
--- Ohne diese vier GRANTs schlägt jeder Aufruf mit "permission denied for
+-- Ohne diese GRANTs schlägt jeder Aufruf mit "permission denied for
 -- table ..." fehl, weil pos_owner_lookup_bypass sonst gar kein SELECT auf
 -- den Tabellen hat, die die Funktionskörper lesen (siehe database.py::
 -- _migrate_owner_lookup_functions für die genauen Tabellen je Funktion).
-GRANT SELECT ON pos_portfolios, pos_positions, pos_transactions, pos_real_estate
+GRANT SELECT ON pos_portfolios, pos_positions, pos_transactions, pos_real_estate,
+    pos_buchungen
     TO pos_owner_lookup_bypass;
 
 -- Nach der Ownership-Umschaltung erbt trading_bot_user EXECUTE nicht mehr
@@ -77,6 +86,7 @@ GRANT EXECUTE ON FUNCTION pos_position_owner_id(integer)    TO trading_bot_user;
 GRANT EXECUTE ON FUNCTION pos_portfolio_owner_id(integer)   TO trading_bot_user;
 GRANT EXECUTE ON FUNCTION pos_transaction_owner_id(integer) TO trading_bot_user;
 GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO trading_bot_user;
+GRANT EXECUTE ON FUNCTION pos_buchung_owner_id(integer)     TO trading_bot_user;
 
 -- Verifikation (als trading_bot_user oder via \df+ als Superuser):
 --   SELECT proname, proowner::regrole, prosecdef

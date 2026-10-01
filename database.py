@@ -684,8 +684,9 @@ def _migrate_owner_lookup_functions():
     fest im Code stehende SQL-Zeichenkette, Nutzereingaben fließen ausschließlich
     als gebundene Parameterwerte ein, nie als SQL/Bezeichner-Text; kein Raw-SQL-
     Endpoint, kein generischer Query-Builder, keine Debug-Route). Die einzigen
-    Aufrufer dieser 4 Funktionen sind und bleiben die 4 gleichnamigen Python-
-    Helfer in api.py. Der GRANT ist also technisch weiter als nötig (jede
+    Aufrufer dieser Funktionen sind und bleiben die gleichnamigen Python-
+    Helfer in api.py (seit 2026-10-01 fünf: zusätzlich pos_buchung_owner_id /
+    _buchung_owner_id für PUT /api/haushaltsbuch/{buchung_id}). Der GRANT ist also technisch weiter als nötig (jede
     Postgres-Session unter trading_bot_user KÖNNTE die Funktionen direkt
     aufrufen), aber praktisch nicht ausnutzbar, weil kein Request-Pfad beliebige
     SQL an die DB reicht. Falls sich das beim nächsten RLS-Chunk ändert (z.B.
@@ -745,16 +746,32 @@ def _migrate_owner_lookup_functions():
             SELECT user_id FROM pos_real_estate WHERE id = p_real_estate_id;
         $$;
         """,
+        # 5. Eintrag (2026-10-01): Owner-Lookup für PUT /api/haushaltsbuch/{buchung_id}
+        # (api.py::_buchung_owner_id) -- war beim Chunk-2-Nachzug (8e1d89c) bewusst
+        # ausgeklammert, folgt jetzt exakt demselben Muster wie die 4 obigen.
+        """
+        CREATE OR REPLACE FUNCTION pos_buchung_owner_id(p_buchung_id integer)
+        RETURNS integer
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT user_id FROM pos_buchungen WHERE id = p_buchung_id;
+        $$;
+        """,
         # PUBLIC hat für neu angelegte Funktionen per Postgres-Default EXECUTE --
         # sofort entziehen und explizit nur an die eine App-Rolle vergeben (s.o.).
         "REVOKE EXECUTE ON FUNCTION pos_position_owner_id(integer) FROM PUBLIC",
         "REVOKE EXECUTE ON FUNCTION pos_portfolio_owner_id(integer) FROM PUBLIC",
         "REVOKE EXECUTE ON FUNCTION pos_transaction_owner_id(integer) FROM PUBLIC",
         "REVOKE EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) FROM PUBLIC",
+        "REVOKE EXECUTE ON FUNCTION pos_buchung_owner_id(integer) FROM PUBLIC",
         "GRANT EXECUTE ON FUNCTION pos_position_owner_id(integer) TO CURRENT_USER",
         "GRANT EXECUTE ON FUNCTION pos_portfolio_owner_id(integer) TO CURRENT_USER",
         "GRANT EXECUTE ON FUNCTION pos_transaction_owner_id(integer) TO CURRENT_USER",
         "GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO CURRENT_USER",
+        "GRANT EXECUTE ON FUNCTION pos_buchung_owner_id(integer) TO CURRENT_USER",
     ]
     with engine.begin() as conn:
         for stmt in statements:
