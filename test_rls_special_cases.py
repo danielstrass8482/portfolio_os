@@ -12,7 +12,7 @@ für ALLE Nutzer, korrekt adressierte Reports, funktionierender Admin-
 Cross-View) dabei nicht kaputtgeht.
 
 Deckt ab:
-  1. update_prices(): 3 Nutzer mit je eigenen Positionen -- nach dem Lauf
+  1. update_prices_all_users() (vor 2026-10-01: update_prices()): 3 Nutzer mit je eigenen Positionen -- nach dem Lauf
      müssen ALLE Positionen aktualisiert sein (kein Nutzer übersprungen),
      unabhängig davon wie viele verschiedene user_context()-Wechsel das
      bedeutet.
@@ -97,7 +97,9 @@ def mint_token(user_id: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# 1: update_prices() -- nutzerübergreifend, kein Nutzer übersprungen
+# 1: update_prices_all_users() -- nutzerübergreifend, kein Nutzer übersprungen
+#    (seit 2026-10-01 eigene Funktion für den System-Fall; update_prices() ist
+#    nur noch für den aktiven Kontext zuständig und wirft ohne Kontext)
 # ─────────────────────────────────────────────
 
 def test_update_prices_covers_all_users():
@@ -111,12 +113,19 @@ def test_update_prices_covers_all_users():
     original = portfolio_module.get_price_in_eur
     portfolio_module.get_price_in_eur = lambda ticker: 42.0
     try:
-        updated = portfolio_module.update_prices()
+        updated = portfolio_module.update_prices_all_users()
+        try:
+            portfolio_module.update_prices()
+            ohne_kontext = "kein Fehler"
+        except RuntimeError as e:
+            ohne_kontext = f"RuntimeError: {e}"
     finally:
         portfolio_module.get_price_in_eur = original
 
-    record("update_prices(): alle 3 Positionen (3 verschiedene Nutzer) aktualisiert",
+    record("update_prices_all_users(): alle 3 Positionen (3 verschiedene Nutzer) aktualisiert",
            updated == 3, f"updated={updated}")
+    record("update_prices() ohne Nutzerkontext wirft statt still 0 zu liefern",
+           ohne_kontext.startswith("RuntimeError"), ohne_kontext)
 
     for uid, ticker in ((uid_1, "TICK1"), (uid_2, "TICK2"), (uid_3, "TICK3")):
         with database.user_context(uid):

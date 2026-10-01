@@ -13,7 +13,7 @@ from config import TICKER_MAPPING
 from database import (
     get_session, PosPortfolio, PosPosition, PosTransaction,
     PosAssetClass, PosTargetWeight, PosDailySnapshot, PosRealEstate,
-    user_context,
+    PosUser, user_context, current_user_context,
 )
 import tax_engine
 import trading_bot_connector
@@ -637,58 +637,83 @@ def get_price_in_eur(ticker: str) -> float:
     return round(price, 2)
 
 
-def update_prices() -> int:
-    """
-    Aktualisiert current_price aller Positionen – Preise werden über
-    get_price_in_eur() geholt, laufen also immer bereits in EUR umgerechnet
-    ein (siehe get_price_in_eur()). Läuft fehlertolerant: einzelne nicht
-    auflösbare oder fehlerhafte Ticker überspringen den Rest nicht, werden
-    aber geloggt. Gibt die Anzahl erfolgreich aktualisierter Positionen zurück.
-
-    RLS-Umbau Chunk 2 (2026-08-21, siehe docs/rls-force-umbau-plan-21-08.md,
-    Sonderfall a): läuft nutzerübergreifend über ALLE Portfolios -- passt
-    nicht ins normale "ein Request/Job = ein user_context()"-Muster. Pro-
-    Nutzer-Iteration statt eigener BYPASSRLS-DB-Rolle gewählt (siehe Plan-
-    Dokument: kein neuer DB-User/Connection-Pool nötig, solange nur wenige
-    Nutzer aktiv Portfolio-OS nutzen -- aktuell hat nur Daniel überhaupt
-    Positionen, siehe Testbericht zur Performance-Einschätzung). Erst eine
-    lesende Session ohne Kontext (Lesen ist in diesem Chunk noch nicht
-    eingeschränkt), dann pro betroffenem Nutzer ein einzelner
-    user_context()-Block für die Schreib-Session.
-    """
+def _update_prices_fuer(user_id: int) -> int:
+    """Aktualisiert current_price aller Positionen von user_id. Muss im
+    RLS-Kontext von user_id laufen (Lesen und Schreiben in derselben Session);
+    zusätzlich explizit auf user_id gefiltert, damit das Ergebnis nicht davon
+    abhängt, ob FORCE ROW LEVEL SECURITY aktiv ist."""
+    updated = 0
     with get_session() as session:
-        rows = (
-            session.query(PosPosition.id, PosPosition.ticker, PosPortfolio.user_id)
+        positionen = (
+            session.query(PosPosition)
             .join(PosPortfolio, PosPosition.portfolio_id == PosPortfolio.id)
+            .filter(PosPortfolio.user_id == user_id)
             .all()
         )
-    positionen_je_nutzer: dict[int, list[tuple[int, str]]] = {}
-    for position_id, ticker, user_id in rows:
-        positionen_je_nutzer.setdefault(user_id, []).append((position_id, ticker))
+        for pos in positionen:
+            if not pos.ticker:
+                continue
+            try:
+                preis = get_price_in_eur(pos.ticker)
+            except Exception as e:
+                print(f"⚠️  Fehler beim Kursabruf für Ticker '{pos.ticker}': {e} (übersprungen)")
+                continue
+            if preis is None:
+                print(f"⚠️  Kein aktueller Kurs für Ticker '{pos.ticker}' gefunden (übersprungen)")
+                continue
+            pos.current_price = preis
+            pos.currency = "EUR"
+            pos.last_updated = datetime.utcnow()
+            updated += 1
+    return updated
 
+
+def update_prices() -> int:
+    """
+    Aktualisiert current_price der Positionen des Nutzers im AKTIVEN RLS-Kontext
+    (Dashboard: fester Kontext, API: anfragender Nutzer) -- Preise kommen über
+    get_price_in_eur() bereits in EUR. Fehlertolerant: einzelne nicht
+    auflösbare oder fehlerhafte Ticker werden übersprungen und geloggt. Gibt
+    die Anzahl erfolgreich aktualisierter Positionen zurück.
+
+    RLS-Umbau (2026-10-01, siehe docs/rls-force-umbau-plan-21-08.md, Sonderfall
+    a): früher las diese Funktion zuerst ALLE Positionen in der Session des
+    Aufrufers und schrieb dann pro Besitzer -- ohne Kontext (täglicher Job)
+    hätte die Leseabfrage unter FORCE RLS 0 Zeilen geliefert, still und ohne
+    Fehler. Jetzt getrennt: diese Funktion NUR für den aktiven Kontext (wirft
+    ohne Kontext, statt still 0 zu liefern), der nutzerübergreifende
+    System-Fall ist update_prices_all_users().
+    """
+    user_id = current_user_context()
+    if user_id is None:
+        raise RuntimeError(
+            "update_prices() braucht einen aktiven Nutzerkontext -- für den "
+            "nutzerübergreifenden System-Fall update_prices_all_users() verwenden."
+        )
+    return _update_prices_fuer(user_id)
+
+
+def update_prices_all_users() -> int:
+    """
+    System-Fall (täglicher Job, notify-daily.timer -> main.daily_job()): Kurse
+    für ALLE Zeilen in pos_users ohne Filter (Verhaltensparität zum Zustand
+    vor 2026-10-01 -- auch inaktive Nutzer behalten aktuelle Kurse). pos_users
+    liegt außerhalb des RLS-Umfangs; Positionen werden pro Nutzer in dessen
+    eigenem user_context() gelesen und geschrieben. Darf NICHT aus einem
+    aktiven Nutzerkontext (Request, Dashboard) aufgerufen werden -- sonst
+    könnte ein Nutzer über diese Funktion fremde Positionen anfassen.
+    """
+    if current_user_context() is not None:
+        raise RuntimeError(
+            "update_prices_all_users() ist nur für Systemjobs ohne Nutzerkontext "
+            f"(aktiver Kontext: {current_user_context()}) -- update_prices() verwenden."
+        )
+    with get_session() as session:
+        user_ids = [uid for (uid,) in session.query(PosUser.id).order_by(PosUser.id).all()]
     updated = 0
-    for user_id, positionen in positionen_je_nutzer.items():
+    for user_id in user_ids:
         with user_context(user_id):
-            with get_session() as session:
-                for position_id, ticker in positionen:
-                    if not ticker:
-                        continue
-                    try:
-                        preis = get_price_in_eur(ticker)
-                    except Exception as e:
-                        print(f"⚠️  Fehler beim Kursabruf für Ticker '{ticker}': {e} (übersprungen)")
-                        continue
-                    if preis is None:
-                        print(f"⚠️  Kein aktueller Kurs für Ticker '{ticker}' gefunden (übersprungen)")
-                        continue
-                    pos = session.get(PosPosition, position_id)
-                    if pos is None:
-                        continue
-                    pos.current_price = preis
-                    pos.currency = "EUR"
-                    pos.last_updated = datetime.utcnow()
-                    updated += 1
-
+            updated += _update_prices_fuer(user_id)
     return updated
 
 

@@ -46,7 +46,7 @@ def _alle_user_ids() -> list:
 def daily_job():
     """Täglich 08:00: Preise aktualisieren, Schwellwerte prüfen, Snapshot speichern."""
     print(f"[{date.today()}] Daily Job: Preise aktualisieren...")
-    aktualisiert = portfolio_module.update_prices()
+    aktualisiert = portfolio_module.update_prices_all_users()
     print(f"  {aktualisiert} Position(en) aktualisiert")
 
     for user_id in _alle_user_ids():
@@ -108,10 +108,10 @@ def yearly_job():
 
 def update_all_prices():
     """Alle 15 Min während der US-Handelszeit: nur Kurse aktualisieren (kein
-    Alert/Snapshot – das übernimmt weiterhin der daily_job). update_prices()
-    verwaltet Session und Commit selbst."""
+    Alert/Snapshot – das übernimmt weiterhin der daily_job).
+    update_prices_all_users() verwaltet Session und Commit selbst."""
     try:
-        aktualisiert = portfolio_module.update_prices()
+        aktualisiert = portfolio_module.update_prices_all_users()
         print(f"✅ Preise aktualisiert ({aktualisiert} Position(en))")
     except Exception as e:
         print(f"⚠️ Preisupdate fehlgeschlagen: {e}")

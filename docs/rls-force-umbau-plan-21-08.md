@@ -83,14 +83,24 @@ gewesen) ist geschlossen:
 
 Chunk 3 (`main.py`/`notifier.py`, `update_prices()` via Pro-Nutzer-Iteration)
 ist ebenfalls bereits umgesetzt (Commit `982842c`).
-**Nebenbefund (2026-10-01), vor Chunk 7 zu lösen:** `update_prices()` liest
-die Positionen ALLER Nutzer zuerst in einer Session OHNE Kontext und
-iteriert erst danach pro Nutzer mit `user_context()`. Unter FORCE RLS liefert
-diese erste Abfrage ohne Kontext 0 Zeilen. Unkritisch für Dashboard und API
-(beide laufen mit festem bzw. Request-Kontext und aktualisieren dann eben nur
-die Kurse dieses Nutzers), aber `main.py` (täglicher Job, läuft auf
-Produktion derzeit nicht) würde unter FORCE RLS stillschweigend NICHTS mehr
-aktualisieren.
+**Kursaktualisierung unter FORCE RLS gelöst** (2026-10-01, Code gepusht, NICHT
+deployed; vorher Nebenbefund "vor Chunk 7 zu lösen"): `update_prices()` las
+die Positionen aller Nutzer zuerst in der Session des Aufrufers. Der tägliche
+Job (`notify-daily.timer` -> `run_scheduled_job.py daily` ->
+`main.daily_job()`, läuft auf Produktion seit 2026-08-21 und ist der einzige
+regelmäßige Kurs-Updater) ruft ohne Kontext auf -- unter FORCE RLS hätte er
+still 0 Positionen aktualisiert (Snapshot/Alert-Mail auf veralteten Kursen,
+kein Fehler). Jetzt getrennt: `update_prices()` nur für den aktiven Kontext
+(Dashboard, API; explizit auf diesen Nutzer gefiltert, wirft ohne Kontext),
+`update_prices_all_users()` für den System-Fall (alle Zeilen aus `pos_users`
+ohne Filter, pro Nutzer in dessen `user_context()`, verweigert den Aufruf aus
+einem aktiven Nutzerkontext). `main.daily_job()` und `main.update_all_prices()`
+nutzen die neue Funktion. Nebeneffekt, gewollt: `POST
+/api/positions/refresh-prices` trifft jetzt auch OHNE FORCE nur noch die
+Positionen des anfragenden Nutzers (vorher alle Nutzer). Verifiziert mit
+`test_update_prices_rls.py` (17/17, inkl. Vorher-Beweis mit dem alten Code:
+0 aktualisiert ohne Fehler) und angepasstem Test 1 in
+`test_rls_special_cases.py`.
 
 **Chunk 4 gelöst** (2026-10-01, Code gepusht, NICHT deployed): Entscheidung --
 `dashboard.py` ist ein Ein-Personen-Admin-Werkzeug. Es läuft fest im Kontext
@@ -362,7 +372,7 @@ Keine offenen Fragen — Schema ist bei allen fünf eindeutig.
 
 | Stelle | Warum kein Filter | Risiko bei zu aggressiver Umstellung |
 |---|---|---|
-| `portfolio.py::update_prices()` | Systemweites Preis-Update über alle Positionen | Bricht komplett, wenn naiv unter FORCE gestellt (s. Sonderfall a) |
+| `portfolio.py::update_prices()` — *seit 2026-10-01 getrennt in `update_prices()` (aktiver Kontext) + `update_prices_all_users()` (System-Fall), siehe Status* | Systemweites Preis-Update über alle Positionen | Bricht komplett, wenn naiv unter FORCE gestellt (s. Sonderfall a) |
 | `api.py::family()` / `overview(family=true)` | Admin-Aggregation über ALLE `pos_users` (bewusst, `_require_admin`-gated, ADMIN-SCOPE-TODO) | Muss wie Sonderfall (c) behandelt werden — mehrere Kontext-Wechsel INNERHALB eines einzigen Requests (einmal pro aggregiertem Nutzer), nicht nur einer |
 | `api.py::list_users/get_pending_users/admin_approve_user/...` | Admin-Verwaltung aller `pos_users` | `pos_users` ist ohnehin außerhalb des Scopes dieser Runde — kein Konflikt, aber falls `pos_users` später auch RLS bekommt, bräuchten diese Endpoints eine eigene Bypass-Logik |
 | **`dashboard.py`/`onboarding.py` (40 Stellen zusammen)** — *gelöst 2026-10-01, siehe Status oben: fester Kontext über `DASHBOARD_USER_ID`* | **Kein Auth-/User-Konzept im gesamten Streamlit-Code** — kein Login, kein `session_state`-User, keine erkennbare Stelle, die "wer bin ich" beantwortet | **Größtes offenes Risiko dieser ganzen Umsetzung.** Ich habe keine Stelle gefunden, die dashboard.py verrät, für welchen `user_id`-Kontext es aktuell rendert (weder Konstante noch Query-Parameter noch Session-State). Bevor hier irgendein `user_context(...)` gesetzt werden kann, muss erst geklärt werden: Ist `dashboard.py` faktisch ein Single-Operator-Tool nur für Daniel (dann reicht ein hartcodierter Kontext beim Programmstart), oder gibt es eine mir nicht aufgefallene Nutzerauswahl? **Das kläre ich nicht selbst, sondern frage nach**, bevor Chunk 2/3 (unten) dashboard.py anfasst. |

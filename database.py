@@ -582,6 +582,13 @@ def override_user_context(user_id: int) -> None:
     _current_user_ctx.set(user_id)
 
 
+def current_user_context() -> int | None:
+    """user_id des aktuell aktiven RLS-Kontexts (oder None) -- lesend, z.B. für
+    portfolio.update_prices(), das ausdrücklich nur im Kontext des Aufrufers
+    arbeitet."""
+    return _current_user_ctx.get()
+
+
 def pin_user_context(user_id: int) -> None:
     """
     RLS-Umbau Chunk 4 (2026-10-01, siehe docs/rls-force-umbau-plan-21-08.md):
