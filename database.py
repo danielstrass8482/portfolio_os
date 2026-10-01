@@ -922,15 +922,37 @@ def _seed_asset_classes(session: Session):
 def log_admin_access(admin_user_id: int, target_user_id: int, endpoint: str, method: str) -> None:
     """Schreibt einen Audit-Log-Eintrag für echten Cross-User-Zugriff eines Admins
     (siehe PosAdminAccessLog). Fehlertolerant: ein Logging-Fehler darf den
-    eigentlichen, bereits erlaubten Request nicht scheitern lassen."""
+    eigentlichen, bereits erlaubten Request nicht scheitern lassen -- wird aber
+    sichtbar geloggt, damit ein verlorener Audit-Eintrag nicht unbemerkt bleibt.
+
+    Rohes INSERT OHNE RETURNING statt session.add() (RLS-Umbau Chunk 5,
+    2026-10-01, docs/rls-policies.sql §5 Variante C): pos_admin_access_log hat
+    unter FORCE RLS bewusst nur eine INSERT-Policy und keine SELECT-Policy.
+    Postgres verlangt für INSERT ... RETURNING (so schreibt der ORM-Pfad, um
+    die id zurückzulesen), dass die neue Zeile auch eine SELECT-Policy erfüllt
+    -- der Eintrag würde abgelehnt. Alle Spalten außer id werden explizit
+    gesetzt, created_at exakt wie der ORM-Default des Modells (datetime.utcnow,
+    naiver UTC-Zeitstempel); id kommt wie bisher aus der DB-Sequenz. Bei einer
+    neuen Modellspalte mit Default hier nachziehen (test_rls_policies.py prüft
+    das)."""
     try:
         with get_session() as session:
-            session.add(PosAdminAccessLog(
-                admin_user_id=admin_user_id, target_user_id=target_user_id,
-                endpoint=endpoint, method=method,
-            ))
-    except Exception:
-        pass
+            session.execute(
+                text(
+                    "INSERT INTO pos_admin_access_log "
+                    "(admin_user_id, target_user_id, endpoint, method, created_at) "
+                    "VALUES (:admin_user_id, :target_user_id, :endpoint, :method, :created_at)"
+                ),
+                {
+                    "admin_user_id": admin_user_id, "target_user_id": target_user_id,
+                    "endpoint": endpoint, "method": method, "created_at": datetime.utcnow(),
+                },
+            )
+    except Exception as e:
+        print(
+            f"⚠️  Admin-Zugriff NICHT protokolliert (admin={admin_user_id}, target={target_user_id}, "
+            f"{method} {endpoint}): {e}"
+        )
 
 
 def get_or_create_user(session: Session, name: str, email: str = None, rolle: str = "member") -> PosUser:

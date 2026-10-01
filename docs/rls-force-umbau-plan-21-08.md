@@ -6,7 +6,7 @@ Entscheidung vor der eigentlichen Umsetzung. Umfang laut Vorgabe: 14 Tabellen
 `pos_admin_access_log`); `pos_users`/`pos_asset_classes`/`pos_family_goals`
 bleiben außen vor.
 
-## Status (2026-10-01)
+## Status (2026-10-01, Stand Chunk 5)
 
 Chunk 1 (Commit `c16b405`), Chunk 2 inkl. Nachzug (Commits `982842c`,
 `8e1d89c`) sind umgesetzt und seit 2026-09-30 auf Produktion deployed (VPS auf
@@ -128,8 +128,24 @@ Login -- Schutz ist die Bindung an `127.0.0.1:8502` (nur per SSH-Tunnel).
 **Offen auf Produktion:** `DASHBOARD_USER_ID=1` in die `.env`, Deploy,
 Dashboard-Neustart (ohne die Variable startet das neue Dashboard nicht).
 
-**Nächster offener Schritt:** Chunk 5 (die eigentlichen `CREATE POLICY`-
-Statements aus Abschnitt 4/5/6). Chunk 6/7 sind noch NICHT umgesetzt.
+**Chunk 5 vorbereitet** (2026-10-01, Code + SQL gepusht, auf Produktion NICHT
+ausgeführt): `docs/rls-policies.sql` enthält erstmals ALLE Policies der 14
+Tabellen versioniert (die 7 seit 2026-07-24 nur von Hand auf Produktion
+angelegten wortgleich übernommen; §4 `pos_transactions`; §6 die 5 bisher
+ungeschützten Tabellen inkl. `ENABLE`; §5 Variante C für
+`pos_admin_access_log`), wiederholbar, eine Transaktion, ohne FORCE (ändert
+am Verhalten der App nichts). Dazu `log_admin_access()` ohne RETURNING (siehe
+§5). Verifiziert mit `test_rls_policies.py` (40/40, zweimal gegen dieselbe
+DB): Definitionen gegen Erwartung und Produktion, unter FORCE Trennung je
+Tabelle, Audit-Log nur erweiterbar, rohes INSERT gleichwertig zum alten
+ORM-Weg. Alle übrigen RLS-Suiten grün. **Offen auf Produktion:** Deploy des
+Codes (`log_admin_access()`), danach `docs/rls-policies.sql` als manueller
+Superuser-Schritt mit Backup vorher.
+
+**Nächster offener Schritt danach:** Chunk 6 (Isolationstest unter FORCE gegen
+eine wiederhergestellte Kopie des Produktions-Dumps; die Test-Suiten sollten
+dafür die Policies aus `docs/rls-policies.sql` laden statt eigener
+Inline-Definitionen), dann Chunk 7 (FORCE).
 
 ## 0. Kernproblem zur Erinnerung
 
@@ -305,6 +321,9 @@ CREATE POLICY user_isolation ON pos_transactions
 ```
 
 Kein offener Punkt — Schema ist eindeutig, keine Rückfrage nötig.
+**Hinweis 2026-10-01:** RLS ist auf `pos_transactions` bereits aktiviert, aber
+ohne Policy -- unter FORCE wäre die Tabelle damit komplett gesperrt; die
+Policy ist also Pflicht vor Chunk 7. Umgesetzt in `docs/rls-policies.sql`.
 
 ## 5. Policy-Vorschlag `pos_admin_access_log`
 
@@ -339,15 +358,32 @@ zu sehen, dass/wann ein Admin auf ihre Daten zugegriffen hat — heute gibt es
 dafür in der UI ohnehin keinen Endpoint, wäre also erstmal nur DB-seitig
 vorbereitet, nicht nutzbar.
 
-**Meine Einschätzung:** Variante A ist der sicherere Default (Audit-Logs
+**Entscheidung 2026-10-01: Variante C** (zusätzlich zu A/B vorgeschlagen) --
+nur `FOR INSERT WITH CHECK (admin_user_id = <Kontext>)`, keine SELECT-/
+UPDATE-/DELETE-Policy: die App kann das Audit-Log unter FORCE nur schreiben,
+nicht lesen, ändern oder löschen (lesen nur als Superuser). Wie bei §6 ist
+zusätzlich `ALTER TABLE pos_admin_access_log ENABLE ROW LEVEL SECURITY;` nötig
+(RLS war aus). Umgesetzt in `docs/rls-policies.sql`. **Befund aus dem lokalen Test,
+gelöst:** `INSERT ... RETURNING` (der ORM-Pfad, mit dem `log_admin_access()`
+bisher schrieb) verlangt, dass die neue Zeile auch eine SELECT-Policy erfüllt
+-- unter Variante C + FORCE scheiterte der Insert, und `log_admin_access()`
+verschluckte den Fehler (`except: pass`), der Audit-Eintrag ging still
+verloren. Jetzt schreibt `log_admin_access()` per rohem INSERT ohne RETURNING
+(alle Spalten explizit, `created_at` wie der ORM-Default) und loggt einen
+abgelehnten Eintrag sichtbar statt ihn zu verschlucken.
+
+**Ursprüngliche Einschätzung:** Variante A ist der sicherere Default (Audit-Logs
 sollten primär für Admins/Auditoren sichtbar sein, nicht für die betroffene
 Person selbst editierbar-nah in Reichweite) — aber das ist eine bewusste
 Produktentscheidung, keine technische, daher explizit offen gelassen.
 
 ## 6. Policies für die 5 ungeschützten Tabellen
 
-Alle vier mit direktem `user_id` folgen 1:1 dem bestehenden Muster der 7
-bereits (wirkungslos) geschützten Tabellen:
+Alle fünf mit direktem `user_id` folgen 1:1 dem bestehenden Muster der 7
+bereits (wirkungslos) geschützten Tabellen. **Korrektur 2026-10-01:** auf
+allen fünf ist RLS bisher NICHT aktiviert -- vor jeder Policy fehlt
+`ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;`, ohne das wirkt die Policy auch
+unter FORCE nicht. Umgesetzt (inkl. ENABLE) in `docs/rls-policies.sql`:
 
 ```sql
 CREATE POLICY user_isolation ON pos_daily_snapshots
