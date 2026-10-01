@@ -30,6 +30,14 @@ LLM_MAX_TOKENS    = 1536
 # ─────────────────────────────────────────────
 BASE_URL = os.getenv("BASE_URL", "https://portfolio.diestraesschens.de")
 
+# Streamlit-Dashboard (dashboard.py, Port 8502) ist ein Ein-Personen-Admin-
+# Werkzeug (RLS-Umbau Chunk 4, siehe docs/rls-force-umbau-plan-21-08.md): es
+# läuft fest im RLS-Kontext DIESES Nutzers, ohne Nutzerauswahl. Fehlt der Wert
+# oder ist er keine Zahl, startet das Dashboard nicht (fail closed, siehe
+# dashboard.py). Die Web-App (api.py) braucht ihn nicht.
+_dashboard_user_id_raw = os.getenv("DASHBOARD_USER_ID", "").strip()
+DASHBOARD_USER_ID = int(_dashboard_user_id_raw) if _dashboard_user_id_raw.isdigit() else None
+
 # ─────────────────────────────────────────────
 # ALERTS / SMTP
 # ─────────────────────────────────────────────
@@ -109,6 +117,9 @@ def validate_config() -> list[str]:
         warnings.append("ANTHROPIC_API_KEY fehlt – KI-Analyse deaktiviert (degraded mode)")
     if not ALERT_EMAIL or not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         warnings.append("SMTP/ALERT_EMAIL unvollständig – E-Mail-Benachrichtigungen deaktiviert (nur Logs)")
+    if DASHBOARD_USER_ID is None:
+        warnings.append("DASHBOARD_USER_ID fehlt oder ist keine Zahl – Streamlit-Dashboard startet nicht "
+                        "(betrifft nur dashboard.py, nicht die Web-App)")
     if not (0 < REBALANCING_THRESHOLD_SPARRATE < REBALANCING_THRESHOLD_ALERT < REBALANCING_THRESHOLD_SELL):
         warnings.append("Rebalancing-Schwellwerte nicht aufsteigend (SPARRATE < ALERT < SELL erwartet)")
     return warnings

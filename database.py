@@ -582,6 +582,42 @@ def override_user_context(user_id: int) -> None:
     _current_user_ctx.set(user_id)
 
 
+def pin_user_context(user_id: int) -> None:
+    """
+    RLS-Umbau Chunk 4 (2026-10-01, siehe docs/rls-force-umbau-plan-21-08.md):
+    setzt den RLS-Kontext für den REST des aktuellen Threads fest auf user_id
+    -- gedacht ausschließlich für das Streamlit-Dashboard (dashboard.py), das
+    als Ein-Personen-Admin-Werkzeug fest im Kontext von DASHBOARD_USER_ID läuft.
+
+    BEWUSST KEIN Token-Reset (anders als user_context(), und anders als
+    override_user_context(), das nur innerhalb eines äußeren user_context()-
+    Blocks sicher ist, dessen finally den Zustand zurücksetzt): Streamlit hat
+    kein Request-Ende, an dem ein with-Block schließen könnte -- jeder
+    Script-Run ist ein Top-to-Bottom-Durchlauf des Moduls. Ein Reset ist hier
+    aber auch nicht nötig, weil Streamlit (geprüft für 1.61) JEDEN Script-Run
+    in einem eigenen, neu erzeugten threading.Thread ausführt
+    (ScriptRunner.start(), ohne contextvars.copy_context()), und ein neuer
+    Thread unter Python 3.12 mit einem leeren Context startet: der Wert kann
+    weder in einen späteren Run noch in eine andere Browser-Session lecken,
+    sondern stirbt mit dem Thread. dashboard.py ruft die Funktion deshalb zu
+    Beginn JEDES Runs erneut auf, noch vor init_db()/update_prices(). Siehe
+    test_dashboard_context.py für den expliziten Isolationstest.
+
+    NICHT in api.py oder anderen Request-/Job-Kontexten verwenden -- dort
+    gilt das user_context()-Muster mit garantiertem Reset.
+    """
+    if not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError(f"pin_user_context() braucht eine positive user_id, nicht {user_id!r}")
+    vorher = _current_user_ctx.get()
+    if vorher is not None and vorher != user_id:
+        # Laut test_dashboard_context.py nie der Fall (jeder Run = neuer Thread
+        # mit leerem Context) -- falls doch, hat sich Streamlits Thread-Modell
+        # geändert und die Begründung oben gilt nicht mehr.
+        print(f"⚠️  pin_user_context({user_id}): Thread hatte bereits fremden Kontext {vorher} "
+              f"-- Streamlit-Thread-Isolation prüfen (siehe Docstring).")
+    _current_user_ctx.set(user_id)
+
+
 @contextmanager
 def get_session():
     """

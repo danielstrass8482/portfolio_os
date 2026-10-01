@@ -1,9 +1,16 @@
 """
 dashboard.py – Streamlit-Dashboard für Portfolio-OS.
-9 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Haushaltsbuch,
-Familie, KI-Analyse, Verwaltung. Keine Sidebar – die Nutzer-/Familienauswahl
-steht oberhalb der Tabs (wird von allen Tabs benötigt), alle Anlege-/
-Bearbeiten-/Löschen-Formulare stecken im Tab „⚙️ Verwaltung“.
+8 Tabs: Übersicht, Positionen, Rebalancing, Steuer, Immobilie, Haushaltsbuch,
+KI-Analyse, Verwaltung. Alle Anlege-/Bearbeiten-/Löschen-Formulare stecken im
+Tab „⚙️ Verwaltung“.
+
+Ein-Personen-Admin-Werkzeug (RLS-Umbau Chunk 4, 2026-10-01, siehe
+docs/rls-force-umbau-plan-21-08.md): läuft fest im RLS-Kontext des Nutzers aus
+DASHBOARD_USER_ID (config.py), ohne Nutzerauswahl, ohne Familien-Modus und
+ohne Nutzerverwaltung -- alle anderen Nutzer und jede nutzerübergreifende Sicht
+gehen ausschließlich über die authentifizierte Web-App (api.py, mit
+protokolliertem Admin-Cross-View). Fehlt DASHBOARD_USER_ID oder ist der Nutzer
+kein aktiver Admin mit Portfolio-OS-Zugang, startet das Dashboard nicht.
 
 Datenzugriff läuft ausschließlich über portfolio.py / tax_engine.py /
 rebalancing.py / llm_analyst.py / kontoauszug_analyzer.py – dashboard.py
@@ -20,9 +27,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
 
-from config import validate_config, BASE_URL
+from config import validate_config, BASE_URL, DASHBOARD_USER_ID
 from database import (
-    init_db, get_session, get_or_create_user, save_real_estate,
+    init_db, get_session, pin_user_context, save_real_estate,
     update_real_estate, delete_real_estate, save_buchungen,
     add_kategorisierungsregel, reset_onboarding,
     PosUser, PosPortfolio, PosAssetClass, PosTargetWeight,
@@ -314,6 +321,39 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ── FESTER NUTZERKONTEXT (RLS-Umbau Chunk 4) ──────────────────────
+# Bei JEDEM Script-Run zuerst, noch vor init_db()/update_prices(): den
+# Dashboard-Nutzer prüfen (fail closed) und den RLS-Kontext fest auf ihn
+# setzen (siehe database.pin_user_context() zur Begründung ohne Token-Reset).
+def _dashboard_nutzer(user_id):
+    """(nutzer_dict, None) bei gültigem Dashboard-Nutzer, sonst (None, Fehlertext).
+    pos_users liegt außerhalb von RLS -- die Prüfung braucht keinen Kontext."""
+    if user_id is None:
+        return None, ("DASHBOARD_USER_ID ist nicht gesetzt (oder keine Zahl). Das Dashboard läuft "
+                      "nur fest im Kontext eines Admin-Nutzers – bitte in der .env eintragen.")
+    try:
+        with get_session() as session:
+            u = session.get(PosUser, user_id)
+            if u is None:
+                return None, f"DASHBOARD_USER_ID={user_id}: Nutzer existiert nicht."
+            if u.rolle != "admin" or u.status != "active" or not u.portfolio_os_access:
+                return None, (f"DASHBOARD_USER_ID={user_id}: Nutzer ist kein aktiver Admin mit "
+                              f"Portfolio-OS-Zugang (rolle={u.rolle}, status={u.status}, "
+                              f"portfolio_os_access={u.portfolio_os_access}).")
+            return {"id": u.id, "name": u.name, "email": u.email, "rolle": u.rolle,
+                    "onboarding_completed": bool(u.onboarding_completed)}, None
+    except Exception as e:  # z.B. DB nicht erreichbar / Tabelle fehlt
+        return None, f"Dashboard-Nutzer konnte nicht geprüft werden: {e}"
+
+
+aktiver_user, _nutzer_fehler = _dashboard_nutzer(DASHBOARD_USER_ID)
+if aktiver_user is None:
+    st.error(_nutzer_fehler)
+    st.stop()
+pin_user_context(aktiver_user["id"])
+aktive_user_ids = [aktiver_user["id"]]
+
 init_db()
 
 # Preise einmal pro Browser-Session automatisch aktualisieren (nicht bei jedem
@@ -447,60 +487,15 @@ def _dialog_onboarding_neustart(user_id: int):
         st.rerun()
 
 
-# ─────────────────────────────────────────────
-# BOOTSTRAP: NUTZER / KONTEXT (ersetzt die frühere Sidebar)
-# ─────────────────────────────────────────────
-
-def _alle_nutzer():
-    with get_session() as session:
-        return [{"id": u.id, "name": u.name, "email": u.email, "rolle": u.rolle} for u in session.query(PosUser).all()]
-
-
-nutzer = _alle_nutzer()
-
 st.title("💼 Portfolio-OS")
 
-if not nutzer:
-    st.warning("Noch kein Nutzer angelegt.")
-    with st.form("neuer_erstnutzer"):
-        name = st.text_input("Name")
-        email = st.text_input("E-Mail (optional)")
-        if st.form_submit_button("Nutzer anlegen") and name:
-            with get_session() as session:
-                get_or_create_user(session, name, email, rolle="admin")
-            st.rerun()
+# Onboarding-Wizard für den Dashboard-Nutzer (Risikoprofil/Ziele/Assetklassen-
+# Präferenzen sind personenbezogen).
+if not aktiver_user["onboarding_completed"]:
+    show_onboarding(aktiver_user["id"])
     st.stop()
 
-nutzer_namen = [n["name"] for n in nutzer]
-
-kontext_col1, kontext_col2, kontext_col3 = st.columns([2, 2, 3])
-with kontext_col1:
-    familien_modus = st.toggle("👨‍👩‍👧 Familien-Portfolio (alle Nutzer)", value=False)
-with kontext_col2:
-    if not familien_modus:
-        gewaehlter_name = st.selectbox("Portfolio von", nutzer_namen, label_visibility="collapsed")
-    else:
-        st.caption("Alle Nutzer aktiv")
-
-if not familien_modus:
-    aktiver_user = next(n for n in nutzer if n["name"] == gewaehlter_name)
-    aktive_user_ids = [aktiver_user["id"]]
-else:
-    aktiver_user = None
-    aktive_user_ids = [n["id"] for n in nutzer]
-
-# Onboarding-Wizard: greift nur bei Einzelnutzer-Ansicht (nicht im Familien-Modus),
-# da Risikoprofil/Ziele/Assetklassen-Präferenzen personenbezogen sind.
-if aktiver_user is not None:
-    with get_session() as session:
-        user_obj = session.query(PosUser).filter_by(id=aktiver_user["id"]).first()
-        onboarding_noetig = not (user_obj and user_obj.onboarding_completed)
-    if onboarding_noetig:
-        show_onboarding(aktiver_user["id"])
-        st.stop()
-
-with kontext_col3:
-    st.caption(f"{'Familien-Portfolio' if familien_modus else aktiver_user['name']} · {BASE_URL}")
+st.caption(f"{aktiver_user['name']} · {BASE_URL}")
 
 warnungen = validate_config()
 if warnungen:
@@ -509,61 +504,21 @@ if warnungen:
             st.caption(w)
 
 
-def _kombinierte_summary(user_ids: list) -> dict:
-    """
-    Aggregiert get_total_wealth über mehrere Nutzer (für den Familien-Modus). Der
-    Trading-Bot-Depotwert ist ein einzelnes gemeinsames Konto (kein personen-
-    bezogenes Vermögen) und wird deshalb nicht pro Nutzer, sondern genau einmal
-    am Ende addiert – sonst würde er bei mehreren aktiven Nutzern vervielfacht.
-    """
-    gesamt = {
-        "gesamtvermoegen": 0.0, "unrealized_pnl": 0.0, "positions_count": 0,
-        "portfolios_count": 0, "asset_breakdown": {},
-        "immobilien_eigenkapital": 0.0, "immobilien_schaetzwert_summe": 0.0,
-        "immobilien_restschuld_summe": 0.0, "trading_bot_wert": 0.0,
-        "trading_bot_info": None,
-    }
-    for uid in user_ids:
-        s = portfolio_module.get_total_wealth(uid, include_trading_bot=False)
-        gesamt["gesamtvermoegen"] += s["gesamtvermoegen"]
-        gesamt["unrealized_pnl"] += s["unrealized_pnl"]
-        gesamt["positions_count"] += s["positions_count"]
-        gesamt["portfolios_count"] += s["portfolios_count"]
-        gesamt["immobilien_eigenkapital"] += s["immobilien_eigenkapital"]
-        gesamt["immobilien_schaetzwert_summe"] += s["immobilien_schaetzwert_summe"]
-        gesamt["immobilien_restschuld_summe"] += s["immobilien_restschuld_summe"]
-        for klass, wert in s["asset_breakdown"].items():
-            gesamt["asset_breakdown"][klass] = gesamt["asset_breakdown"].get(klass, 0.0) + wert
-
-    trading_bot_info = trading_bot_connector.get_bot_account_value_eur()
-    trading_bot_wert = trading_bot_info["total_eur"]
-    if trading_bot_wert:
-        gesamt["gesamtvermoegen"] += trading_bot_wert
-        gesamt["trading_bot_wert"] = trading_bot_wert
-        gesamt["trading_bot_info"] = trading_bot_info
-        # Bot-Positionen als Aktien/ETF einsortieren, freies Guthaben als
-        # "Liquidität (Bot)" – kein eigener "Trading Bot"-Slice mehr.
-        for klasse, wert in trading_bot_connector.bot_asset_breakdown_from_account(trading_bot_info).items():
-            gesamt["asset_breakdown"][klasse] = gesamt["asset_breakdown"].get(klasse, 0.0) + wert
-    return gesamt
-
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Übersicht", "📋 Positionen", "⚖️ Rebalancing", "🧾 Steuer",
-    "🏠 Immobilie", "💰 Haushaltsbuch", "👨‍👩‍👧‍👦 Familie", "🤖 KI-Analyse", "⚙️ Verwaltung",
+    "🏠 Immobilie", "💰 Haushaltsbuch", "🤖 KI-Analyse", "⚙️ Verwaltung",
 ])
 
 # ─────────────────────────────────────────────
 # TAB 1 – ÜBERSICHT
 # ─────────────────────────────────────────────
 with tab1:
-    if aktiver_user is not None:
-        _, col_reset = st.columns([5, 1])
-        with col_reset:
-            if st.button("🔄 Onboarding neu starten", key="onboarding_reset_btn"):
-                _dialog_onboarding_neustart(aktiver_user["id"])
+    _, col_reset = st.columns([5, 1])
+    with col_reset:
+        if st.button("🔄 Onboarding neu starten", key="onboarding_reset_btn"):
+            _dialog_onboarding_neustart(aktiver_user["id"])
 
-    summary = _kombinierte_summary(aktive_user_ids) if familien_modus else portfolio_module.get_total_wealth(aktive_user_ids[0])
+    summary = portfolio_module.get_total_wealth(aktiver_user["id"])
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -657,42 +612,41 @@ with tab1:
             st.info("Noch keine bewerteten Positionen (Kurse aktualisieren).")
 
     # ---- Meine Ziele (persönliche Ziele aus dem Onboarding) ---------------
-    if aktiver_user is not None:
-        st.subheader("Meine Ziele")
-        with get_session() as session:
-            user_row = session.get(PosUser, aktiver_user["id"])
-            sparrate = user_row.monatliche_sparrate or 0.0
-            meine_ziele = [
-                {"id": g.id, "name": g.name, "typ": g.typ, "zielbetrag": g.zielbetrag,
-                 "zeitraum_jahre": g.zeitraum_jahre, "erwartete_rendite": g.erwartete_rendite,
-                 "created_at": g.created_at}
-                for g in session.query(PosGoal).filter_by(user_id=aktiver_user["id"]).order_by(PosGoal.id).all()
-            ]
-        if meine_ziele:
-            aktueller_stand = summary["gesamtvermoegen"]
-            for z in meine_ziele:
-                icon = ZIEL_ICONS.get(z["typ"], "🎯")
-                jahre_seit_anlage = (date.today() - z["created_at"].date()).days / 365.25 if z["created_at"] else 0.0
-                restlaufzeit = max(0, round(z["zeitraum_jahre"] - jahre_seit_anlage))
-                fortschritt_pct = min(100.0, (aktueller_stand / z["zielbetrag"] * 100) if z["zielbetrag"] else 0.0)
+    st.subheader("Meine Ziele")
+    with get_session() as session:
+        user_row = session.get(PosUser, aktiver_user["id"])
+        sparrate = user_row.monatliche_sparrate or 0.0
+        meine_ziele = [
+            {"id": g.id, "name": g.name, "typ": g.typ, "zielbetrag": g.zielbetrag,
+             "zeitraum_jahre": g.zeitraum_jahre, "erwartete_rendite": g.erwartete_rendite,
+             "created_at": g.created_at}
+            for g in session.query(PosGoal).filter_by(user_id=aktiver_user["id"]).order_by(PosGoal.id).all()
+        ]
+    if meine_ziele:
+        aktueller_stand = summary["gesamtvermoegen"]
+        for z in meine_ziele:
+            icon = ZIEL_ICONS.get(z["typ"], "🎯")
+            jahre_seit_anlage = (date.today() - z["created_at"].date()).days / 365.25 if z["created_at"] else 0.0
+            restlaufzeit = max(0, round(z["zeitraum_jahre"] - jahre_seit_anlage))
+            fortschritt_pct = min(100.0, (aktueller_stand / z["zielbetrag"] * 100) if z["zielbetrag"] else 0.0)
 
-                with st.container(border=True):
-                    st.markdown(f"**{icon} {z['name']}**")
-                    st.progress(
-                        min(1.0, fortschritt_pct / 100),
-                        text=f"{fmt_zahl(fortschritt_pct, 0)}% ({fmt_eur(aktueller_stand, 0)} / {fmt_eur(z['zielbetrag'], 0)})"
-                    )
-                    endkapital_projiziert = projiziertes_kapital(
-                        sparrate, z["erwartete_rendite"] or 0.06, restlaufzeit, startkapital=aktueller_stand)
-                    cz1, cz2 = st.columns(2)
-                    if endkapital_projiziert >= z["zielbetrag"]:
-                        cz1.success("Auf Kurs ✅")
-                    else:
-                        cz1.warning("Sparrate erhöhen ⚠️")
-                    cz2.caption(f"Restlaufzeit: {restlaufzeit} Jahre")
-        else:
-            st.caption("Noch keine persönlichen Ziele hinterlegt (siehe Onboarding).")
-        st.divider()
+            with st.container(border=True):
+                st.markdown(f"**{icon} {z['name']}**")
+                st.progress(
+                    min(1.0, fortschritt_pct / 100),
+                    text=f"{fmt_zahl(fortschritt_pct, 0)}% ({fmt_eur(aktueller_stand, 0)} / {fmt_eur(z['zielbetrag'], 0)})"
+                )
+                endkapital_projiziert = projiziertes_kapital(
+                    sparrate, z["erwartete_rendite"] or 0.06, restlaufzeit, startkapital=aktueller_stand)
+                cz1, cz2 = st.columns(2)
+                if endkapital_projiziert >= z["zielbetrag"]:
+                    cz1.success("Auf Kurs ✅")
+                else:
+                    cz1.warning("Sparrate erhöhen ⚠️")
+                cz2.caption(f"Restlaufzeit: {restlaufzeit} Jahre")
+    else:
+        st.caption("Noch keine persönlichen Ziele hinterlegt (siehe Onboarding).")
+    st.divider()
 
     st.subheader("Zielfortschritt")
     with get_session() as session:
@@ -900,160 +854,154 @@ with tab2:
 # TAB 3 – REBALANCING
 # ─────────────────────────────────────────────
 with tab3:
-    if familien_modus:
-        st.info("Rebalancing wird je Nutzer einzeln berechnet – bitte oben einen Nutzer auswählen.")
+    uid = aktiver_user["id"]
+    st.subheader(f"Rebalancing-Analyse vom {date.today():%d.%m.%Y}")
+    st.caption(
+        "Mathematische Abweichung von deiner Zielgewichtung – reine Berechnung, "
+        "keine Anlageberatung und keine automatische Orderausführung."
+    )
+    deviations = rebalancing.calculate_deviations(uid)
+    if deviations:
+        st.markdown("**Aktuelle Allokation vs. Ziel:**")
+        for d in deviations:
+            badge = AMPEL_LABEL.get(d["status"], d["status"])
+            richtung = "Untergewichtet" if d["abweichung_pct"] < 0 else "Übergewichtet"
+            st.markdown(
+                f'<span class="badge badge-{d["status"]}">{badge}</span>&nbsp;&nbsp;'
+                f'**{d["asset_class"]}**: {d["ist_pct"]*100:.0f}% (Ziel: {d["ziel_pct"]*100:.0f}%) '
+                f'→ {richtung} um {abs(d["abweichung_pct"])*100:.0f}%',
+                unsafe_allow_html=True,
+            )
+
+        with get_session() as session:
+            sparrate = (session.get(PosUser, uid).monatliche_sparrate or 0.0)
+        if sparrate:
+            sparrate_verteilung = rebalancing.get_sparrate_empfehlung(uid, sparrate)
+            if sparrate_verteilung:
+                st.markdown(f"**Bei deiner monatlichen Sparrate von {fmt_eur(sparrate, 0)}:**")
+                if len(sparrate_verteilung) == 1:
+                    st.markdown(f"→ Gesamte Sparrate in {sparrate_verteilung[0]['asset_class']} lenken (statt aufteilen)")
+                else:
+                    for s in sparrate_verteilung:
+                        st.markdown(f"→ {fmt_eur(s['betrag'], 0)} in {s['asset_class']} lenken")
+
+        orders = rebalancing.get_full_rebalance_orders(uid)
+        if orders:
+            st.markdown("**Für vollständigen Ausgleich wären nötig:**")
+            for o in orders:
+                vz = "+" if o["betrag"] > 0 else ""
+                st.markdown(f"→ {o['asset_class']}: {vz}{fmt_eur(o['betrag'], 0)} ({o['richtung']})")
     else:
-        uid = aktiver_user["id"]
-        st.subheader(f"Rebalancing-Analyse vom {date.today():%d.%m.%Y}")
-        st.caption(
-            "Mathematische Abweichung von deiner Zielgewichtung – reine Berechnung, "
-            "keine Anlageberatung und keine automatische Orderausführung."
-        )
-        deviations = rebalancing.calculate_deviations(uid)
-        if deviations:
-            st.markdown("**Aktuelle Allokation vs. Ziel:**")
-            for d in deviations:
-                badge = AMPEL_LABEL.get(d["status"], d["status"])
-                richtung = "Untergewichtet" if d["abweichung_pct"] < 0 else "Übergewichtet"
-                st.markdown(
-                    f'<span class="badge badge-{d["status"]}">{badge}</span>&nbsp;&nbsp;'
-                    f'**{d["asset_class"]}**: {d["ist_pct"]*100:.0f}% (Ziel: {d["ziel_pct"]*100:.0f}%) '
-                    f'→ {richtung} um {abs(d["abweichung_pct"])*100:.0f}%',
-                    unsafe_allow_html=True,
-                )
+        st.info("Keine Ziel-Gewichtung hinterlegt (siehe Tab ⚙️ Verwaltung).")
 
-            with get_session() as session:
-                sparrate = (session.get(PosUser, uid).monatliche_sparrate or 0.0)
-            if sparrate:
-                sparrate_verteilung = rebalancing.get_sparrate_empfehlung(uid, sparrate)
-                if sparrate_verteilung:
-                    st.markdown(f"**Bei deiner monatlichen Sparrate von {fmt_eur(sparrate, 0)}:**")
-                    if len(sparrate_verteilung) == 1:
-                        st.markdown(f"→ Gesamte Sparrate in {sparrate_verteilung[0]['asset_class']} lenken (statt aufteilen)")
-                    else:
-                        for s in sparrate_verteilung:
-                            st.markdown(f"→ {fmt_eur(s['betrag'], 0)} in {s['asset_class']} lenken")
+    st.subheader("Offene Analysen")
+    offene = [p for p in rebalancing.get_rebalancing_history(uid) if p["status"] == "pending"]
+    if offene:
+        for p in offene:
+            with st.expander(f"Analyse #{p['id']} – {p['erstellt_am']:%d.%m.%Y}"):
+                st.write(p["begruendung"])
+                if p["ki_analyse"]:
+                    st.caption(f"KI-Einordnung: {p['ki_analyse']}")
+                col_ok, col_no = st.columns(2)
+                if col_ok.button(
+                    "Ich habe die Analyse verstanden und möchte die Orders bei meinem Broker selbst platzieren →",
+                    key=f"ok_{p['id']}",
+                ):
+                    rebalancing.confirm_proposal(p["id"], "confirmed")
+                    st.rerun()
+                if col_no.button("Zur Kenntnis genommen", key=f"no_{p['id']}"):
+                    rebalancing.confirm_proposal(p["id"], "rejected")
+                    st.rerun()
+    else:
+        st.caption("Keine offenen Analysen.")
 
-            orders = rebalancing.get_full_rebalance_orders(uid)
-            if orders:
-                st.markdown("**Für vollständigen Ausgleich wären nötig:**")
-                for o in orders:
-                    vz = "+" if o["betrag"] > 0 else ""
-                    st.markdown(f"→ {o['asset_class']}: {vz}{fmt_eur(o['betrag'], 0)} ({o['richtung']})")
-        else:
-            st.info("Keine Ziel-Gewichtung hinterlegt (siehe Tab ⚙️ Verwaltung).")
+    if st.button("🔎 Neue Analyse erstellen (Schwellwert-Check)"):
+        rebalancing.create_rebalancing_proposal(uid, "schwellwert")
+        st.rerun()
 
-        st.subheader("Offene Analysen")
-        offene = [p for p in rebalancing.get_rebalancing_history(uid) if p["status"] == "pending"]
-        if offene:
-            for p in offene:
-                with st.expander(f"Analyse #{p['id']} – {p['erstellt_am']:%d.%m.%Y}"):
-                    st.write(p["begruendung"])
-                    if p["ki_analyse"]:
-                        st.caption(f"KI-Einordnung: {p['ki_analyse']}")
-                    col_ok, col_no = st.columns(2)
-                    if col_ok.button(
-                        "Ich habe die Analyse verstanden und möchte die Orders bei meinem Broker selbst platzieren →",
-                        key=f"ok_{p['id']}",
-                    ):
-                        rebalancing.confirm_proposal(p["id"], "confirmed")
-                        st.rerun()
-                    if col_no.button("Zur Kenntnis genommen", key=f"no_{p['id']}"):
-                        rebalancing.confirm_proposal(p["id"], "rejected")
-                        st.rerun()
-        else:
-            st.caption("Keine offenen Analysen.")
-
-        if st.button("🔎 Neue Analyse erstellen (Schwellwert-Check)"):
-            rebalancing.create_rebalancing_proposal(uid, "schwellwert")
-            st.rerun()
-
-        st.subheader("Rebalancing-Historie")
-        historie = rebalancing.get_rebalancing_history(uid)
-        if historie:
-            df_hist = pd.DataFrame([{
-                "Datum": h["erstellt_am"], "Status": h["status"],
-                "Begründung": (h["begruendung"] or "")[:120],
-            } for h in historie])
-            st.dataframe(df_hist, width="stretch", hide_index=True)
+    st.subheader("Rebalancing-Historie")
+    historie = rebalancing.get_rebalancing_history(uid)
+    if historie:
+        df_hist = pd.DataFrame([{
+            "Datum": h["erstellt_am"], "Status": h["status"],
+            "Begründung": (h["begruendung"] or "")[:120],
+        } for h in historie])
+        st.dataframe(df_hist, width="stretch", hide_index=True)
 
 
 # ─────────────────────────────────────────────
 # TAB 4 – STEUER
 # ─────────────────────────────────────────────
 with tab4:
-    if familien_modus:
-        st.info("Steuerdaten werden je Nutzer einzeln berechnet – bitte oben einen Nutzer auswählen.")
+    uid = aktiver_user["id"]
+    rest = tax_engine.get_remaining_freistellung(uid)
+    with get_session() as session:
+        cfg = session.query(PosTaxConfig).filter_by(user_id=uid).first()
+        freibetrag = cfg.freistellungsauftrag if cfg else 0.0
+        genutzt = cfg.freistellungsgenutzt if cfg else 0.0
+
+    st.subheader("Freistellungsauftrag")
+    st.progress(min(1.0, genutzt / freibetrag) if freibetrag else 0.0,
+                text=f"{fmt_zahl(genutzt)} / {fmt_zahl(freibetrag)} € genutzt (Rest: {fmt_zahl(rest)} €)")
+
+    st.subheader(f"Realisierte Gewinne/Verluste {date.today().year} (YTD)")
+    uebersicht = tax_engine.generate_jahresuebersicht(uid, date.today().year)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Gewinne", fmt_eur(uebersicht['realisierte_gewinne']))
+    c2.metric("Verluste", fmt_eur(uebersicht['realisierte_verluste']))
+    c3.metric("Gezahlte Steuer", fmt_eur(uebersicht['steuer_gezahlt']))
+
+    st.subheader("Tax-Loss-Harvesting-Kandidaten")
+    kandidaten = tax_engine.find_tax_loss_harvesting(uid)
+    if kandidaten:
+        df_tlh = pd.DataFrame(kandidaten).drop(columns=["position_id"]).rename(columns={
+            "ticker": "Name der Position",
+            "quantity": "Anzahl",
+            "avg_buy_price": "Ø-Kaufpreis",
+            "current_price": "Aktueller Kurs",
+            "unrealisierter_verlust": "Unrealisierter Verlust",
+            "geschaetzte_steuerersparnis": "Geschätzte Steuerersparnis",
+        })
+        styled_tlh = df_tlh.style.format({
+            "Anzahl": _tabellen_safe(fmt_menge),
+            "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
+            "Aktueller Kurs": _tabellen_safe(fmt_eur),
+            "Unrealisierter Verlust": _tabellen_safe(fmt_eur),
+            "Geschätzte Steuerersparnis": _tabellen_safe(fmt_eur),
+        })
+        st.dataframe(styled_tlh, width="stretch", hide_index=True)
     else:
-        uid = aktiver_user["id"]
-        rest = tax_engine.get_remaining_freistellung(uid)
-        with get_session() as session:
-            cfg = session.query(PosTaxConfig).filter_by(user_id=uid).first()
-            freibetrag = cfg.freistellungsauftrag if cfg else 0.0
-            genutzt = cfg.freistellungsgenutzt if cfg else 0.0
+        st.caption("Keine Positionen im Minus.")
 
-        st.subheader("Freistellungsauftrag")
-        st.progress(min(1.0, genutzt / freibetrag) if freibetrag else 0.0,
-                    text=f"{fmt_zahl(genutzt)} / {fmt_zahl(freibetrag)} € genutzt (Rest: {fmt_zahl(rest)} €)")
-
-        st.subheader(f"Realisierte Gewinne/Verluste {date.today().year} (YTD)")
-        uebersicht = tax_engine.generate_jahresuebersicht(uid, date.today().year)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Gewinne", fmt_eur(uebersicht['realisierte_gewinne']))
-        c2.metric("Verluste", fmt_eur(uebersicht['realisierte_verluste']))
-        c3.metric("Gezahlte Steuer", fmt_eur(uebersicht['steuer_gezahlt']))
-
-        st.subheader("Tax-Loss-Harvesting-Kandidaten")
-        kandidaten = tax_engine.find_tax_loss_harvesting(uid)
-        if kandidaten:
-            df_tlh = pd.DataFrame(kandidaten).drop(columns=["position_id"]).rename(columns={
-                "ticker": "Name der Position",
-                "quantity": "Anzahl",
-                "avg_buy_price": "Ø-Kaufpreis",
-                "current_price": "Aktueller Kurs",
-                "unrealisierter_verlust": "Unrealisierter Verlust",
-                "geschaetzte_steuerersparnis": "Geschätzte Steuerersparnis",
-            })
-            styled_tlh = df_tlh.style.format({
-                "Anzahl": _tabellen_safe(fmt_menge),
-                "Ø-Kaufpreis": _tabellen_safe(fmt_eur),
-                "Aktueller Kurs": _tabellen_safe(fmt_eur),
-                "Unrealisierter Verlust": _tabellen_safe(fmt_eur),
-                "Geschätzte Steuerersparnis": _tabellen_safe(fmt_eur),
-            })
-            st.dataframe(styled_tlh, width="stretch", hide_index=True)
-        else:
-            st.caption("Keine Positionen im Minus.")
-
-        st.subheader("Jahresübersicht")
-        jahr_wahl = st.number_input("Jahr", min_value=2000, max_value=date.today().year, value=date.today().year)
-        if st.button("📄 Jahresübersicht als PDF vorbereiten"):
-            uebersicht_jahr = tax_engine.generate_jahresuebersicht(uid, int(jahr_wahl))
-            try:
-                from fpdf import FPDF
-                pdf = FPDF()
-                pdf.add_page()
-                pdf.set_font("Helvetica", "B", 16)
-                pdf.cell(0, 10, f"Jahresuebersicht {int(jahr_wahl)}", ln=True)
-                pdf.set_font("Helvetica", "", 11)
-                # "EUR" statt "€" hier bewusst beibehalten: FPDFs Kernschrift
-                # Helvetica unterstützt kein €-Glyph ohne Unicode-Font-Einbettung.
-                for label, wert in [
-                    ("Nutzer", aktiver_user["name"]),
-                    ("Realisierte Gewinne", f"{fmt_zahl(uebersicht_jahr['realisierte_gewinne'])} EUR"),
-                    ("Realisierte Verluste", f"{fmt_zahl(uebersicht_jahr['realisierte_verluste'])} EUR"),
-                    ("Netto-Ergebnis", f"{fmt_zahl(uebersicht_jahr['netto_ergebnis'])} EUR"),
-                    ("Gezahlte Steuer", f"{fmt_zahl(uebersicht_jahr['steuer_gezahlt'])} EUR"),
-                    ("Freistellungsauftrag", f"{fmt_zahl(uebersicht_jahr['freistellungsauftrag'])} EUR"),
-                    ("Freistellung genutzt (aktuell)", f"{fmt_zahl(uebersicht_jahr['freistellung_genutzt_aktuell'])} EUR"),
-                    ("Verlusttopf (aktuell)", f"{fmt_zahl(uebersicht_jahr['verlusttopf_aktuell'])} EUR"),
-                ]:
-                    pdf.cell(0, 8, f"{label}: {wert}", ln=True)
-                pdf_bytes = bytes(pdf.output())
-                st.download_button("⬇️ Download PDF", data=pdf_bytes,
-                                    file_name=f"jahresuebersicht_{int(jahr_wahl)}.pdf", mime="application/pdf")
-            except Exception as e:
-                st.error(f"PDF-Erstellung fehlgeschlagen: {e}")
+    st.subheader("Jahresübersicht")
+    jahr_wahl = st.number_input("Jahr", min_value=2000, max_value=date.today().year, value=date.today().year)
+    if st.button("📄 Jahresübersicht als PDF vorbereiten"):
+        uebersicht_jahr = tax_engine.generate_jahresuebersicht(uid, int(jahr_wahl))
+        try:
+            from fpdf import FPDF
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, f"Jahresuebersicht {int(jahr_wahl)}", ln=True)
+            pdf.set_font("Helvetica", "", 11)
+            # "EUR" statt "€" hier bewusst beibehalten: FPDFs Kernschrift
+            # Helvetica unterstützt kein €-Glyph ohne Unicode-Font-Einbettung.
+            for label, wert in [
+                ("Nutzer", aktiver_user["name"]),
+                ("Realisierte Gewinne", f"{fmt_zahl(uebersicht_jahr['realisierte_gewinne'])} EUR"),
+                ("Realisierte Verluste", f"{fmt_zahl(uebersicht_jahr['realisierte_verluste'])} EUR"),
+                ("Netto-Ergebnis", f"{fmt_zahl(uebersicht_jahr['netto_ergebnis'])} EUR"),
+                ("Gezahlte Steuer", f"{fmt_zahl(uebersicht_jahr['steuer_gezahlt'])} EUR"),
+                ("Freistellungsauftrag", f"{fmt_zahl(uebersicht_jahr['freistellungsauftrag'])} EUR"),
+                ("Freistellung genutzt (aktuell)", f"{fmt_zahl(uebersicht_jahr['freistellung_genutzt_aktuell'])} EUR"),
+                ("Verlusttopf (aktuell)", f"{fmt_zahl(uebersicht_jahr['verlusttopf_aktuell'])} EUR"),
+            ]:
+                pdf.cell(0, 8, f"{label}: {wert}", ln=True)
+            pdf_bytes = bytes(pdf.output())
+            st.download_button("⬇️ Download PDF", data=pdf_bytes,
+                                file_name=f"jahresuebersicht_{int(jahr_wahl)}.pdf", mime="application/pdf")
+        except Exception as e:
+            st.error(f"PDF-Erstellung fehlgeschlagen: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1237,10 +1185,7 @@ with tab5:
         } for i in immobilien]
 
     if not immobilien_data:
-        if familien_modus:
-            st.info("Keine Immobilie hinterlegt. Bitte oben einen Nutzer auswählen, um eine anzulegen.")
-        else:
-            st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen.")
+        st.info("Noch keine Immobilie hinterlegt – hier direkt anlegen.")
 
     if immobilien_data:
         for im in immobilien_data:
@@ -1490,285 +1435,231 @@ with tab5:
             st.divider()
 
     # ---- Neue / weitere Immobilie anlegen (Fix 2 & 4) ----------------------
-    if not familien_modus:
-        neu_offen_key = "im_neu_offen"
-        btn_label = "➕ Weitere Immobilie anlegen" if immobilien_data else "➕ Immobilie anlegen"
-        if st.button(btn_label, key="im_neu_toggle_btn"):
-            st.session_state[neu_offen_key] = not st.session_state.get(neu_offen_key, False)
-            st.rerun()
+    neu_offen_key = "im_neu_offen"
+    btn_label = "➕ Weitere Immobilie anlegen" if immobilien_data else "➕ Immobilie anlegen"
+    if st.button(btn_label, key="im_neu_toggle_btn"):
+        st.session_state[neu_offen_key] = not st.session_state.get(neu_offen_key, False)
+        st.rerun()
 
-        if st.session_state.get(neu_offen_key, False):
-            with st.expander("Neue Immobilie", expanded=True):
-                neu_basis = _immobilie_basis_felder("im_neu")
-                st.divider()
-                neu_erweitert = _immobilie_erweiterte_felder("im_neu", basis=neu_basis)
-                st.divider()
-                if st.button("Speichern", key="im_neu_speichern_btn"):
-                    if not neu_basis["adresse"]:
-                        st.error("Bitte eine Adresse angeben.")
-                    else:
-                        try:
-                            save_real_estate(
-                                user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
-                                **neu_basis, **neu_erweitert,
-                            )
-                            st.session_state[neu_offen_key] = False
-                            st.success("Immobilie gespeichert!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Fehler beim Speichern: {e}")
+    if st.session_state.get(neu_offen_key, False):
+        with st.expander("Neue Immobilie", expanded=True):
+            neu_basis = _immobilie_basis_felder("im_neu")
+            st.divider()
+            neu_erweitert = _immobilie_erweiterte_felder("im_neu", basis=neu_basis)
+            st.divider()
+            if st.button("Speichern", key="im_neu_speichern_btn"):
+                if not neu_basis["adresse"]:
+                    st.error("Bitte eine Adresse angeben.")
+                else:
+                    try:
+                        save_real_estate(
+                            user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
+                            **neu_basis, **neu_erweitert,
+                        )
+                        st.session_state[neu_offen_key] = False
+                        st.success("Immobilie gespeichert!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Fehler beim Speichern: {e}")
 
 
 # ─────────────────────────────────────────────
 # TAB 6 – HAUSHALTSBUCH
 # ─────────────────────────────────────────────
 with tab6:
-    if familien_modus:
-        st.info("Das Haushaltsbuch läuft je Nutzer – bitte oben einen Nutzer auswählen, um Kontoauszüge hochzuladen.")
-    else:
-        hb_uid = aktiver_user["id"]
+    hb_uid = aktiver_user["id"]
 
-        with st.expander("📤 Kontoauszüge hochladen", expanded=False):
-            st.caption("Daten werden nur lokal verarbeitet.")
-            ka_files = st.file_uploader(
-                "Kontoauszüge (PDF, mehrere möglich, bis 50 Dateien)",
-                type=["pdf"], accept_multiple_files=True, key="ka_upload",
-            )
-            if ka_files and len(ka_files) > 50:
-                st.error(f"Maximal 50 Dateien gleichzeitig ({len(ka_files)} ausgewählt).")
-            elif ka_files and st.button("KI-Analyse starten", key="ka_analyse_btn"):
-                fortschritt_bar = st.progress(0.0)
-                status_text = st.empty()
+    with st.expander("📤 Kontoauszüge hochladen", expanded=False):
+        st.caption("Daten werden nur lokal verarbeitet.")
+        ka_files = st.file_uploader(
+            "Kontoauszüge (PDF, mehrere möglich, bis 50 Dateien)",
+            type=["pdf"], accept_multiple_files=True, key="ka_upload",
+        )
+        if ka_files and len(ka_files) > 50:
+            st.error(f"Maximal 50 Dateien gleichzeitig ({len(ka_files)} ausgewählt).")
+        elif ka_files and st.button("KI-Analyse starten", key="ka_analyse_btn"):
+            fortschritt_bar = st.progress(0.0)
+            status_text = st.empty()
 
-                def _ka_fortschritt(batch_idx, batch_anzahl):
-                    status_text.text(f"Analysiere Batch {batch_idx} von {batch_anzahl}...")
-                    fortschritt_bar.progress(batch_idx / batch_anzahl)
+            def _ka_fortschritt(batch_idx, batch_anzahl):
+                status_text.text(f"Analysiere Batch {batch_idx} von {batch_anzahl}...")
+                fortschritt_bar.progress(batch_idx / batch_anzahl)
 
-                pdf_daten = [(f.name, f.getvalue()) for f in ka_files]
-                with st.spinner("Lese Kontoauszüge aus..."):
-                    ergebnis = kontoauszug_analyzer.analyze_kontoauszuege(pdf_daten, progress_callback=_ka_fortschritt)
-                fortschritt_bar.empty()
-                status_text.empty()
+            pdf_daten = [(f.name, f.getvalue()) for f in ka_files]
+            with st.spinner("Lese Kontoauszüge aus..."):
+                ergebnis = kontoauszug_analyzer.analyze_kontoauszuege(pdf_daten, progress_callback=_ka_fortschritt)
+            fortschritt_bar.empty()
+            status_text.empty()
 
-                if not ergebnis["verfuegbar"]:
-                    st.error("Kontoauszüge konnten nicht ausgelesen werden. Bitte später erneut versuchen.")
-                else:
-                    anzahl_neu = save_buchungen(hb_uid, ergebnis["buchungen"])
-                    anzahl_erkannt = len(ergebnis["buchungen"])
-                    zusatz = f", {anzahl_erkannt - anzahl_neu} bereits vorhanden" if anzahl_erkannt > anzahl_neu else ""
-                    st.success(f"{anzahl_neu} neue Buchung(en) gespeichert{zusatz}")
-
-                    # Erkannte Immobilienkaufpreiszahlungen (Darlehensauszahlungen an
-                    # Bauträger/Projektgesellschaften) hervorheben – siehe Tab 🏠 Immobilie.
-                    for imm in ergebnis.get("immobilienkaeufe", []):
-                        zeilen = [f"🏠 Möglicher Immobilienkauf erkannt: "
-                                  f"**{fmt_eur(imm.get('gesamtbetrag'))}** an "
-                                  f"{imm.get('empfaenger') or 'unbekannt'}"]
-                        if imm.get("objekt"):
-                            zeilen.append(f"Objekt: {imm['objekt']}")
-                        for ez in imm.get("einzelzahlungen") or []:
-                            zeilen.append(f"• {ez.get('datum')}: {fmt_eur(ez.get('betrag'))}")
-                        st.info("\n\n".join(zeilen))
-
-                    if not ergebnis.get("immobilienkaeufe"):
-                        st.rerun()
-
-        with get_session() as session:
-            buchungen_db = session.query(PosBuchung).filter_by(user_id=hb_uid).order_by(PosBuchung.datum.desc()).all()
-            buchungen_data = [{
-                "id": b.id, "datum": b.datum, "betrag": b.betrag, "empfaenger": b.empfaenger,
-                "verwendungszweck": b.verwendungszweck, "kategorie": b.kategorie, "typ": b.typ,
-            } for b in buchungen_db]
-
-        if not buchungen_data:
-            st.info("Noch keine Buchungen erfasst – oben Kontoauszüge hochladen.")
-        else:
-            df_buchungen = pd.DataFrame(buchungen_data)
-            df_buchungen["monat"] = df_buchungen["datum"].apply(lambda d: d.strftime("%Y-%m"))
-
-            # ---- 1. Monatsübersicht ------------------------------------
-            st.subheader("Monatsübersicht")
-            monate_verfuegbar = sorted(df_buchungen["monat"].unique(), reverse=True)
-            gewaehlter_monat = st.selectbox("Monat", monate_verfuegbar, key="ka_monat_auswahl")
-            df_monat = df_buchungen[df_buchungen["monat"] == gewaehlter_monat]
-            einnahmen = df_monat[df_monat["typ"] == "einnahme"]["betrag"].sum()
-            ausgaben = df_monat[df_monat["typ"] == "ausgabe"]["betrag"].sum()
-
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Einnahmen", fmt_eur(einnahmen, 0))
-            mc2.metric("Ausgaben", fmt_eur(ausgaben, 0))
-            mc3.metric("Überschuss", fmt_eur(einnahmen - ausgaben, 0))
-
-            # ---- 2. Ausgaben nach Kategorie -----------------------------
-            st.subheader("Ausgaben nach Kategorie")
-            df_ausgaben_monat = df_monat[df_monat["typ"] == "ausgabe"]
-            if not df_ausgaben_monat.empty:
-                kat_summe = df_ausgaben_monat.groupby("kategorie")["betrag"].sum().sort_values(ascending=True)
-                kat_labels = [f"{KATEGORIE_ICONS.get(k, '❓')} {k}" for k in kat_summe.index]
-                fig_kat = px.bar(
-                    x=kat_summe.values, y=kat_labels, orientation="h",
-                    labels={"x": "Ausgaben (€)", "y": ""},
-                    color_discrete_sequence=["#60a5fa"],
-                )
-                fig_kat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
-                st.plotly_chart(fig_kat, width="stretch")
+            if not ergebnis["verfuegbar"]:
+                st.error("Kontoauszüge konnten nicht ausgelesen werden. Bitte später erneut versuchen.")
             else:
-                st.caption("Keine Ausgaben in diesem Monat.")
+                anzahl_neu = save_buchungen(hb_uid, ergebnis["buchungen"])
+                anzahl_erkannt = len(ergebnis["buchungen"])
+                zusatz = f", {anzahl_erkannt - anzahl_neu} bereits vorhanden" if anzahl_erkannt > anzahl_neu else ""
+                st.success(f"{anzahl_neu} neue Buchung(en) gespeichert{zusatz}")
 
-            # ---- 3. Alle Buchungen (filterbar) --------------------------
-            st.subheader("Alle Buchungen")
-            fc1, fc2 = st.columns(2)
-            kat_filter = fc1.multiselect(
-                "Kategorie", sorted(df_buchungen["kategorie"].dropna().unique().tolist()), key="ka_kat_filter")
-            typ_filter = fc2.multiselect(
-                "Typ", sorted(df_buchungen["typ"].dropna().unique().tolist()), key="ka_typ_filter")
+                # Erkannte Immobilienkaufpreiszahlungen (Darlehensauszahlungen an
+                # Bauträger/Projektgesellschaften) hervorheben – siehe Tab 🏠 Immobilie.
+                for imm in ergebnis.get("immobilienkaeufe", []):
+                    zeilen = [f"🏠 Möglicher Immobilienkauf erkannt: "
+                              f"**{fmt_eur(imm.get('gesamtbetrag'))}** an "
+                              f"{imm.get('empfaenger') or 'unbekannt'}"]
+                    if imm.get("objekt"):
+                        zeilen.append(f"Objekt: {imm['objekt']}")
+                    for ez in imm.get("einzelzahlungen") or []:
+                        zeilen.append(f"• {ez.get('datum')}: {fmt_eur(ez.get('betrag'))}")
+                    st.info("\n\n".join(zeilen))
 
-            gefiltert = df_buchungen.copy()
-            if kat_filter:
-                gefiltert = gefiltert[gefiltert["kategorie"].isin(kat_filter)]
-            if typ_filter:
-                gefiltert = gefiltert[gefiltert["typ"].isin(typ_filter)]
-
-            st.caption(f"{len(gefiltert)} Buchung(en) – zeige max. 200")
-            kopf1, kopf2, kopf3, kopf4, kopf5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
-            kopf1.markdown("**Datum**")
-            kopf2.markdown("**Empfänger**")
-            kopf3.markdown("**Betrag**")
-            kopf4.markdown("**Kategorie**")
-            kopf5.markdown("**Immer so kategorisieren**")
-
-            for _, row in gefiltert.head(200).iterrows():
-                bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
-                bc1.write(row["datum"].strftime("%d.%m.%Y"))
-                bc2.write(row["empfaenger"] or "–")
-                vz_symbol = "🟢" if row["typ"] == "einnahme" else "🔴"
-                bc3.write(f"{vz_symbol} {fmt_eur(row['betrag'], 2)}")
-                aktuelle_kat = row["kategorie"] if row["kategorie"] in KATEGORIEN else "Sonstiges"
-                neue_kat = bc4.selectbox(
-                    "Kategorie", KATEGORIEN, index=KATEGORIEN.index(aktuelle_kat),
-                    key=f"ka_kat_{row['id']}", label_visibility="collapsed")
-                immer_so = bc5.checkbox("", key=f"ka_immer_{row['id']}", label_visibility="collapsed")
-
-                if neue_kat != row["kategorie"]:
-                    with get_session() as session:
-                        buchung = session.get(PosBuchung, int(row["id"]))
-                        if buchung:
-                            buchung.kategorie = neue_kat
-                    if immer_so and row["empfaenger"]:
-                        add_kategorisierungsregel(hb_uid, row["empfaenger"], neue_kat)
+                if not ergebnis.get("immobilienkaeufe"):
                     st.rerun()
 
-            # ---- 4. Jahresübersicht --------------------------------------
-            st.subheader("Jahresübersicht")
-            jahres_gruppe = df_buchungen.groupby(["monat", "typ"])["betrag"].sum().reset_index()
-            if not jahres_gruppe.empty:
-                fig_jahr = px.bar(
-                    jahres_gruppe, x="monat", y="betrag", color="typ", barmode="group",
-                    labels={"monat": "Monat", "betrag": "Betrag (€)", "typ": "Typ"},
-                    color_discrete_map={"einnahme": "#34d399", "ausgabe": "#f87171"},
-                )
-                fig_jahr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
-                st.plotly_chart(fig_jahr, width="stretch")
+    with get_session() as session:
+        buchungen_db = session.query(PosBuchung).filter_by(user_id=hb_uid).order_by(PosBuchung.datum.desc()).all()
+        buchungen_data = [{
+            "id": b.id, "datum": b.datum, "betrag": b.betrag, "empfaenger": b.empfaenger,
+            "verwendungszweck": b.verwendungszweck, "kategorie": b.kategorie, "typ": b.typ,
+        } for b in buchungen_db]
+
+    if not buchungen_data:
+        st.info("Noch keine Buchungen erfasst – oben Kontoauszüge hochladen.")
+    else:
+        df_buchungen = pd.DataFrame(buchungen_data)
+        df_buchungen["monat"] = df_buchungen["datum"].apply(lambda d: d.strftime("%Y-%m"))
+
+        # ---- 1. Monatsübersicht ------------------------------------
+        st.subheader("Monatsübersicht")
+        monate_verfuegbar = sorted(df_buchungen["monat"].unique(), reverse=True)
+        gewaehlter_monat = st.selectbox("Monat", monate_verfuegbar, key="ka_monat_auswahl")
+        df_monat = df_buchungen[df_buchungen["monat"] == gewaehlter_monat]
+        einnahmen = df_monat[df_monat["typ"] == "einnahme"]["betrag"].sum()
+        ausgaben = df_monat[df_monat["typ"] == "ausgabe"]["betrag"].sum()
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Einnahmen", fmt_eur(einnahmen, 0))
+        mc2.metric("Ausgaben", fmt_eur(ausgaben, 0))
+        mc3.metric("Überschuss", fmt_eur(einnahmen - ausgaben, 0))
+
+        # ---- 2. Ausgaben nach Kategorie -----------------------------
+        st.subheader("Ausgaben nach Kategorie")
+        df_ausgaben_monat = df_monat[df_monat["typ"] == "ausgabe"]
+        if not df_ausgaben_monat.empty:
+            kat_summe = df_ausgaben_monat.groupby("kategorie")["betrag"].sum().sort_values(ascending=True)
+            kat_labels = [f"{KATEGORIE_ICONS.get(k, '❓')} {k}" for k in kat_summe.index]
+            # BEKANNTER BUG (gefunden 2026-10-01, nicht behoben): haben ALLE Ausgaben
+            # des Monats kategorie=None, ist kat_summe nach dem groupby leer und
+            # px.bar wirft "Cannot accept list of column references ... for both x
+            # and y" -- der Script-Run bricht ab, alle Tabs danach rendern nicht.
+            fig_kat = px.bar(
+                x=kat_summe.values, y=kat_labels, orientation="h",
+                labels={"x": "Ausgaben (€)", "y": ""},
+                color_discrete_sequence=["#60a5fa"],
+            )
+            fig_kat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
+            st.plotly_chart(fig_kat, width="stretch")
+        else:
+            st.caption("Keine Ausgaben in diesem Monat.")
+
+        # ---- 3. Alle Buchungen (filterbar) --------------------------
+        st.subheader("Alle Buchungen")
+        fc1, fc2 = st.columns(2)
+        kat_filter = fc1.multiselect(
+            "Kategorie", sorted(df_buchungen["kategorie"].dropna().unique().tolist()), key="ka_kat_filter")
+        typ_filter = fc2.multiselect(
+            "Typ", sorted(df_buchungen["typ"].dropna().unique().tolist()), key="ka_typ_filter")
+
+        gefiltert = df_buchungen.copy()
+        if kat_filter:
+            gefiltert = gefiltert[gefiltert["kategorie"].isin(kat_filter)]
+        if typ_filter:
+            gefiltert = gefiltert[gefiltert["typ"].isin(typ_filter)]
+
+        st.caption(f"{len(gefiltert)} Buchung(en) – zeige max. 200")
+        kopf1, kopf2, kopf3, kopf4, kopf5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
+        kopf1.markdown("**Datum**")
+        kopf2.markdown("**Empfänger**")
+        kopf3.markdown("**Betrag**")
+        kopf4.markdown("**Kategorie**")
+        kopf5.markdown("**Immer so kategorisieren**")
+
+        for _, row in gefiltert.head(200).iterrows():
+            bc1, bc2, bc3, bc4, bc5 = st.columns([1.2, 2, 1.2, 1.8, 1.8])
+            bc1.write(row["datum"].strftime("%d.%m.%Y"))
+            bc2.write(row["empfaenger"] or "–")
+            vz_symbol = "🟢" if row["typ"] == "einnahme" else "🔴"
+            bc3.write(f"{vz_symbol} {fmt_eur(row['betrag'], 2)}")
+            aktuelle_kat = row["kategorie"] if row["kategorie"] in KATEGORIEN else "Sonstiges"
+            neue_kat = bc4.selectbox(
+                "Kategorie", KATEGORIEN, index=KATEGORIEN.index(aktuelle_kat),
+                key=f"ka_kat_{row['id']}", label_visibility="collapsed")
+            immer_so = bc5.checkbox("", key=f"ka_immer_{row['id']}", label_visibility="collapsed")
+
+            if neue_kat != row["kategorie"]:
+                with get_session() as session:
+                    buchung = session.get(PosBuchung, int(row["id"]))
+                    if buchung:
+                        buchung.kategorie = neue_kat
+                if immer_so and row["empfaenger"]:
+                    add_kategorisierungsregel(hb_uid, row["empfaenger"], neue_kat)
+                st.rerun()
+
+        # ---- 4. Jahresübersicht --------------------------------------
+        st.subheader("Jahresübersicht")
+        jahres_gruppe = df_buchungen.groupby(["monat", "typ"])["betrag"].sum().reset_index()
+        if not jahres_gruppe.empty:
+            fig_jahr = px.bar(
+                jahres_gruppe, x="monat", y="betrag", color="typ", barmode="group",
+                labels={"monat": "Monat", "betrag": "Betrag (€)", "typ": "Typ"},
+                color_discrete_map={"einnahme": "#34d399", "ausgabe": "#f87171"},
+            )
+            fig_jahr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f9fafb")
+            st.plotly_chart(fig_jahr, width="stretch")
 
 
 # ─────────────────────────────────────────────
-# TAB 7 – FAMILIE
+# TAB 7 – KI-ANALYSE
 # ─────────────────────────────────────────────
 with tab7:
-    st.subheader("Alle Depots aggregiert")
-    zeilen = []
-    kinder_zeilen = []
-    for n in nutzer:
-        with get_session() as session:
-            portfolios_n = [
-                {"name": p.name, "typ": p.typ, "broker": p.broker, "is_kinderdepot": p.is_kinderdepot}
-                for p in session.query(PosPortfolio).filter_by(user_id=n["id"]).all()
-            ]
-        for p in portfolios_n:
-            eintrag = {"Nutzer": n["name"], "Depot": p["name"], "Typ": p["typ"], "Broker": p["broker"]}
-            if p["is_kinderdepot"]:
-                kinder_zeilen.append(eintrag)
-            else:
-                zeilen.append(eintrag)
+    uid = aktiver_user["id"]
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Depots (Erwachsene)**")
-        st.dataframe(pd.DataFrame(zeilen) if zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
-                     width="stretch", hide_index=True)
-    with c2:
-        st.markdown("**Kinderdepots**")
-        st.dataframe(pd.DataFrame(kinder_zeilen) if kinder_zeilen else pd.DataFrame(columns=["Nutzer", "Depot", "Typ", "Broker"]),
-                     width="stretch", hide_index=True)
+    st.subheader("Klumpenrisiko-Analyse")
+    if st.button("Analyse anfordern"):
+        with st.spinner("Claude analysiert das Portfolio..."):
+            ergebnis = llm_analyst.analyze_portfolio(uid)
+        st.write(ergebnis["text"])
+        if not ergebnis["verfuegbar"]:
+            st.caption("(degraded mode – KI nicht erreichbar)")
 
-    st.subheader("Vermögen je Nutzer")
-    uebersicht_nutzer = []
-    for n in nutzer:
-        s = portfolio_module.get_portfolio_summary(n["id"])
-        uebersicht_nutzer.append({"Nutzer": n["name"], "Vermögen": s["gesamtvermoegen"]})
-    df_verm = pd.DataFrame(uebersicht_nutzer)
-    st.dataframe(df_verm.style.format({"Vermögen": _tabellen_safe(fmt_eur)}), width="stretch", hide_index=True)
+    st.subheader("Quartalsbericht")
+    if st.button("Quartalsbericht anfordern"):
+        with st.spinner("Erstelle Quartalsbericht..."):
+            report = llm_analyst.generate_quarterly_report(uid)
+        st.write(report["text"])
 
-    st.subheader("Gemeinsame Ziele")
-    with get_session() as session:
-        ziele = [
-            {"name": z.name, "fortschritt_pct": z.fortschritt_pct}
-            for z in session.query(PosFamilyGoal).all()
-        ]
-    if ziele:
-        for z in ziele:
-            st.progress(min(1.0, z["fortschritt_pct"] / 100), text=f"{z['name']}: {fmt_zahl(z['fortschritt_pct'], 0)}%")
-    else:
-        st.caption("Keine gemeinsamen Ziele hinterlegt.")
+    st.subheader("Frage an die Portfolio-KI")
+    if "chat_verlauf" not in st.session_state:
+        st.session_state.chat_verlauf = []
+
+    frage = st.text_input("Deine Frage")
+    if st.button("Fragen") and frage:
+        with st.spinner("Claude denkt nach..."):
+            antwort = llm_analyst.answer_portfolio_question(uid, frage)
+        st.session_state.chat_verlauf.append((frage, antwort))
+
+    for f, a in reversed(st.session_state.chat_verlauf):
+        st.markdown(f"**Du:** {f}")
+        st.markdown(f"**KI:** {a}")
+        st.divider()
+
+    st.caption(
+        "Hinweis: Die KI empfiehlt, keine Anlageberatung. Alle Entscheidungen trifft der Nutzer selbst."
+    )
 
 
 # ─────────────────────────────────────────────
-# TAB 8 – KI-ANALYSE
+# TAB 8 – VERWALTUNG
 # ─────────────────────────────────────────────
 with tab8:
-    if familien_modus:
-        st.info("KI-Analyse läuft je Nutzer – bitte oben einen Nutzer auswählen.")
-    else:
-        uid = aktiver_user["id"]
-
-        st.subheader("Klumpenrisiko-Analyse")
-        if st.button("Analyse anfordern"):
-            with st.spinner("Claude analysiert das Portfolio..."):
-                ergebnis = llm_analyst.analyze_portfolio(uid)
-            st.write(ergebnis["text"])
-            if not ergebnis["verfuegbar"]:
-                st.caption("(degraded mode – KI nicht erreichbar)")
-
-        st.subheader("Quartalsbericht")
-        if st.button("Quartalsbericht anfordern"):
-            with st.spinner("Erstelle Quartalsbericht..."):
-                report = llm_analyst.generate_quarterly_report(uid)
-            st.write(report["text"])
-
-        st.subheader("Frage an die Portfolio-KI")
-        if "chat_verlauf" not in st.session_state:
-            st.session_state.chat_verlauf = []
-
-        frage = st.text_input("Deine Frage")
-        if st.button("Fragen") and frage:
-            with st.spinner("Claude denkt nach..."):
-                antwort = llm_analyst.answer_portfolio_question(uid, frage)
-            st.session_state.chat_verlauf.append((frage, antwort))
-
-        for f, a in reversed(st.session_state.chat_verlauf):
-            st.markdown(f"**Du:** {f}")
-            st.markdown(f"**KI:** {a}")
-            st.divider()
-
-        st.caption(
-            "Hinweis: Die KI empfiehlt, keine Anlageberatung. Alle Entscheidungen trifft der Nutzer selbst."
-        )
-
-
-# ─────────────────────────────────────────────
-# TAB 9 – VERWALTUNG
-# ─────────────────────────────────────────────
-with tab9:
     with get_session() as session:
         asset_classes = session.query(PosAssetClass).all()
         ac_options = {ac.name: ac.id for ac in asset_classes}
@@ -1777,56 +1668,6 @@ with tab9:
             for p in session.query(PosPortfolio).filter(PosPortfolio.user_id.in_(aktive_user_ids)).all()
         ]
     pf_options = {f"{p['name']} ({p['typ']})": p for p in portfolios_all}
-
-    # ---- Nutzer verwalten (Fix 5: Name + E-Mail bearbeitbar) -----------
-    st.subheader("Nutzer verwalten")
-    st.dataframe(pd.DataFrame(nutzer)[["name", "email", "rolle"]], width="stretch", hide_index=True)
-
-    col_nutzer_neu, col_nutzer_edit = st.columns(2)
-    with col_nutzer_neu:
-        st.markdown("**Neuer Nutzer**")
-        with st.form("verwaltung_neuer_nutzer"):
-            n_name = st.text_input("Name", key="verw_nutzer_name")
-            n_email = st.text_input("E-Mail (optional)", key="verw_nutzer_email")
-            n_rolle = st.selectbox("Rolle", ["member", "admin"], key="verw_nutzer_rolle")
-            if st.form_submit_button("Nutzer anlegen") and n_name:
-                with get_session() as session:
-                    get_or_create_user(session, n_name, n_email, rolle=n_rolle)
-                st.rerun()
-
-    with col_nutzer_edit:
-        st.markdown("**Nutzer bearbeiten**")
-        nutzer_options = {n["name"]: n for n in nutzer}
-        if nutzer_options:
-            nutzer_wahl = st.selectbox("Nutzer", list(nutzer_options.keys()), key="nutzer_bearbeiten_wahl")
-            gewaehlter_nutzer = nutzer_options[nutzer_wahl]
-
-            # Bei Wechsel des ausgewählten Nutzers alte Widget-States verwerfen
-            # (gleiches Muster wie beim Positionswechsel im Positionen-Tab).
-            if st.session_state.get("nutzer_last_edit_id") != gewaehlter_nutzer["id"]:
-                st.session_state["nutzer_last_edit_id"] = gewaehlter_nutzer["id"]
-                for key in list(st.session_state.keys()):
-                    if key.startswith("nutzer_edit_"):
-                        del st.session_state[key]
-
-            with st.form("nutzer_bearbeiten"):
-                neuer_nutzer_name = st.text_input("Name", value=gewaehlter_nutzer["name"], key="nutzer_edit_name")
-                neuer_nutzer_email = st.text_input(
-                    "E-Mail", value=gewaehlter_nutzer["email"] or "", key="nutzer_edit_email")
-                if st.form_submit_button("Speichern"):
-                    if not neuer_nutzer_name:
-                        st.error("Bitte einen Namen angeben.")
-                    else:
-                        with get_session() as session:
-                            u = session.get(PosUser, gewaehlter_nutzer["id"])
-                            u.name = neuer_nutzer_name
-                            u.email = neuer_nutzer_email or None
-                        st.success("Nutzer aktualisiert")
-                        st.rerun()
-        else:
-            st.caption("Noch kein Nutzer angelegt.")
-
-    st.divider()
 
     # ---- Portfolios: anlegen / bearbeiten / löschen ----------------
     st.subheader("Portfolios verwalten")
@@ -1839,7 +1680,7 @@ with tab9:
             pf_typ = st.selectbox("Typ", PORTFOLIO_TYPEN, key="pf_typ")
             pf_broker = st.text_input("Broker (optional)", key="pf_broker")
             pf_kinderdepot = st.checkbox("Kinderdepot", key="pf_kinderdepot")
-            if st.form_submit_button("Anlegen") and pf_name and not familien_modus:
+            if st.form_submit_button("Anlegen") and pf_name:
                 with get_session() as session:
                     session.add(PosPortfolio(user_id=aktiver_user["id"], name=pf_name, broker=pf_broker,
                                               typ=pf_typ, is_kinderdepot=pf_kinderdepot))
@@ -2067,109 +1908,108 @@ with tab9:
     st.divider()
 
     # ---- Zielgewichtungen ---------------------------------------------
-    if not familien_modus:
-        st.subheader("Ziel-Gewichtung")
-        with st.form("ziel_gewichtung"):
-            tw_class = st.selectbox("Assetklasse", list(ac_options.keys()))
-            tw_target = st.slider("Ziel-%", 0, 100, 20)
-            tw_min = st.slider("Min-%", 0, 100, max(0, tw_target - 5))
-            tw_max = st.slider("Max-%", 0, 100, min(100, tw_target + 5))
-            if st.form_submit_button("Speichern"):
-                with get_session() as session:
-                    existing = session.query(PosTargetWeight).filter_by(
-                        user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class]
-                    ).first()
-                    if existing:
-                        existing.target_pct, existing.min_pct, existing.max_pct = tw_target / 100, tw_min / 100, tw_max / 100
-                    else:
-                        session.add(PosTargetWeight(
-                            user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class],
-                            target_pct=tw_target / 100, min_pct=tw_min / 100, max_pct=tw_max / 100,
-                        ))
-                st.success("Ziel-Gewichtung gespeichert")
+    st.subheader("Ziel-Gewichtung")
+    with st.form("ziel_gewichtung"):
+        tw_class = st.selectbox("Assetklasse", list(ac_options.keys()))
+        tw_target = st.slider("Ziel-%", 0, 100, 20)
+        tw_min = st.slider("Min-%", 0, 100, max(0, tw_target - 5))
+        tw_max = st.slider("Max-%", 0, 100, min(100, tw_target + 5))
+        if st.form_submit_button("Speichern"):
+            with get_session() as session:
+                existing = session.query(PosTargetWeight).filter_by(
+                    user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class]
+                ).first()
+                if existing:
+                    existing.target_pct, existing.min_pct, existing.max_pct = tw_target / 100, tw_min / 100, tw_max / 100
+                else:
+                    session.add(PosTargetWeight(
+                        user_id=aktiver_user["id"], asset_class_id=ac_options[tw_class],
+                        target_pct=tw_target / 100, min_pct=tw_min / 100, max_pct=tw_max / 100,
+                    ))
+            st.success("Ziel-Gewichtung gespeichert")
 
+    st.divider()
+
+    # ---- Immobilien (Fix 3) ------------------------------------------
+    st.subheader("Immobilien")
+    with get_session() as session:
+        verw_immobilien = session.query(PosRealEstate).filter_by(user_id=aktiver_user["id"]).all()
+        verw_immobilien_options = {
+            f"{i.adresse}": {
+                "id": i.id, "adresse": i.adresse, "kaufpreis": i.kaufpreis, "kaufjahr": i.kaufjahr,
+                "wohnflaeche_qm": i.wohnflaeche_qm, "eigenkapital": i.eigenkapital, "restschuld": i.restschuld,
+                "monatliche_rate": i.monatliche_rate, "mieteinnahmen": i.mieteinnahmen,
+                "letzter_schaetzwert": i.letzter_schaetzwert,
+                "vermietung_start": i.vermietung_start, "kredit_gesamtbetrag": i.kredit_gesamtbetrag,
+                "kredit_abgerufen": i.kredit_abgerufen, "kredit_zinssatz": i.kredit_zinssatz,
+                "kredit_laufzeit_jahre": i.kredit_laufzeit_jahre,
+                "vorfaelligkeitsgebuehr_pct": i.vorfaelligkeitsgebuehr_pct,
+                "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
+                "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
+                "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
+                "grundstuecksanteil": i.grundstuecksanteil, "gebaeudewert": i.gebaeudewert,
+                "kaufpreis_gesamt": i.kaufpreis_gesamt, "sanierungskosten": i.sanierungskosten,
+            } for i in verw_immobilien
+        }
+
+    col_im_neu, col_im_edit = st.columns(2)
+
+    with col_im_neu:
+        st.markdown("**Neue Immobilie anlegen**")
+        verw_neu_basis = _immobilie_basis_felder("verw_im_neu")
         st.divider()
+        verw_neu_erweitert = _immobilie_erweiterte_felder("verw_im_neu", basis=verw_neu_basis)
+        if st.button("Anlegen", key="verw_im_neu_anlegen_btn"):
+            if not verw_neu_basis["adresse"]:
+                st.error("Bitte eine Adresse angeben.")
+            else:
+                try:
+                    save_real_estate(
+                        user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
+                        **verw_neu_basis, **verw_neu_erweitert,
+                    )
+                    st.success("Immobilie gespeichert!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Fehler beim Speichern: {e}")
 
-        # ---- Immobilien (Fix 3) ------------------------------------------
-        st.subheader("Immobilien")
-        with get_session() as session:
-            verw_immobilien = session.query(PosRealEstate).filter_by(user_id=aktiver_user["id"]).all()
-            verw_immobilien_options = {
-                f"{i.adresse}": {
-                    "id": i.id, "adresse": i.adresse, "kaufpreis": i.kaufpreis, "kaufjahr": i.kaufjahr,
-                    "wohnflaeche_qm": i.wohnflaeche_qm, "eigenkapital": i.eigenkapital, "restschuld": i.restschuld,
-                    "monatliche_rate": i.monatliche_rate, "mieteinnahmen": i.mieteinnahmen,
-                    "letzter_schaetzwert": i.letzter_schaetzwert,
-                    "vermietung_start": i.vermietung_start, "kredit_gesamtbetrag": i.kredit_gesamtbetrag,
-                    "kredit_abgerufen": i.kredit_abgerufen, "kredit_zinssatz": i.kredit_zinssatz,
-                    "kredit_laufzeit_jahre": i.kredit_laufzeit_jahre,
-                    "vorfaelligkeitsgebuehr_pct": i.vorfaelligkeitsgebuehr_pct,
-                    "zinsbindung_bis": i.zinsbindung_bis, "abschreibungsart": i.abschreibungsart,
-                    "abschreibungsbasis": i.abschreibungsbasis, "abschreibungssatz": i.abschreibungssatz,
-                    "kaufdatum": i.kaufdatum, "finanzierungskosten": i.finanzierungskosten,
-                    "grundstuecksanteil": i.grundstuecksanteil, "gebaeudewert": i.gebaeudewert,
-                    "kaufpreis_gesamt": i.kaufpreis_gesamt, "sanierungskosten": i.sanierungskosten,
-                } for i in verw_immobilien
-            }
+    with col_im_edit:
+        st.markdown("**Immobilie bearbeiten / löschen**")
+        if verw_immobilien_options:
+            verw_im_wahl = st.selectbox("Immobilie", list(verw_immobilien_options.keys()), key="verw_im_wahl")
+            verw_gewaehlte_im = verw_immobilien_options[verw_im_wahl]
 
-        col_im_neu, col_im_edit = st.columns(2)
+            # Bei Wechsel der ausgewählten Immobilie alte Widget-States verwerfen –
+            # sonst zeigt das Formular nach dem Wechsel weiter die vorherigen Werte
+            # (gleicher Bug/Fix wie beim Positionswechsel im Positionen-Tab).
+            if st.session_state.get("verw_im_last_edit_id") != verw_gewaehlte_im["id"]:
+                st.session_state["verw_im_last_edit_id"] = verw_gewaehlte_im["id"]
+                for key in list(st.session_state.keys()):
+                    if key.startswith("verw_im_edit_"):
+                        del st.session_state[key]
 
-        with col_im_neu:
-            st.markdown("**Neue Immobilie anlegen**")
-            verw_neu_basis = _immobilie_basis_felder("verw_im_neu")
+            verw_edit_basis = _immobilie_basis_felder("verw_im_edit", defaults=verw_gewaehlte_im)
             st.divider()
-            verw_neu_erweitert = _immobilie_erweiterte_felder("verw_im_neu", basis=verw_neu_basis)
-            if st.button("Anlegen", key="verw_im_neu_anlegen_btn"):
-                if not verw_neu_basis["adresse"]:
+            verw_edit_erweitert = _immobilie_erweiterte_felder("verw_im_edit", defaults=verw_gewaehlte_im, basis=verw_edit_basis)
+            if st.button("💾 Speichern", key="verw_im_edit_speichern_btn"):
+                if not verw_edit_basis["adresse"]:
                     st.error("Bitte eine Adresse angeben.")
                 else:
                     try:
-                        save_real_estate(
-                            user_id=aktiver_user["id"], letztes_update=datetime.utcnow(),
-                            **verw_neu_basis, **verw_neu_erweitert,
+                        update_real_estate(
+                            verw_gewaehlte_im["id"], letztes_update=datetime.utcnow(),
+                            **verw_edit_basis, **verw_edit_erweitert,
                         )
-                        st.success("Immobilie gespeichert!")
+                        st.success("Immobilie aktualisiert!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Fehler beim Speichern: {e}")
+            if st.button("🗑️ Immobilie löschen", key="verw_im_loeschen_btn"):
+                _dialog_immobilie_loeschen(verw_gewaehlte_im["id"], verw_gewaehlte_im["adresse"])
+        else:
+            st.caption("Noch keine Immobilie angelegt.")
 
-        with col_im_edit:
-            st.markdown("**Immobilie bearbeiten / löschen**")
-            if verw_immobilien_options:
-                verw_im_wahl = st.selectbox("Immobilie", list(verw_immobilien_options.keys()), key="verw_im_wahl")
-                verw_gewaehlte_im = verw_immobilien_options[verw_im_wahl]
-
-                # Bei Wechsel der ausgewählten Immobilie alte Widget-States verwerfen –
-                # sonst zeigt das Formular nach dem Wechsel weiter die vorherigen Werte
-                # (gleicher Bug/Fix wie beim Positionswechsel im Positionen-Tab).
-                if st.session_state.get("verw_im_last_edit_id") != verw_gewaehlte_im["id"]:
-                    st.session_state["verw_im_last_edit_id"] = verw_gewaehlte_im["id"]
-                    for key in list(st.session_state.keys()):
-                        if key.startswith("verw_im_edit_"):
-                            del st.session_state[key]
-
-                verw_edit_basis = _immobilie_basis_felder("verw_im_edit", defaults=verw_gewaehlte_im)
-                st.divider()
-                verw_edit_erweitert = _immobilie_erweiterte_felder("verw_im_edit", defaults=verw_gewaehlte_im, basis=verw_edit_basis)
-                if st.button("💾 Speichern", key="verw_im_edit_speichern_btn"):
-                    if not verw_edit_basis["adresse"]:
-                        st.error("Bitte eine Adresse angeben.")
-                    else:
-                        try:
-                            update_real_estate(
-                                verw_gewaehlte_im["id"], letztes_update=datetime.utcnow(),
-                                **verw_edit_basis, **verw_edit_erweitert,
-                            )
-                            st.success("Immobilie aktualisiert!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Fehler beim Speichern: {e}")
-                if st.button("🗑️ Immobilie löschen", key="verw_im_loeschen_btn"):
-                    _dialog_immobilie_loeschen(verw_gewaehlte_im["id"], verw_gewaehlte_im["adresse"])
-            else:
-                st.caption("Noch keine Immobilie angelegt.")
-
-        st.divider()
+    st.divider()
 
     # ---- Familienziele (Fix 5) ------------------------------------------
     st.subheader("Familienziele")

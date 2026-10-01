@@ -63,9 +63,11 @@ gewesen) ist geschlossen:
   (ContextVar pro Request) -- relevant für die geplante Policy auf
   `pos_kategorisierungsregeln` (Abschnitt 6). Unverändert ggü. vorher:
   Buchungs-Update und Regel-Anlage laufen in zwei getrennten Sessions/
-  Transaktionen. **Offen auf Produktion:** Deploy (legt die Funktion per
-  `init_db()` an) und danach erneut `docs/rls-owner-lookup-bypass-role-setup.sql`
-  als Superuser (Ownership + `GRANT SELECT ON pos_buchungen` + `EXECUTE`).
+  Transaktionen. **Auf Produktion erledigt** (2026-10-01): Deploy (`fbe93ea`,
+  `init_db()` hat die Funktion angelegt) und danach erneut
+  `docs/rls-owner-lookup-bypass-role-setup.sql` als Superuser -- alle 5
+  Funktionen gehören `pos_owner_lookup_bypass`, `SELECT` auf 5 Tabellen,
+  Mitgliedschaft weiter `SET FALSE`.
 - Verifiziert gegen eine lokale Wegwerf-Postgres-Instanz mit ECHTEM FORCE ROW
   LEVEL SECURITY + Owner-Policies auf `pos_positions`/`pos_portfolios`/
   `pos_transactions`/`pos_real_estate`/`pos_buchungen`/
@@ -81,11 +83,43 @@ gewesen) ist geschlossen:
 
 Chunk 3 (`main.py`/`notifier.py`, `update_prices()` via Pro-Nutzer-Iteration)
 ist ebenfalls bereits umgesetzt (Commit `982842c`).
+**Nebenbefund (2026-10-01), vor Chunk 7 zu lösen:** `update_prices()` liest
+die Positionen ALLER Nutzer zuerst in einer Session OHNE Kontext und
+iteriert erst danach pro Nutzer mit `user_context()`. Unter FORCE RLS liefert
+diese erste Abfrage ohne Kontext 0 Zeilen. Unkritisch für Dashboard und API
+(beide laufen mit festem bzw. Request-Kontext und aktualisieren dann eben nur
+die Kurse dieses Nutzers), aber `main.py` (täglicher Job, läuft auf
+Produktion derzeit nicht) würde unter FORCE RLS stillschweigend NICHTS mehr
+aktualisieren.
 
-**Nächster offener Schritt:** Chunk 4 (`dashboard.py`/`onboarding.py`, weiterhin
-blockiert auf die offene Frage aus Abschnitt 7) bzw. Chunk 5 selbst (die
-eigentlichen `CREATE POLICY`-Statements aus Abschnitt 4/5/6). Chunk 6/7 sind
-noch NICHT umgesetzt.
+**Chunk 4 gelöst** (2026-10-01, Code gepusht, NICHT deployed): Entscheidung --
+`dashboard.py` ist ein Ein-Personen-Admin-Werkzeug. Es läuft fest im Kontext
+von `DASHBOARD_USER_ID` (`config.py`, `.env`) über
+`database.pin_user_context()`: bei jedem Script-Run zuerst Nutzerprüfung
+(existiert, `admin`, `active`, `portfolio_os_access`; sonst `st.error` +
+`st.stop()`, fail closed), dann Pin, erst danach `init_db()`/`update_prices()`.
+Bewusst ohne Token-Reset -- Streamlit 1.61 führt jeden Script-Run in einem
+neuen Thread mit leerem Context aus; eine Warnung in `pin_user_context()`
+macht eine künftige Änderung daran sichtbar. Entfernt: Nutzer-Dropdown,
+Familien-Modus, Familie-Tab (gehört langfristig in die Web-App), Nutzerverwaltung
+inkl. Admin-Bootstrap (`pos_users` liegt außerhalb von RLS, Nutzer mit Rolle
+`admin` ließen sich dort anlegen). Unverändert: Bot-Einstellungen, Familienziele
+(`pos_family_goals`, global, außerhalb des RLS-Umfangs). Nutzerübergreifende
+Sicht/Support nur noch über die Web-App (protokollierter Admin-Cross-View).
+`onboarding.py` braucht keine Änderung (alle Stellen bekommen `user_id` als
+Parameter und laufen im gepinnten Kontext). Verifiziert mit
+`test_dashboard_context.py` (32/32, `streamlit.testing.v1.AppTest`, FORCE RLS
+auf allen `pos_*`-Tabellen mit Nutzerbezug, Paketstände identisch mit
+`venv_dashboard` auf Produktion): nur eigene Daten, fail closed, Schreibzugriff
+im festen Kontext, Cross-Session-/Thread-Isolation (sequenziell und
+nebenläufig). Gegenprobe: das alte `dashboard.py` bricht unter FORCE RLS beim
+ersten Schreibzugriff ab. Bleibt bestehen: das Dashboard hat keinen eigenen
+Login -- Schutz ist die Bindung an `127.0.0.1:8502` (nur per SSH-Tunnel).
+**Offen auf Produktion:** `DASHBOARD_USER_ID=1` in die `.env`, Deploy,
+Dashboard-Neustart (ohne die Variable startet das neue Dashboard nicht).
+
+**Nächster offener Schritt:** Chunk 5 (die eigentlichen `CREATE POLICY`-
+Statements aus Abschnitt 4/5/6). Chunk 6/7 sind noch NICHT umgesetzt.
 
 ## 0. Kernproblem zur Erinnerung
 
@@ -331,7 +365,7 @@ Keine offenen Fragen — Schema ist bei allen fünf eindeutig.
 | `portfolio.py::update_prices()` | Systemweites Preis-Update über alle Positionen | Bricht komplett, wenn naiv unter FORCE gestellt (s. Sonderfall a) |
 | `api.py::family()` / `overview(family=true)` | Admin-Aggregation über ALLE `pos_users` (bewusst, `_require_admin`-gated, ADMIN-SCOPE-TODO) | Muss wie Sonderfall (c) behandelt werden — mehrere Kontext-Wechsel INNERHALB eines einzigen Requests (einmal pro aggregiertem Nutzer), nicht nur einer |
 | `api.py::list_users/get_pending_users/admin_approve_user/...` | Admin-Verwaltung aller `pos_users` | `pos_users` ist ohnehin außerhalb des Scopes dieser Runde — kein Konflikt, aber falls `pos_users` später auch RLS bekommt, bräuchten diese Endpoints eine eigene Bypass-Logik |
-| **`dashboard.py`/`onboarding.py` (40 Stellen zusammen)** | **Kein Auth-/User-Konzept im gesamten Streamlit-Code** — kein Login, kein `session_state`-User, keine erkennbare Stelle, die "wer bin ich" beantwortet | **Größtes offenes Risiko dieser ganzen Umsetzung.** Ich habe keine Stelle gefunden, die dashboard.py verrät, für welchen `user_id`-Kontext es aktuell rendert (weder Konstante noch Query-Parameter noch Session-State). Bevor hier irgendein `user_context(...)` gesetzt werden kann, muss erst geklärt werden: Ist `dashboard.py` faktisch ein Single-Operator-Tool nur für Daniel (dann reicht ein hartcodierter Kontext beim Programmstart), oder gibt es eine mir nicht aufgefallene Nutzerauswahl? **Das kläre ich nicht selbst, sondern frage nach**, bevor Chunk 2/3 (unten) dashboard.py anfasst. |
+| **`dashboard.py`/`onboarding.py` (40 Stellen zusammen)** — *gelöst 2026-10-01, siehe Status oben: fester Kontext über `DASHBOARD_USER_ID`* | **Kein Auth-/User-Konzept im gesamten Streamlit-Code** — kein Login, kein `session_state`-User, keine erkennbare Stelle, die "wer bin ich" beantwortet | **Größtes offenes Risiko dieser ganzen Umsetzung.** Ich habe keine Stelle gefunden, die dashboard.py verrät, für welchen `user_id`-Kontext es aktuell rendert (weder Konstante noch Query-Parameter noch Session-State). Bevor hier irgendein `user_context(...)` gesetzt werden kann, muss erst geklärt werden: Ist `dashboard.py` faktisch ein Single-Operator-Tool nur für Daniel (dann reicht ein hartcodierter Kontext beim Programmstart), oder gibt es eine mir nicht aufgefallene Nutzerauswahl? **Das kläre ich nicht selbst, sondern frage nach**, bevor Chunk 2/3 (unten) dashboard.py anfasst. |
 | `database.py::log_admin_access` | Schreibt bewusst BEIDE Rollen (admin+target) in einer Zeile | Policy-Design bereits in Abschnitt 5 behandelt |
 
 ## 8. Chunk-Einteilung für die Umsetzung
@@ -341,7 +375,7 @@ Keine offenen Fragen — Schema ist bei allen fünf eindeutig.
 | **1** | `user_context()`-Mechanismus in `database.py` (ContextVar + Helper), OHNE ihn irgendwo scharf zu nutzen — reiner Infrastruktur-Chunk, testbar isoliert | **Klein, risikoarm.** Keine Verhaltensänderung, da noch nirgends aufgerufen. |
 | **2** | `api.py` verdrahten: `get_current_user`/`require_portfolio_os_access` setzt Default-Kontext (`current_user.id`), `_resolve_user_id()` überschreibt bei Admin-Cross-View (Sonderfall c), `_owner_check_id`/`_maybe_log_admin_access`-Pfade nachziehen. Test: alle 35 Endpoints einmal manuell/automatisiert durchspielen (eigene Daten + Admin-Cross-View). | **Mittel.** Ein zentraler Eingriffspunkt, aber 22 Cross-View-Stellen einzeln zu verifizieren braucht Sorgfalt. |
 | **3** | `main.py`/`notifier.py` verdrahten (Sonderfall b) + `update_prices()`-Entscheidung (Sonderfall a, Option 1 oder 2) treffen und umsetzen. | **Mittel, eine echte Architekturentscheidung nötig** (DB-Rolle vs. Loop) — sollte VOR Umsetzung mit Dir abgestimmt sein. |
-| **4** | `dashboard.py`/`onboarding.py` — **blockiert auf die offene Frage aus Abschnitt 7**, kann erst starten, wenn geklärt ist, wie dashboard.py "seinen" Nutzer bestimmt. | **Unklare Größe, da Voraussetzung fehlt.** Potenziell der aufwändigste Chunk (40 Stellen), aber vielleicht auch trivial (1 Zeile), falls es tatsächlich fest für Daniel läuft. |
+| **4** | ✅ *Umgesetzt 2026-10-01 (siehe Status).* `dashboard.py`/`onboarding.py` — **blockiert auf die offene Frage aus Abschnitt 7**, kann erst starten, wenn geklärt ist, wie dashboard.py "seinen" Nutzer bestimmt. | **Unklare Größe, da Voraussetzung fehlt.** Potenziell der aufwändigste Chunk (40 Stellen), aber vielleicht auch trivial (1 Zeile), falls es tatsächlich fest für Daniel läuft. |
 | **5** | Fehlende Policies anlegen (`pos_transactions`, `pos_admin_access_log` gemäß gewählter Variante, 5 Gap-Tabellen) — reine SQL, kein Python-Code. | **Klein.** SQL aus Abschnitt 4/5/6 dieses Dokuments, einsatzbereit. |
 | **6** | Test gegen isolierte Kopie (Teil 2 des ursprünglichen Auftrags: 2 Nutzer, Lese-/Schreibtest, Cross-Access-Sicherheitstest) — erst NACH Chunk 1-5. | Wie ursprünglich beauftragt. |
 | **7** | `FORCE ROW LEVEL SECURITY`-SQL vorbereiten (Teil 3) — Freigabe für Live-Lauf separat einholen. | Wie ursprünglich beauftragt. |
