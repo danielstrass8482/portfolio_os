@@ -56,6 +56,11 @@ Sanity-Checks in Gruppe 2 (und in Gruppe 5 die Admin-Cross-Access-Checks)
 erwartungsgemäß fehl, weil die Funktionen dann selbst noch RLS-gefiltert
 wären (SECURITY DEFINER allein bypassed nichts, siehe database.py-Kommentar).
 
+Mehrfach hintereinander gegen DIESELBE DB lauffähig (seit 2026-10-01: Test-
+User-E-Mails und Hilfsrolle tragen eine pro Lauf eindeutige RUN_ID, Teardown
+der Hilfsrolle entzieht vorher CONNECT) -- Drop/Neuanlage der DB zwischen zwei
+Läufen ist nicht nötig.
+
 KEINE Produktions-DB, KEIN echter yfinance-Call. Setup (Wegwerf-Postgres,
 analog test_rls_admin_bypass_helpers.py, PLUS die BYPASSRLS-Rolle):
     sudo pg_ctlcluster 16 main start
@@ -90,6 +95,7 @@ SQL
 import os
 import subprocess
 import sys
+import uuid
 from types import SimpleNamespace
 
 os.environ.setdefault(
@@ -111,6 +117,13 @@ client = TestClient(api.app, base_url="https://testserver")
 pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
 _counter = {"n": 0}
 
+# Pro Lauf eindeutige Kennung für Test-User-E-Mails und die Hilfsrolle in
+# Gruppe 4: die Suite kann so mehrfach gegen DIESELBE DB laufen, ohne mit
+# Usern/Daten früherer Läufe zu kollidieren (früher: make_user() löschte per
+# E-Mail und scheiterte am Fremdschlüssel der Portfolios des Vorlaufs). Bewusst
+# NICHT in _uniq(), das auch Ticker (String(20)) erzeugt.
+RUN_ID = uuid.uuid4().hex[:8]
+
 # Test-DB-Name für psql-Aufrufe außerhalb der App-Engine (Gruppe 4: dritte,
 # unprivilegierte Rolle -- braucht eine eigene Connection, kein SQLAlchemy nötig).
 _TEST_DB = database.engine.url.database
@@ -127,8 +140,8 @@ def _uniq() -> str:
 
 
 def make_user(email: str, *, rolle: str = "member", password: str = "TestPassword123") -> int:
-    with database.get_session() as session:
-        session.query(database.PosUser).filter_by(email=email).delete()
+    local, domain = email.split("@", 1)
+    email = f"{local}-{RUN_ID}@{domain}"
     with database.get_session() as session:
         u = database.PosUser(
             name="Owner Lookup Test", email=email, password_hash=pwd_context.hash(password),
@@ -333,8 +346,27 @@ def test_nonexistent_id_returns_null():
 # 4: PUBLIC kann die Funktionen NICHT ausführen
 # ─────────────────────────────────────────────
 
+def _psql_su(*args, db=None):
+    cmd = ["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-At"]
+    if db:
+        cmd += ["-d", db]
+    return subprocess.run(cmd + list(args), capture_output=True, text=True)
+
+
+def _drop_unpriv_role(role: str) -> subprocess.CompletedProcess:
+    """CONNECT-Recht zuerst entziehen -- solange es besteht, schlägt DROP ROLE
+    mit 'role ... cannot be dropped because some objects depend on it' fehl
+    (die Rolle blieb früher still liegen und kollidierte im nächsten Lauf)."""
+    _psql_su("-c", f"REVOKE CONNECT ON DATABASE {_TEST_DB} FROM {role};", db=_TEST_DB)
+    return _psql_su("-c", f"DROP ROLE IF EXISTS {role};")
+
+
 def test_public_cannot_execute():
-    role = f"ownerlookup_unpriv_{_uniq()}"
+    # Reste aus Läufen VOR diesem Fix (ohne REVOKE im Teardown) wegräumen.
+    leftovers = _psql_su("-c", "SELECT rolname FROM pg_roles WHERE rolname LIKE 'ownerlookup\\_unpriv\\_%';")
+    for old in leftovers.stdout.split():
+        _drop_unpriv_role(old)
+    role = f"ownerlookup_unpriv_{RUN_ID}"
     try:
         subprocess.run(
             ["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-c",
@@ -357,10 +389,11 @@ def test_public_cannot_execute():
             f"returncode={result.returncode}, stderr={result.stderr.strip()!r}",
         )
     finally:
-        subprocess.run(
-            ["sudo", "-u", "postgres", "psql", "-c", f"DROP ROLE IF EXISTS {role};"],
-            capture_output=True, text=True,
-        )
+        dropped = _drop_unpriv_role(role)
+        record(f"Teardown: Hilfsrolle {role} wieder gelöscht",
+               dropped.returncode == 0 and _psql_su(
+                   "-c", f"SELECT count(*) FROM pg_roles WHERE rolname = '{role}';").stdout.strip() == "0",
+               dropped.stderr.strip())
 
 
 # ─────────────────────────────────────────────
