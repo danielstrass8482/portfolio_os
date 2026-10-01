@@ -43,7 +43,17 @@ BEGIN
 END
 $$;
 
-GRANT pos_owner_lookup_bypass TO trading_bot_user;
+-- Mitgliedschaftsoptionen explizit (PG16+, 2026-10-01 ergänzt):
+-- INHERIT TRUE ist nötig, damit trading_bot_user als Mitglied die Owner-
+-- Rechte erbt und init_db() die Funktionen weiter per CREATE OR REPLACE +
+-- REVOKE/GRANT aktualisieren kann. SET FALSE verhindert, dass die App-Rolle
+-- per SET ROLE pos_owner_lookup_bypass selbst BYPASSRLS annimmt (das wäre ein
+-- voller RLS-Bypass für jede Query, nicht nur für die 4 Lookups). Der
+-- Postgres-Default wäre SET TRUE -- so lief die Erstausführung auf Produktion
+-- (2026-09-30), dort am 2026-10-01 per genau diesem Statement korrigiert.
+-- Ein erneutes GRANT vom selben Grantor ändert die bestehende Mitgliedschaft
+-- in place (keine zweite Zeile in pg_auth_members), ist also idempotent.
+GRANT pos_owner_lookup_bypass TO trading_bot_user WITH INHERIT TRUE, SET FALSE;
 
 ALTER FUNCTION pos_position_owner_id(integer)    OWNER TO pos_owner_lookup_bypass;
 ALTER FUNCTION pos_portfolio_owner_id(integer)   OWNER TO pos_owner_lookup_bypass;
@@ -72,3 +82,8 @@ GRANT EXECUTE ON FUNCTION pos_real_estate_owner_id(integer) TO trading_bot_user;
 --   SELECT proname, proowner::regrole, prosecdef
 --   FROM pg_proc WHERE proname LIKE 'pos_%_owner_id';
 -- proowner muss pos_owner_lookup_bypass zeigen, prosecdef = true.
+--   SELECT grantor::regrole, inherit_option, set_option FROM pg_auth_members
+--   WHERE roleid = 'pos_owner_lookup_bypass'::regrole;
+-- genau 1 Zeile, inherit_option = true, set_option = false. Als
+-- trading_bot_user muss SET ROLE pos_owner_lookup_bypass mit "permission
+-- denied to set role" fehlschlagen.
