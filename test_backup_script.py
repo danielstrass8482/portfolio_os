@@ -17,7 +17,7 @@ Stellvertreter der Bot-Tabellen trades/bot_config. Geprüft:
      aber pos_*-Tabellen leer): Fehlschlag über die Pflicht-Tabellen-Prüfung.
   5. gpg schlägt fehl (Passphrase-Datei fehlt): Fehlschlag statt stiller
      unverschlüsselter Datei.
-  6. Produktions-Schwellen (40 Tabellen / 5 MB) gegen die kleine Test-DB:
+  6. Produktions-Schwellen (40 Tabellen im Dump / 5 MB) gegen die kleine Test-DB:
      Fehlschlag -- die Schwellen sind aktiv.
   7. Rotation: behält 30 erfolgreiche Backups, FAILED_-Dateien bleiben unberührt.
 
@@ -227,11 +227,11 @@ def main():
     record("NEU (gpg-Fehler): Exit 1, keine unverschlüsselte Datei unter normalem Namen",
            r.returncode == 1 and "gpg" in r.stderr and all(f.startswith("FAILED_") for f in files), files)
 
-    # 6) Produktions-Schwellen auf der kleinen Test-DB
+    # 6) Produktions-Schwellen (40 Tabellen im Dump / 5 MB) auf der kleinen Test-DB
     ws = workspace()
     r = run_new(ws, BACKUP_MIN_TABLES="40", BACKUP_MIN_BYTES="5000000")
     record("NEU (Prod-Schwellen 40 Tabellen / 5 MB): kleine Test-DB wird abgelehnt",
-           r.returncode == 1 and "Tabellen mit Daten" in r.stderr, r.stderr.strip().splitlines()[0] if r.stderr else "")
+           r.returncode == 1 and "Tabellen im Dump" in r.stderr, r.stderr.strip().splitlines()[0] if r.stderr else "")
 
     # 7) Rotation
     ws = workspace()

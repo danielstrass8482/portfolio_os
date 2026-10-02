@@ -15,8 +15,11 @@
 #     `sudo -n` (administrator hat NOPASSWD; -n bricht sofort ab statt auf ein
 #     Passwort zu warten). Kein DB-Passwort mehr im Skript.
 #   - pipefail + Plausibilitätsprüfung des Dumps (gzip intakt, Abschlusszeile
-#     vorhanden, Mindestzahl Tabellen mit Daten, Pflicht-Tabellen nicht leer,
-#     Mindestgröße), gpg muss erfolgreich sein.
+#     vorhanden, Mindestzahl Tabellen im Dump, Pflicht-Tabellen nicht leer,
+#     Mindestgröße), gpg muss erfolgreich sein. Bewusst NICHT "Mindestzahl
+#     Tabellen MIT Daten": einzelne Bot-Tabellen dürfen legitim leer sein
+#     (2026-10-02: 46 Tabellen, davon 42 mit Daten) -- fehlende Daten durch
+#     RLS fängt die Pflicht-Tabellen-Prüfung gezielt ab.
 #   - Bei jedem Fehler: Exit 1, Meldung auf stderr, Eintrag im Journal
 #     (logger -p user.err) und E-Mail an ALERT_EMAIL über notifier.send_email()
 #     von Portfolio-OS. Die unvollständige Datei bleibt als FAILED_… liegen und
@@ -35,7 +38,7 @@ PORTFOLIO_OS_DIR="${BACKUP_PORTFOLIO_OS_DIR:-/home/administrator/portfolio_os}"
 ALERT_PYTHON="${BACKUP_ALERT_PYTHON:-$PORTFOLIO_OS_DIR/venv_notify/bin/python}"
 PG_DUMP_CMD="${BACKUP_PG_DUMP_CMD:-sudo -n -u postgres pg_dump}"
 KEEP="${BACKUP_KEEP:-30}"
-MIN_TABLES_WITH_DATA="${BACKUP_MIN_TABLES:-40}"      # 2026-10-02: 46
+MIN_TABLES="${BACKUP_MIN_TABLES:-40}"                # Tabellen im Dump (COPY-Blöcke); 2026-10-02: 46
 MIN_BYTES="${BACKUP_MIN_BYTES:-5000000}"              # 2026-10-02: 16,6 MB unkomprimiert
 REQUIRED_TABLES="${BACKUP_REQUIRED_TABLES:-pos_users pos_portfolios pos_positions pos_buchungen trades bot_config}"
 
@@ -84,18 +87,18 @@ stats=$(zcat "$OUT" | awk -v req="$REQUIRED_TABLES" '
   BEGIN { n = split(req, r, " "); for (i = 1; i <= n; i++) rows[r[i]] = 0 }
   { bytes += length($0) + 1 }
   /^-- PostgreSQL database dump complete/ { complete = 1 }
-  /^COPY public\./ { split($2, a, "."); tbl = a[2]; incopy = 1; next }
+  /^COPY public\./ { split($2, a, "."); tbl = a[2]; incopy = 1; tables++; next }
   incopy && /^\\\.$/ { incopy = 0; if (cnt[tbl] > 0) withdata++; next }
   incopy { cnt[tbl]++ }
   END {
     missing = ""
     for (t in rows) if (cnt[t] < 1) missing = missing " " t
-    printf "%d %d %d%s\n", bytes, complete, withdata, missing
+    printf "%d %d %d %d%s\n", bytes, complete, tables, withdata, missing
   }')
-read -r bytes complete withdata missing <<<"$stats"
+read -r bytes complete tables withdata missing <<<"$stats"
 [ "$complete" = "1" ] || fail "Abschlusszeile '-- PostgreSQL database dump complete' fehlt (Dump abgeschnitten)"
 [ -z "${missing// /}" ] || fail "Pflicht-Tabellen ohne Datenzeilen:$missing (z.B. durch Row-Level-Security gefiltert)"
-[ "$withdata" -ge "$MIN_TABLES_WITH_DATA" ] || fail "nur $withdata Tabellen mit Daten (Minimum $MIN_TABLES_WITH_DATA)"
+[ "$tables" -ge "$MIN_TABLES" ] || fail "nur $tables Tabellen im Dump (Minimum $MIN_TABLES)"
 [ "$bytes" -ge "$MIN_BYTES" ] || fail "Dump nur $bytes Bytes unkomprimiert (Minimum $MIN_BYTES)"
 
 # 3) Verschlüsseln -- ein Fehler hier ist ebenfalls ein Fehlschlag (früher: still).
@@ -112,4 +115,4 @@ fi
 # 4) Rotation -- nur erfolgreiche Backups (FAILED_* bleiben unberührt).
 ls -t "$BACKUP_DIR"/portfolio_* 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -f
 
-echo "Backup: $ERGEBNIS OK ($withdata Tabellen mit Daten, $bytes Bytes unkomprimiert)"
+echo "Backup: $ERGEBNIS OK ($tables Tabellen, davon $withdata mit Daten, $bytes Bytes unkomprimiert)"
