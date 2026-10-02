@@ -43,7 +43,7 @@ import kontoauszug_analyzer
 from notifier import send_email
 from config import validate_config, BASE_URL, ALERT_EMAIL, FREISTELLUNGSAUFTRAG_DEFAULT
 from database import (
-    get_session, engine, init_db, PosUser, PosRealEstate, PosFamilyGoal, PosGoal,
+    get_session, engine, init_db, PosUser, PosRealEstate, PosGoal,
     PosPortfolio, PosPosition, PosTransaction, PosAssetClass, PosBuchung,
     PosTargetWeight, PosTaxConfig, get_or_create_user, save_buchungen, add_kategorisierungsregel,
     encrypt_field, decrypt_field, log_admin_access, user_context, override_user_context,
@@ -763,26 +763,15 @@ def _erstes_ziel(user_id: int) -> Optional[dict]:
 # hinaus) nochmal bewusst entscheiden, z.B. getrennte Berechtigungen
 # "Familien-Verwaltung" vs. "Support-Zugriff auf Kundendaten".
 #
-# ADMIN-SCOPE-TODO (2026-08-05, Audit Chunk 4): /api/family und
-# /api/overview?family=true waren bis eben ganz ohne Rollen-Check erreichbar
-# (jeder eingeloggte Nutzer sah Name+Depotwert+G/V+Positionsanzahl JEDES
-# registrierten Nutzers) – jetzt auf current_user.rolle=="admin" beschränkt
-# (siehe _require_admin unten), analog zum "Meine Daten"-Fix oben. OFFENE
-# FRAGE, bewusst nicht selbst entschieden: falls es künftig einen legitimen
-# Use-Case für Nicht-Admin-Zugriff auf family=true geben soll (z.B. "echte"
-# Familienmitglieder untereinander, die sich gegenseitig sehen dürfen sollen,
-# ohne dass jeder gleich Admin-Rechte auf ALLE pos_users bekommt) – das würde
-# eine eigene Gruppierung brauchen (aktuell gibt es in pos_users keinerlei
-# "Familie"-Feld, "family=true" aggregiert schlicht ALLE Nutzer). Bis dahin:
-# admin-only.
+# Familien-Aggregation (/api/family, /api/overview?family=true) seit
+# 2026-10-02 entfernt (RLS-Umbau, Risiko R2 vor Chunk 7): sie summierte im
+# Admin-eigenen RLS-Kontext über ALLE pos_users und hätte unter FORCE ROW LEVEL
+# SECURITY für fremde Nutzer still 0 € geliefert. Damit entfällt auch
+# _require_admin(). Falls eine Familien-Sicht zurückkommt: pro Nutzer über
+# _resolve_user_id()/override_user_context() umschalten und protokollieren,
+# und vorher klären, wer zu einer "Familie" gehört (pos_users hat dafür kein
+# Feld).
 # ─────────────────────────────────────────────
-
-
-def _require_admin(current_user, endpoint: str) -> None:
-    """Für Endpoints, die grundsätzlich über alle pos_users aggregieren
-    (/api/family, /api/overview?family=true) – siehe ADMIN-SCOPE-TODO oben."""
-    if current_user.rolle != "admin":
-        raise HTTPException(status_code=403, detail="Nur für Admins verfügbar")
 
 
 def _resolve_user_id(current_user, requested_user_id: Optional[int], endpoint: str, method: str = "GET") -> int:
@@ -1107,43 +1096,21 @@ def admin_reject_user(user_id: int, current_user=Depends(get_current_user)):
 # ─────────────────────────────────────────────
 
 @protected.get("/api/overview")
-def overview(user_id: Optional[int] = None, family: bool = False, current_user=Depends(get_current_user)):
-    """family=true aggregiert über alle Nutzer (Trading-Bot-Wert wird dabei nur
-    EINMAL gezählt, nicht pro Nutzer – siehe get_total_wealth-Docstring), daher
-    admin-only (ADMIN-SCOPE-TODO oben). Sonst IDOR-Fix (siehe Modulkommentar
-    oben): user_id wird über _resolve_user_id aufgelöst statt dem Query-Param
-    blind zu vertrauen."""
-    if family:
-        _require_admin(current_user, "/api/overview?family=true")
-        with get_session() as session:
-            user_ids = [u.id for u in session.query(PosUser).all()]
-        gesamt = {
-            "gesamtvermoegen": 0.0, "unrealized_pnl": 0.0,
-            "positions_count": 0, "portfolios_count": 0, "asset_breakdown": {},
-        }
-        for uid in user_ids:
-            s = portfolio_module.get_total_wealth(uid, include_trading_bot=False)
-            gesamt["gesamtvermoegen"] += s["gesamtvermoegen"]
-            gesamt["unrealized_pnl"] += s["unrealized_pnl"]
-            gesamt["positions_count"] += s["positions_count"]
-            gesamt["portfolios_count"] += s["portfolios_count"]
-            for klass, wert in s["asset_breakdown"].items():
-                gesamt["asset_breakdown"][klass] = gesamt["asset_breakdown"].get(klass, 0.0) + wert
-        bot_info = trading_bot_connector.get_bot_account_value_eur()
-        if bot_info["total_eur"]:
-            gesamt["gesamtvermoegen"] += bot_info["total_eur"]
-        summary = gesamt
-        ziel = None
-    else:
-        user_id = _resolve_user_id(current_user, user_id, "/api/overview", "GET")
-        summary = portfolio_module.get_total_wealth(user_id)
-        ziel = _erstes_ziel(user_id)
+def overview(user_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    """IDOR-Fix (siehe Modulkommentar oben): user_id wird über _resolve_user_id
+    aufgelöst statt dem Query-Param blind zu vertrauen (Admin-Cross-View wird
+    protokolliert). Die frühere Familien-Aggregation (family=true, über ALLE
+    Nutzer im Admin-eigenen RLS-Kontext) ist seit 2026-10-02 entfernt -- unter
+    FORCE ROW LEVEL SECURITY hätte sie für fremde Nutzer still 0 € geliefert
+    (RLS-Umbau, Risiko R2 vor Chunk 7); ebenso GET /api/family."""
+    user_id = _resolve_user_id(current_user, user_id, "/api/overview", "GET")
+    summary = portfolio_module.get_total_wealth(user_id)
+    ziel = _erstes_ziel(user_id)
 
     kosten_basis = summary["gesamtvermoegen"] - summary["unrealized_pnl"]
     rendite_pct = (summary["unrealized_pnl"] / kosten_basis * 100) if kosten_basis else 0.0
 
-    with get_session() as session:
-        open_positions = portfolio_module.get_positions(user_id) if user_id else []
+    open_positions = portfolio_module.get_positions(user_id)
 
     return {
         "gesamtvermoegen": summary["gesamtvermoegen"],
@@ -1663,29 +1630,6 @@ def remove_real_estate(real_estate_id: int, current_user=Depends(get_current_use
 
 # ─────────────────────────────────────────────
 # FAMILIE
-# ─────────────────────────────────────────────
-
-@protected.get("/api/family")
-def family(current_user=Depends(get_current_user)):
-    """Aggregiert über ALLE pos_users, daher admin-only (ADMIN-SCOPE-TODO oben)."""
-    _require_admin(current_user, "/api/family")
-    with get_session() as session:
-        depots = [
-            {"user_id": u.id, "name": u.name,
-             **portfolio_module.get_portfolio_summary(u.id)}
-            for u in session.query(PosUser).all()
-        ]
-        ziele = [
-            {"id": z.id, "name": z.name, "fortschritt_pct": z.fortschritt_pct,
-             "aktuell_betrag": z.aktuell_betrag, "ziel_betrag": z.ziel_betrag,
-             "zieldatum": str(z.zieldatum) if z.zieldatum else None}
-            for z in session.query(PosFamilyGoal).all()
-        ]
-    return {"depots": depots, "ziele": ziele}
-
-
-# ─────────────────────────────────────────────
-# HAUSHALTSBUCH
 # ─────────────────────────────────────────────
 
 @protected.get("/api/haushaltsbuch")
