@@ -6,7 +6,7 @@ Entscheidung vor der eigentlichen Umsetzung. Umfang laut Vorgabe: 14 Tabellen
 `pos_admin_access_log`); `pos_users`/`pos_asset_classes`/`pos_family_goals`
 bleiben außen vor.
 
-## Status (2026-10-01, Stand Chunk 5)
+## Status (2026-10-02, Chunk 5 abgeschlossen)
 
 Chunk 1 (Commit `c16b405`), Chunk 2 inkl. Nachzug (Commits `982842c`,
 `8e1d89c`) sind umgesetzt und seit 2026-09-30 auf Produktion deployed (VPS auf
@@ -128,8 +128,7 @@ Login -- Schutz ist die Bindung an `127.0.0.1:8502` (nur per SSH-Tunnel).
 **Offen auf Produktion:** `DASHBOARD_USER_ID=1` in die `.env`, Deploy,
 Dashboard-Neustart (ohne die Variable startet das neue Dashboard nicht).
 
-**Chunk 5 vorbereitet** (2026-10-01, Code + SQL gepusht, auf Produktion NICHT
-ausgeführt): `docs/rls-policies.sql` enthält erstmals ALLE Policies der 14
+**Chunk 5 abgeschlossen** (2026-10-02, live auf Produktion): `docs/rls-policies.sql` enthält erstmals ALLE Policies der 14
 Tabellen versioniert (die 7 seit 2026-07-24 nur von Hand auf Produktion
 angelegten wortgleich übernommen; §4 `pos_transactions`; §6 die 5 bisher
 ungeschützten Tabellen inkl. `ENABLE`; §5 Variante C für
@@ -138,11 +137,16 @@ am Verhalten der App nichts). Dazu `log_admin_access()` ohne RETURNING (siehe
 §5). Verifiziert mit `test_rls_policies.py` (40/40, zweimal gegen dieselbe
 DB): Definitionen gegen Erwartung und Produktion, unter FORCE Trennung je
 Tabelle, Audit-Log nur erweiterbar, rohes INSERT gleichwertig zum alten
-ORM-Weg. Alle übrigen RLS-Suiten grün. **Offen auf Produktion:** Deploy des
-Codes (`log_admin_access()`), danach `docs/rls-policies.sql` als manueller
-Superuser-Schritt mit Backup vorher.
+ORM-Weg. Alle übrigen RLS-Suiten grün. **Auf Produktion erledigt
+(2026-10-02):** (1) Code-Deploy `ab8e98b` (`log_admin_access()` ohne
+RETURNING, portfolio-api + portfolio-dashboard neu gestartet), (2) danach
+`docs/rls-policies.sql` als manueller Superuser-Schritt ausgeführt (frisches
+pg_dump-Backup vorher). Verifiziert: 14 Policies (13x `user_isolation` ALL,
+1x `admin_insert_only` INSERT), die 7 alten wortgleich zu vorher, RLS an auf
+allen 14 Tabellen, FORCE weiterhin auf 0 Tabellen, Dienste gesund,
+`pos_admin_access_log` unverändert (28 Zeilen).
 
-**Nächster offener Schritt danach:** Chunk 6 (Isolationstest unter FORCE gegen
+**Nächster offener Schritt:** Chunk 6 (Isolationstest unter FORCE gegen
 eine wiederhergestellte Kopie des Produktions-Dumps; die Test-Suiten sollten
 dafür die Policies aus `docs/rls-policies.sql` laden statt eigener
 Inline-Definitionen), dann Chunk 7 (FORCE).
@@ -422,7 +426,7 @@ Keine offenen Fragen — Schema ist bei allen fünf eindeutig.
 | **2** | `api.py` verdrahten: `get_current_user`/`require_portfolio_os_access` setzt Default-Kontext (`current_user.id`), `_resolve_user_id()` überschreibt bei Admin-Cross-View (Sonderfall c), `_owner_check_id`/`_maybe_log_admin_access`-Pfade nachziehen. Test: alle 35 Endpoints einmal manuell/automatisiert durchspielen (eigene Daten + Admin-Cross-View). | **Mittel.** Ein zentraler Eingriffspunkt, aber 22 Cross-View-Stellen einzeln zu verifizieren braucht Sorgfalt. |
 | **3** | `main.py`/`notifier.py` verdrahten (Sonderfall b) + `update_prices()`-Entscheidung (Sonderfall a, Option 1 oder 2) treffen und umsetzen. | **Mittel, eine echte Architekturentscheidung nötig** (DB-Rolle vs. Loop) — sollte VOR Umsetzung mit Dir abgestimmt sein. |
 | **4** | ✅ *Umgesetzt 2026-10-01 (siehe Status).* `dashboard.py`/`onboarding.py` — **blockiert auf die offene Frage aus Abschnitt 7**, kann erst starten, wenn geklärt ist, wie dashboard.py "seinen" Nutzer bestimmt. | **Unklare Größe, da Voraussetzung fehlt.** Potenziell der aufwändigste Chunk (40 Stellen), aber vielleicht auch trivial (1 Zeile), falls es tatsächlich fest für Daniel läuft. |
-| **5** | Fehlende Policies anlegen (`pos_transactions`, `pos_admin_access_log` gemäß gewählter Variante, 5 Gap-Tabellen) — reine SQL, kein Python-Code. | **Klein.** SQL aus Abschnitt 4/5/6 dieses Dokuments, einsatzbereit. |
+| **5** | ✅ *Umgesetzt 2026-10-02 (siehe Status, `docs/rls-policies.sql`).* Fehlende Policies anlegen (`pos_transactions`, `pos_admin_access_log` gemäß gewählter Variante, 5 Gap-Tabellen) — reine SQL, kein Python-Code. | **Klein.** SQL aus Abschnitt 4/5/6 dieses Dokuments, einsatzbereit. |
 | **6** | Test gegen isolierte Kopie (Teil 2 des ursprünglichen Auftrags: 2 Nutzer, Lese-/Schreibtest, Cross-Access-Sicherheitstest) — erst NACH Chunk 1-5. | Wie ursprünglich beauftragt. |
 | **7** | `FORCE ROW LEVEL SECURITY`-SQL vorbereiten (Teil 3) — Freigabe für Live-Lauf separat einholen. | Wie ursprünglich beauftragt. |
 
