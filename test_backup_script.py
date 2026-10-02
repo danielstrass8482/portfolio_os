@@ -31,6 +31,7 @@ Setup:
 """
 import glob
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NEW_SCRIPT = os.path.join(HERE, "ops", "backup-portfolio-db.sh")
 POLICY_FILE = os.path.join(HERE, "docs", "rls-policies.sql")
 RESULTS = []
+WORKSPACES = []  # am Ende gelöscht (enthalten Test-Dumps)
 
 # Wörtlich das Skript, das bis 2026-10-02 als /usr/local/bin/backup-portfolio-db.sh
 # lief -- nur Passwort, Rolle, DB und Pfade durch lokale Platzhalter ersetzt.
@@ -103,6 +105,7 @@ def setup_db():
 
 def workspace():
     d = tempfile.mkdtemp(prefix="bkptest_")
+    WORKSPACES.append(d)
     os.chmod(d, 0o755)
     passfile = os.path.join(d, "passphrase")
     with open(passfile, "w") as f:
@@ -246,6 +249,8 @@ def main():
 
     for t in tables:
         su(f"ALTER TABLE {t} NO FORCE ROW LEVEL SECURITY")
+    for d in WORKSPACES:
+        shutil.rmtree(d, ignore_errors=True)
 
     print("\n=== ZUSAMMENFASSUNG ===")
     fehl = [r for r in RESULTS if not r[1]]
